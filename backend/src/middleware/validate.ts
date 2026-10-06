@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import { type AnyZodObject, type ZodError, ZodSchema } from 'zod';
+import { type ZodError, type ZodSchema } from 'zod';
 import { sendError } from '../utils/api-response.js';
 
 /**
@@ -7,8 +7,8 @@ import { sendError } from '../utils/api-response.js';
  */
 interface ValidationSchemas {
   body?: ZodSchema;
-  params?: AnyZodObject;
-  query?: AnyZodObject;
+  params?: ZodSchema;
+  query?: ZodSchema;
 }
 
 /**
@@ -54,6 +54,13 @@ export function validate(schemas: ValidationSchemas) {
       const result = schemas.params.safeParse(req.params);
       if (!result.success) {
         errors.params = formatZodErrors(result.error);
+      } else {
+        Object.defineProperty(req, 'params', {
+          value: result.data,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
       }
     }
 
@@ -61,6 +68,13 @@ export function validate(schemas: ValidationSchemas) {
       const result = schemas.query.safeParse(req.query);
       if (!result.success) {
         errors.query = formatZodErrors(result.error);
+      } else {
+        Object.defineProperty(req, 'query', {
+          value: result.data,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
       }
     }
 
