@@ -1,6 +1,7 @@
 import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import { config } from './config/index.js';
 import {
   globalErrorHandler,
@@ -8,6 +9,7 @@ import {
   notFoundHandler,
 } from './middleware/index.js';
 import { healthRoutes } from './modules/health/index.js';
+import { authRoutes } from './modules/auth/index.js';
 
 /**
  * Create and configure the Express application.
@@ -29,10 +31,11 @@ export function createApp(): express.Express {
   );
 
   // ---------------------------------------------------------------------------
-  // Body parsing
+  // Body and cookie parsing
   // ---------------------------------------------------------------------------
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+  app.use(cookieParser());
 
   // ---------------------------------------------------------------------------
   // Request logging
@@ -44,6 +47,7 @@ export function createApp(): express.Express {
   // ---------------------------------------------------------------------------
   // All API routes are prefixed with /api
   app.use('/api', healthRoutes);
+  app.use('/api/auth', authRoutes);
 
   // Future module routes will be registered here:
   // app.use('/api/auth', authRoutes);

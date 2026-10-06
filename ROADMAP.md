@@ -55,30 +55,38 @@ TypeScript passes          ✅
 
 # Phase 2 — Authentication & Users
 
+Status: Completed
+
 Tasks:
 
-* [ ] User model
-* [ ] Register
-* [ ] Password hashing
-* [ ] Login
-* [ ] Secure authentication cookies
-* [ ] Refresh lifecycle
-* [ ] Logout
-* [ ] GET /me
-* [ ] Authentication middleware
-* [ ] Role middleware
-* [ ] Teacher approval status
-* [ ] User profile
-* [ ] Change password
-* [ ] Forgot password
-* [ ] Reset password
-* [ ] Email verification
+* [x] User model
+* [x] Register
+* [x] Password hashing
+* [x] Login
+* [x] Secure authentication cookies
+* [x] Refresh lifecycle
+* [x] Logout
+* [x] GET /me
+* [x] Authentication middleware
+* [x] Role middleware
+* [x] Teacher approval status
+* [x] User profile
+* [ ] Change password (future)
+* [ ] Forgot password (future email provider)
+* [ ] Reset password (future email provider)
+* [ ] Email verification (future email provider)
 
 Definition of done:
 
-A student can register/login/logout and access protected endpoints.
-
-Teacher authorization must distinguish pending and approved teachers.
+```text
+User registration & login  ✅
+Password hashing (bcrypt)  ✅
+Access & Refresh tokens    ✅
+Secure HttpOnly cookies    ✅
+Auth & Role middleware     ✅
+Teacher approval status    ✅
+11 behavior tests passing  ✅
+```
 
 ---
 
@@ -457,7 +465,7 @@ For every completed phase:
 Current phase:
 
 ```text
-Phase 2 — Authentication & Users
+Phase 3 — Categories
 ```
 
 Completed:
@@ -465,18 +473,18 @@ Completed:
 ```text
 Phase 0 — Project Definition
 Phase 1 — Backend Foundation
+Phase 2 — Authentication & Users
 ```
 
 Immediate next tasks:
 
 ```text
-1. User model
-2. Register
-3. Password hashing
-4. Login
-5. Secure authentication cookies
-6. Authentication middleware
-7. Role middleware
+1. Category model
+2. Nested category support
+3. Category tree
+4. Admin category CRUD
+5. Public category listing
+6. Category filtering
 ```
 
 After authentication:

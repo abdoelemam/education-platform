@@ -40,6 +40,7 @@ src/
 - `npm run dev` — Start development server with hot reload
 - `npm run build` — Compile TypeScript to JavaScript
 - `npm start` — Run compiled production build
+- `npm test` — Run automated test suite with Vitest
 - `npm run typecheck` — Run TypeScript type checking
 - `npm run lint` — Run ESLint
 - `npm run lint:fix` — Run ESLint with auto-fix
@@ -49,3 +50,12 @@ src/
 ### Health
 
 - `GET /api/health` — Application health check
+
+### Authentication
+
+- `POST /api/auth/register` — Register a new account (`name`, `email`, `password`, optional `role`)
+- `POST /api/auth/login` — Sign in with `email` and `password`
+- `POST /api/auth/refresh` — Rotate refresh token and issue new token pair
+- `POST /api/auth/logout` — Revoke session and clear authentication cookies
+- `GET /api/auth/me` — Retrieve authenticated user profile (protected)
+
