@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import { authService, type AuthService } from './auth.service.js';
 import { setAuthCookies, clearAuthCookies } from './auth.cookies.js';
+import { setCsrfCookie, clearCsrfCookie } from '../../middleware/csrf.js';
 import { AUTH_COOKIES } from './auth.constants.js';
 import { sendSuccess } from '../../utils/api-response.js';
 import { AppError } from '../../errors/index.js';
@@ -18,6 +19,7 @@ export class AuthController {
 
     // Set secure HttpOnly cookies for both access and refresh tokens
     setAuthCookies(res, result.tokens);
+    setCsrfCookie(res);
 
     sendSuccess(res, { user: result.user }, 201);
   };
@@ -31,6 +33,7 @@ export class AuthController {
 
     // Set secure HttpOnly cookies
     setAuthCookies(res, result.tokens);
+    setCsrfCookie(res);
 
     sendSuccess(res, { user: result.user }, 200);
   };
@@ -39,9 +42,9 @@ export class AuthController {
    * POST /api/auth/refresh
    */
   refresh = async (req: Request, res: Response): Promise<void> => {
-    // Read refresh token from HttpOnly cookie or authorization header fallback
-    const rawRefreshToken = (req.cookies?.[AUTH_COOKIES.REFRESH_TOKEN] as string | undefined) ??
-      (req.headers['x-refresh-token'] as string | undefined);
+    // Refresh token must come from the HttpOnly cookie only.
+    // We do not accept it via headers to prevent JavaScript-accessible transport.
+    const rawRefreshToken = req.cookies?.[AUTH_COOKIES.REFRESH_TOKEN] as string | undefined;
 
     if (!rawRefreshToken) {
       throw AppError.unauthorized('Refresh token is required');
@@ -51,6 +54,7 @@ export class AuthController {
 
     // Set updated HttpOnly cookies
     setAuthCookies(res, tokens);
+    setCsrfCookie(res);
 
     sendSuccess(res, { message: 'Token refreshed successfully' }, 200);
   };
@@ -64,8 +68,9 @@ export class AuthController {
     // Revoke server session
     await this.authSvc.logout(rawRefreshToken);
 
-    // Clear HttpOnly cookies
+    // Clear HttpOnly cookies and CSRF cookie
     clearAuthCookies(res);
+    clearCsrfCookie(res);
 
     sendSuccess(res, { message: 'Logged out successfully' }, 200);
   };

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { authController } from './auth.controller.js';
 import { registerSchema, loginSchema } from './auth.validation.js';
-import { validate, requireAuth } from '../../middleware/index.js';
+import { validate, requireAuth, verifyCsrfToken } from '../../middleware/index.js';
 import { asyncHandler } from '../../utils/async-handler.js';
 
 const router = Router();
@@ -23,11 +23,13 @@ router.post(
 
 router.post(
   '/refresh',
+  verifyCsrfToken,
   asyncHandler(authController.refresh),
 );
 
 router.post(
   '/logout',
+  verifyCsrfToken,
   asyncHandler(authController.logout),
 );
 

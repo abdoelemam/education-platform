@@ -8,7 +8,6 @@ import {
   generateAccessToken,
   generateRefreshToken,
   hashToken,
-  generateRandomToken,
   verifyRefreshToken,
   parseDurationToMs,
 } from './auth.tokens.js';
@@ -109,6 +108,12 @@ export class AuthService {
 
   /**
    * Rotate refresh token and issue a fresh access token.
+   *
+   * Atomicity guarantee:
+   *   The old token is claimed with a single findOneAndUpdate that filters on
+   *   { _id, tokenHash, isRevoked: false }.  Only one concurrent request can
+   *   match that filter; any subsequent request with the same token will find
+   *   no document and be treated as a reuse-detection event.
    */
   async refresh(rawRefreshToken: string): Promise<AuthTokens> {
     const payload = verifyRefreshToken(rawRefreshToken);
@@ -121,52 +126,57 @@ export class AuthService {
     }
 
     const incomingHash = hashToken(rawRefreshToken);
-    const tokenRecord = await RefreshTokenModel.findById(payload.tokenId).exec();
+
+    // ---------------------------------------------------------------------------
+    // Atomic claim: only succeeds if the token exists, is not revoked, AND is not expired.
+    // Concurrent requests with the same token will receive null on all but one.
+    // ---------------------------------------------------------------------------
+    const now = new Date();
+    const tokenRecord = await RefreshTokenModel.findOneAndUpdate(
+      {
+        _id: new Types.ObjectId(payload.tokenId),
+        tokenHash: incomingHash,
+        isRevoked: false,
+        expiresAt: { $gt: now },
+      },
+      {
+        isRevoked: true,
+        revokedAt: now,
+      },
+      { new: false }, // return the document BEFORE the update
+    ).exec();
 
     if (!tokenRecord) {
-      throw new AppError(
-        401,
-        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-        'Refresh token not recognized',
-      );
-    }
+      // The token was not matched. Look up by ID to distinguish reuse/expired from unknown.
+      const existingRecord = await RefreshTokenModel.findById(
+        new Types.ObjectId(payload.tokenId),
+      ).exec();
 
-    // Reuse detection: If a revoked token is presented again, invalidate all sessions for safety
-    if (tokenRecord.isRevoked) {
-      if (tokenRecord.replacedByTokenHash) {
-        // Suspected token theft: revoke all sessions for this user
+      if (existingRecord?.isRevoked && existingRecord.replacedByTokenHash) {
+        // A replacement was already issued — treat as suspected token theft.
+        // Revoke all sessions for this user.
         await RefreshTokenModel.updateMany(
           { userId: new Types.ObjectId(payload.sub) },
           { isRevoked: true, revokedAt: new Date() },
         ).exec();
       }
 
+      if (existingRecord && existingRecord.expiresAt <= now) {
+        throw new AppError(
+          401,
+          AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+          'Refresh token has expired',
+        );
+      }
+
       throw new AppError(
         401,
         AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-        'Refresh token has been revoked',
+        'Refresh token is invalid, expired, or has already been used',
       );
     }
 
-    // Hash integrity verification
-    if (tokenRecord.tokenHash !== incomingHash) {
-      throw new AppError(
-        401,
-        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-        'Invalid refresh token signature',
-      );
-    }
-
-    // Expiry check
-    if (tokenRecord.expiresAt < new Date()) {
-      throw new AppError(
-        401,
-        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-        'Refresh token has expired',
-      );
-    }
-
-    // Check user status
+    // Verify the user still exists and is active
     const user = await this.userRepo.findById(payload.sub);
     if (!user || !user.isActive) {
       throw new AppError(
@@ -176,31 +186,31 @@ export class AuthService {
       );
     }
 
-    // Generate new refresh token record (rotation)
-    const newSessionSecret = generateRandomToken();
+    // Generate new refresh token (rotation)
+    const newRecordId = new Types.ObjectId();
+    const newRefreshToken = generateRefreshToken(user._id.toString(), newRecordId.toString());
     const newExpiresAt = new Date(Date.now() + parseDurationToMs(config.JWT_REFRESH_EXPIRES_IN));
 
     const newRecord = new RefreshTokenModel({
+      _id: newRecordId,
       userId: user._id,
-      tokenHash: hashToken(newSessionSecret),
+      tokenHash: hashToken(newRefreshToken),
       expiresAt: newExpiresAt,
       isRevoked: false,
     });
     await newRecord.save();
 
-    // Invalidate old token and link to replacement for reuse detection
-    tokenRecord.isRevoked = true;
-    tokenRecord.revokedAt = new Date();
-    tokenRecord.replacedByTokenHash = newRecord.tokenHash;
-    await tokenRecord.save();
+    // Link old record to its replacement for reuse-detection chain
+    await RefreshTokenModel.findByIdAndUpdate(tokenRecord._id, {
+      replacedByTokenHash: newRecord.tokenHash,
+    }).exec();
 
-    // Create new JWT pair
+    // Issue new JWT pair
     const accessToken = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user._id.toString(), newRecord._id.toString());
 
     return {
       accessToken,
-      refreshToken,
+      refreshToken: newRefreshToken,
     };
   }
 
@@ -243,19 +253,20 @@ export class AuthService {
    * Helper: Create and persist a new refresh token session and return access/refresh pair.
    */
   private async createTokenSession(user: UserDocument): Promise<AuthTokens> {
-    const sessionSecret = generateRandomToken();
+    const tokenId = new Types.ObjectId();
+    const refreshToken = generateRefreshToken(user._id.toString(), tokenId.toString());
     const expiresAt = new Date(Date.now() + parseDurationToMs(config.JWT_REFRESH_EXPIRES_IN));
 
     const tokenDoc = new RefreshTokenModel({
+      _id: tokenId,
       userId: user._id,
-      tokenHash: hashToken(sessionSecret),
+      tokenHash: hashToken(refreshToken),
       expiresAt,
       isRevoked: false,
     });
     await tokenDoc.save();
 
     const accessToken = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user._id.toString(), tokenDoc._id.toString());
 
     return {
       accessToken,

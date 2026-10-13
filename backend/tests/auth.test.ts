@@ -1,19 +1,33 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import mongoose from 'mongoose';
+import express from 'express';
+import cookieParser from 'cookie-parser';
 import { createApp } from '../src/app.js';
 import { UserModel } from '../src/modules/users/user.model.js';
 import { RefreshTokenModel } from '../src/modules/auth/refresh-token.model.js';
 import { requireAuth, requireRole } from '../src/middleware/auth.js';
 import { asyncHandler } from '../src/utils/async-handler.js';
 import { sendSuccess } from '../src/utils/api-response.js';
-import { AUTH_COOKIES } from '../src/modules/auth/auth.constants.js';
-
-import express from 'express';
-import cookieParser from 'cookie-parser';
+import { AUTH_COOKIES, AUTH_ERRORS } from '../src/modules/auth/auth.constants.js';
+import { CSRF_COOKIE_NAME } from '../src/middleware/csrf.js';
 import { globalErrorHandler } from '../src/middleware/error-handler.js';
 
 const TEST_DB_URI = 'mongodb://127.0.0.1:27017/education-platform-test';
+
+/**
+ * Helper to extract a cookie value by name from Supertest Set-Cookie headers.
+ */
+function getCookieValue(cookies: string[], name: string): string | undefined {
+  for (const cookie of cookies) {
+    const [pair] = cookie.split(';');
+    const [cookieName, ...cookieValParts] = pair.split('=');
+    if (cookieName.trim() === name) {
+      return cookieValParts.join('=');
+    }
+  }
+  return undefined;
+}
 
 describe('Phase 2: Authentication & Users Integration Tests', () => {
   const app = createApp();
@@ -40,8 +54,25 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   roleTestApp.use(globalErrorHandler);
 
   beforeAll(async () => {
+    // -------------------------------------------------------------------------
+    // Database Safety Guard: Prevent accidental connection or deletion of prod data
+    // -------------------------------------------------------------------------
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('SAFETY CHECK FAILED: Tests must never run in production mode (NODE_ENV=production).');
+    }
+
+    if (!TEST_DB_URI.includes('test')) {
+      throw new Error(`SAFETY CHECK FAILED: TEST_DB_URI must explicitly contain 'test'. Found: ${TEST_DB_URI}`);
+    }
+
     if (mongoose.connection.readyState === 0) {
       await mongoose.connect(TEST_DB_URI);
+    }
+
+    // Verify connected database name
+    const connectedDbName = mongoose.connection.name;
+    if (!connectedDbName || !connectedDbName.toLowerCase().includes('test')) {
+      throw new Error(`SAFETY CHECK FAILED: Connected database name must contain 'test'. Connected to: ${connectedDbName}`);
     }
   });
 
@@ -82,6 +113,7 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(cookies).toBeDefined();
     expect(cookies.some((c: string) => c.includes(AUTH_COOKIES.ACCESS_TOKEN))).toBe(true);
     expect(cookies.some((c: string) => c.includes(AUTH_COOKIES.REFRESH_TOKEN))).toBe(true);
+    expect(cookies.some((c: string) => c.includes(CSRF_COOKIE_NAME))).toBe(true);
     expect(cookies.some((c: string) => c.toLowerCase().includes('httponly'))).toBe(true);
   });
 
@@ -162,6 +194,8 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const cookies = res.headers['set-cookie'] as unknown as string[];
     expect(cookies).toBeDefined();
     expect(cookies.some((c: string) => c.includes(AUTH_COOKIES.ACCESS_TOKEN))).toBe(true);
+    expect(cookies.some((c: string) => c.includes(AUTH_COOKIES.REFRESH_TOKEN))).toBe(true);
+    expect(cookies.some((c: string) => c.includes(CSRF_COOKIE_NAME))).toBe(true);
   });
 
   // ---------------------------------------------------------------------------
@@ -340,7 +374,7 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 11. Logout behavior and refresh flow
+  // 11. Logout behavior and cookie clearing
   // ---------------------------------------------------------------------------
   it('11. should revoke refresh session and clear cookies on logout', async () => {
     const regRes = await request(app)
@@ -352,15 +386,18 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
       });
 
     const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME);
+    expect(csrfToken).toBeDefined();
 
     // Verify refresh session was created in DB
     const sessionCountBefore = await RefreshTokenModel.countDocuments({ isRevoked: false });
     expect(sessionCountBefore).toBe(1);
 
-    // Logout
+    // Logout with CSRF header
     const logoutRes = await request(app)
       .post('/api/auth/logout')
-      .set('Cookie', cookies);
+      .set('Cookie', cookies)
+      .set('X-CSRF-Token', csrfToken!);
 
     expect(logoutRes.status).toBe(200);
     expect(logoutRes.body.success).toBe(true);
@@ -369,10 +406,289 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const sessionCountAfter = await RefreshTokenModel.countDocuments({ isRevoked: false });
     expect(sessionCountAfter).toBe(0);
 
-    // Verify clear-cookie headers
+    // Verify clear-cookie headers for access_token, refresh_token, and csrf_token
     const clearCookies = logoutRes.headers['set-cookie'] as unknown as string[];
     expect(clearCookies).toBeDefined();
     expect(clearCookies.some((c: string) => c.includes('access_token=;'))).toBe(true);
     expect(clearCookies.some((c: string) => c.includes('refresh_token=;'))).toBe(true);
+    expect(clearCookies.some((c: string) => c.includes('csrf_token=;'))).toBe(true);
+
+    // Attempting to refresh with the logged-out token should fail
+    const refreshAfterLogout = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', cookies)
+      .set('X-CSRF-Token', csrfToken!);
+
+    expect(refreshAfterLogout.status).toBe(401);
+    expect(refreshAfterLogout.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 12. Refresh-token rotation: Successful rotation & database linking
+  // ---------------------------------------------------------------------------
+  it('12. should successfully refresh and rotate tokens, linking old token to replacement', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Rotation User',
+        email: 'rotation@example.com',
+        password: 'Password123!',
+      });
+
+    const initialCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const initialRefreshToken = getCookieValue(initialCookies, AUTH_COOKIES.REFRESH_TOKEN);
+    const initialCsrfToken = getCookieValue(initialCookies, CSRF_COOKIE_NAME);
+    expect(initialRefreshToken).toBeDefined();
+    expect(initialCsrfToken).toBeDefined();
+
+    // Perform refresh
+    const refreshRes = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', initialCsrfToken!);
+
+    expect(refreshRes.status).toBe(200);
+    expect(refreshRes.body.success).toBe(true);
+
+    const rotatedCookies = refreshRes.headers['set-cookie'] as unknown as string[];
+    const newRefreshToken = getCookieValue(rotatedCookies, AUTH_COOKIES.REFRESH_TOKEN);
+    const newAccessToken = getCookieValue(rotatedCookies, AUTH_COOKIES.ACCESS_TOKEN);
+
+    // New refresh token must be issued and must differ from initial token
+    expect(newRefreshToken).toBeDefined();
+    expect(newAccessToken).toBeDefined();
+    expect(newRefreshToken).not.toBe(initialRefreshToken);
+
+    // Verify database state: exactly 1 active token, 1 revoked token with replacedByTokenHash
+    const activeTokens = await RefreshTokenModel.find({ isRevoked: false });
+    const revokedTokens = await RefreshTokenModel.find({ isRevoked: true });
+
+    expect(activeTokens.length).toBe(1);
+    expect(revokedTokens.length).toBe(1);
+    expect(revokedTokens[0].replacedByTokenHash).toBe(activeTokens[0].tokenHash);
+    expect(revokedTokens[0].revokedAt).toBeDefined();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 13. Refresh-token rotation: Rejection of old refresh token after rotation
+  // ---------------------------------------------------------------------------
+  it('13. should reject an old refresh token that has already been rotated', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Old Token User',
+        email: 'oldtoken@example.com',
+        password: 'Password123!',
+      });
+
+    const initialCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrfToken = getCookieValue(initialCookies, CSRF_COOKIE_NAME)!;
+
+    // First rotation: succeeds
+    const firstRefresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', csrfToken);
+
+    expect(firstRefresh.status).toBe(200);
+
+    // Attempt second refresh using the INITIAL (now rotated/old) cookie
+    const secondRefresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', csrfToken);
+
+    expect(secondRefresh.status).toBe(401);
+    expect(secondRefresh.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 14. Reuse detection: Suspected token theft revokes ALL sessions
+  // ---------------------------------------------------------------------------
+  it('14. should detect refresh token reuse and revoke all sessions for that user', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Theft Detection User',
+        email: 'theft@example.com',
+        password: 'Password123!',
+      });
+
+    const user = regRes.body.data.user;
+    const initialCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const initialCsrf = getCookieValue(initialCookies, CSRF_COOKIE_NAME)!;
+
+    // Legitimate rotation (Token 1 -> Token 2)
+    const legitRefresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', initialCsrf);
+
+    expect(legitRefresh.status).toBe(200);
+    const token2Cookies = legitRefresh.headers['set-cookie'] as unknown as string[];
+    const token2Csrf = getCookieValue(token2Cookies, CSRF_COOKIE_NAME)!;
+
+    // Malicious actor attempts to reuse the already-rotated Token 1
+    const attackRefresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', initialCsrf);
+
+    expect(attackRefresh.status).toBe(401);
+    expect(attackRefresh.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+
+    // Reuse detection MUST have revoked ALL sessions for this user in the database
+    const allUserTokens = await RefreshTokenModel.find({ userId: user.id });
+    expect(allUserTokens.length).toBeGreaterThan(0);
+    const anyActive = allUserTokens.some((t) => !t.isRevoked);
+    expect(anyActive).toBe(false);
+
+    // The legitimate user holding Token 2 must now also be rejected (forced re-login)
+    const token2Refresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', token2Cookies)
+      .set('X-CSRF-Token', token2Csrf);
+
+    expect(token2Refresh.status).toBe(401);
+    expect(token2Refresh.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 15. Concurrency: Atomic consumption under simultaneous requests
+  // ---------------------------------------------------------------------------
+  it('15. should handle concurrent refresh requests atomically so only one succeeds', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Concurrent User',
+        email: 'concurrent@example.com',
+        password: 'Password123!',
+      });
+
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    // Fire 2 concurrent refresh requests with the EXACT same token simultaneously
+    const [resA, resB] = await Promise.all([
+      request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrfToken),
+      request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrfToken),
+    ]);
+
+    const statuses = [resA.status, resB.status];
+
+    // Exactly one must succeed (200) and one must be rejected (401)
+    expect(statuses).toContain(200);
+    expect(statuses).toContain(401);
+
+    // Ensure database consistency: exactly 1 active token should exist
+    const activeTokens = await RefreshTokenModel.find({ isRevoked: false });
+    expect(activeTokens.length).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 16. Refresh attempt by disabled user account
+  // ---------------------------------------------------------------------------
+  it('16. should reject refresh attempt if the user account has been disabled', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Deactivated User',
+        email: 'deactivated@example.com',
+        password: 'Password123!',
+      });
+
+    const userId = regRes.body.data.user.id;
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    // Deactivate user in database
+    await UserModel.findByIdAndUpdate(userId, { isActive: false });
+
+    const refreshRes = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', cookies)
+      .set('X-CSRF-Token', csrfToken);
+
+    expect(refreshRes.status).toBe(401);
+    expect(refreshRes.body.error.code).toBe(AUTH_ERRORS.UNAUTHORIZED);
+    expect(refreshRes.body.error.message).toMatch(/no longer active/i);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 17. Refresh attempt by deleted user account
+  // ---------------------------------------------------------------------------
+  it('17. should reject refresh attempt if the user account has been deleted', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Deleted User',
+        email: 'deleted@example.com',
+        password: 'Password123!',
+      });
+
+    const userId = regRes.body.data.user.id;
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    // Delete user from database completely
+    await UserModel.findByIdAndDelete(userId);
+
+    const refreshRes = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', cookies)
+      .set('X-CSRF-Token', csrfToken);
+
+    expect(refreshRes.status).toBe(401);
+    expect(refreshRes.body.error.code).toBe(AUTH_ERRORS.UNAUTHORIZED);
+    expect(refreshRes.body.error.message).toMatch(/no longer active/i);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 18. CSRF Protection: Verification on cookie-authenticated state-changing routes
+  // ---------------------------------------------------------------------------
+  it('18. should enforce CSRF protection on state-changing requests', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'CSRF User',
+        email: 'csrf@example.com',
+        password: 'Password123!',
+      });
+
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const validCsrf = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+    expect(validCsrf).toBeDefined();
+
+    // 1. Missing CSRF header -> 403 CSRF_TOKEN_MISSING
+    const missingRes = await request(app)
+      .post('/api/auth/logout')
+      .set('Cookie', cookies);
+
+    expect(missingRes.status).toBe(403);
+    expect(missingRes.body.error.code).toBe(AUTH_ERRORS.CSRF_TOKEN_MISSING);
+
+    // 2. Invalid CSRF header value -> 403 CSRF_TOKEN_INVALID
+    const invalidRes = await request(app)
+      .post('/api/auth/logout')
+      .set('Cookie', cookies)
+      .set('X-CSRF-Token', 'forged-or-mismatched-csrf-token-12345');
+
+    expect(invalidRes.status).toBe(403);
+    expect(invalidRes.body.error.code).toBe(AUTH_ERRORS.CSRF_TOKEN_INVALID);
+
+    // 3. Valid CSRF header value -> 200 Success
+    const validRes = await request(app)
+      .post('/api/auth/logout')
+      .set('Cookie', cookies)
+      .set('X-CSRF-Token', validCsrf);
+
+    expect(validRes.status).toBe(200);
+    expect(validRes.body.success).toBe(true);
   });
 });

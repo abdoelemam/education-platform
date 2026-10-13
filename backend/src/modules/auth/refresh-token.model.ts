@@ -26,6 +26,7 @@ const refreshTokenSchema = new Schema<RefreshTokenDocument>(
     tokenHash: {
       type: String,
       required: true,
+      unique: true,
       index: true,
     },
     expiresAt: {

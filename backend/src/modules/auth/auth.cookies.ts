@@ -12,7 +12,7 @@ export function getBaseCookieOptions(): CookieOptions {
 
   return {
     httpOnly: true,
-    secure: isProduction,
+    secure: isProduction || config.COOKIE_SAME_SITE === 'none',
     sameSite: config.COOKIE_SAME_SITE,
     domain: config.COOKIE_DOMAIN,
     path: '/',
