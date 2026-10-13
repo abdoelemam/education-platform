@@ -7,6 +7,7 @@ export interface IRefreshToken {
   isRevoked: boolean;
   revokedAt?: Date;
   replacedByTokenHash?: string;
+  reuseCount?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -46,6 +47,10 @@ const refreshTokenSchema = new Schema<RefreshTokenDocument>(
     replacedByTokenHash: {
       type: String,
       default: undefined,
+    },
+    reuseCount: {
+      type: Number,
+      default: 0,
     },
   },
   {

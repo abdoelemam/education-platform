@@ -1,9 +1,9 @@
 import bcrypt from 'bcrypt';
-import { Types } from 'mongoose';
+import mongoose, { Types } from 'mongoose';
 import { userRepository, type UserRepository } from '../users/user.repository.js';
 import { toPublicUser } from '../users/user.mapper.js';
 import type { PublicUser, UserDocument } from '../users/user.types.js';
-import { RefreshTokenModel } from './refresh-token.model.js';
+import { RefreshTokenModel, type RefreshTokenDocument } from './refresh-token.model.js';
 import {
   generateAccessToken,
   generateRefreshToken,
@@ -17,6 +17,18 @@ import { AppError } from '../../errors/index.js';
 import type { RegisterDto, LoginDto, AuthResult, AuthTokens } from './auth.types.js';
 
 const BCRYPT_SALT_ROUNDS = 12;
+
+/**
+ * Detects whether the active MongoDB deployment topology supports multi-document transactions.
+ * Transactions require a replica set or sharded cluster (mongos). Standalone deployments do not support transactions.
+ */
+function isTransactionSupported(): boolean {
+  const client = mongoose.connection.getClient() as unknown as {
+    topology?: { description?: { type?: string } };
+  };
+  const type = client?.topology?.description?.type;
+  return type === 'ReplicaSetWithPrimary' || type === 'Sharded' || type === 'LoadBalanced';
+}
 
 export class AuthService {
   constructor(private readonly userRepo: UserRepository = userRepository) {}
@@ -109,11 +121,25 @@ export class AuthService {
   /**
    * Rotate refresh token and issue a fresh access token.
    *
-   * Atomicity guarantee:
-   *   The old token is claimed with a single findOneAndUpdate that filters on
-   *   { _id, tokenHash, isRevoked: false }.  Only one concurrent request can
-   *   match that filter; any subsequent request with the same token will find
-   *   no document and be treated as a reuse-detection event.
+   * Security & Failure-Safety Policy:
+   * 1. Pre-validation:
+   *    - Verify user exists and is active before performing any token mutations.
+   * 2. Failure-Safety during rotation:
+   *    - Uses multi-document MongoDB transaction when supported by the cluster.
+   *    - Uses atomic claim with compensating rollback on standalone deployments:
+   *      If persistence of the replacement token fails, the claim on the old token
+   *      is rolled back, keeping the session active so transient DB glitches do not log the user out.
+   * 3. Replay vs Concurrency Policy:
+   *    - Confirmed Reuse (Theft):
+   *      (a) Token rotated outside the grace window (> REFRESH_ROTATION_GRACE_PERIOD_MS).
+   *      (b) Token whose replacement has already been consumed/rotated (chain advanced).
+   *      (c) Repeated presentation of an already-rotated token (reuseCount >= 1).
+   *      Action: Invalidate ALL sessions for the user to contain the breach.
+   *    - Concurrent Sibling Request:
+   *      (a) Token rotated within grace window (<= REFRESH_ROTATION_GRACE_PERIOD_MS).
+   *      (b) Replacement token is still active (chain has not advanced).
+   *      (c) First re-presentation attempt on this token (reuseCount == 0).
+   *      Action: Increment reuseCount, reject safely with 401 without revoking the active session.
    */
   async refresh(rawRefreshToken: string): Promise<AuthTokens> {
     const payload = verifyRefreshToken(rawRefreshToken);
@@ -125,97 +151,7 @@ export class AuthService {
       );
     }
 
-    const incomingHash = hashToken(rawRefreshToken);
-
-    // ---------------------------------------------------------------------------
-    // Atomic claim: only succeeds if the token exists, is not revoked, AND is not expired.
-    // Concurrent requests with the same token will receive null on all but one.
-    // ---------------------------------------------------------------------------
-    const now = new Date();
-    const tokenRecord = await RefreshTokenModel.findOneAndUpdate(
-      {
-        _id: new Types.ObjectId(payload.tokenId),
-        tokenHash: incomingHash,
-        isRevoked: false,
-        expiresAt: { $gt: now },
-      },
-      {
-        isRevoked: true,
-        revokedAt: now,
-      },
-      { new: false }, // return the document BEFORE the update
-    ).exec();
-
-    if (!tokenRecord) {
-      // The token was not matched with isRevoked:false.
-      // Look up by ID to distinguish reuse/expired from unknown.
-      const existingRecord = await RefreshTokenModel.findById(
-        new Types.ObjectId(payload.tokenId),
-      ).exec();
-
-      if (existingRecord?.isRevoked) {
-        if (existingRecord.expiresAt <= now) {
-          throw new AppError(
-            401,
-            AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-            'Refresh token has expired',
-          );
-        }
-
-        const revokedTime = existingRecord.revokedAt ? existingRecord.revokedAt.getTime() : 0;
-        const elapsedMs = now.getTime() - revokedTime;
-        const isWithinGracePeriod = elapsedMs <= REFRESH_ROTATION_GRACE_PERIOD_MS;
-
-        // Check if token was previously rotated (has replacedByTokenHash)
-        if (existingRecord.replacedByTokenHash) {
-          if (!isWithinGracePeriod) {
-            // Theft detection: Token was rotated outside the grace window and presented again.
-            // Revoke all active sessions for this user.
-            await RefreshTokenModel.updateMany(
-              { userId: new Types.ObjectId(payload.sub) },
-              { isRevoked: true, revokedAt: now },
-            ).exec();
-
-            throw new AppError(
-              401,
-              AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-              'Refresh token reuse detected. All sessions have been revoked for security.',
-            );
-          }
-
-          // Within grace window: this is a legitimate in-flight concurrent request during rotation.
-          // Reject safely without revoking the newly issued session.
-          throw new AppError(
-            401,
-            AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-            'Refresh token was recently rotated. Please use the newly issued session.',
-          );
-        }
-
-        // Token was revoked without replacement (e.g. concurrent in-flight save or logout)
-        if (isWithinGracePeriod) {
-          throw new AppError(
-            401,
-            AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-            'Refresh token was recently rotated. Please use the newly issued session.',
-          );
-        }
-
-        throw new AppError(
-          401,
-          AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-          'Refresh token has been revoked',
-        );
-      }
-
-      throw new AppError(
-        401,
-        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-        'Refresh token is invalid, expired, or has already been used',
-      );
-    }
-
-    // Verify the user still exists and is active
+    // Step 1: Pre-validate user status before mutating token state
     const user = await this.userRepo.findById(payload.sub);
     if (!user || !user.isActive) {
       throw new AppError(
@@ -225,7 +161,9 @@ export class AuthService {
       );
     }
 
-    // Generate new refresh token (rotation)
+    const incomingHash = hashToken(rawRefreshToken);
+
+    // Step 2: Prepare replacement token document
     const newRecordId = new Types.ObjectId();
     const newRefreshToken = generateRefreshToken(user._id.toString(), newRecordId.toString());
     const newExpiresAt = new Date(Date.now() + parseDurationToMs(config.JWT_REFRESH_EXPIRES_IN));
@@ -236,21 +174,250 @@ export class AuthService {
       tokenHash: hashToken(newRefreshToken),
       expiresAt: newExpiresAt,
       isRevoked: false,
+      reuseCount: 0,
     });
-    await newRecord.save();
 
-    // Link old record to its replacement for reuse-detection chain
-    await RefreshTokenModel.findByIdAndUpdate(tokenRecord._id, {
-      replacedByTokenHash: newRecord.tokenHash,
-    }).exec();
+    // Step 3: Execute rotation with transactional or compensating failure-safety
+    return this.executeRotationWithSafety({
+      tokenId: payload.tokenId,
+      userId: user._id.toString(),
+      incomingHash,
+      newRecord,
+      user,
+      newRefreshToken,
+    });
+  }
 
-    // Issue new JWT pair
-    const accessToken = generateAccessToken(user);
+  /**
+   * Evaluates an already-claimed or unrecognized refresh token according to the Replay Policy.
+   */
+  private async handleUnclaimedToken(
+    tokenId: string,
+    userId: string,
+    now: Date,
+  ): Promise<never> {
+    const existingRecord = await RefreshTokenModel.findById(
+      new Types.ObjectId(tokenId),
+    ).exec();
 
-    return {
-      accessToken,
-      refreshToken: newRefreshToken,
-    };
+    if (!existingRecord) {
+      throw new AppError(
+        401,
+        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+        'Refresh token is invalid, expired, or has already been used',
+      );
+    }
+
+    if (existingRecord.expiresAt <= now) {
+      throw new AppError(
+        401,
+        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+        'Refresh token has expired',
+      );
+    }
+
+    if (!existingRecord.isRevoked) {
+      // Token exists and is not revoked, but failed the hash match
+      throw new AppError(
+        401,
+        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+        'Invalid refresh token signature',
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // The token was previously revoked. Check if it was part of a rotation.
+    // -------------------------------------------------------------------------
+    if (existingRecord.replacedByTokenHash) {
+      const revokedTime = existingRecord.revokedAt ? existingRecord.revokedAt.getTime() : 0;
+      const elapsedMs = now.getTime() - revokedTime;
+      const isOutsideGracePeriod = elapsedMs > REFRESH_ROTATION_GRACE_PERIOD_MS;
+      const isRepeatedAttempt = (existingRecord.reuseCount ?? 0) >= 1;
+
+      // Check whether the replacement token has already advanced (been rotated/revoked)
+      const replacementDoc = await RefreshTokenModel.findOne({
+        tokenHash: existingRecord.replacedByTokenHash,
+      }).exec();
+      const replacementAlreadyConsumed = replacementDoc?.isRevoked === true;
+
+      const isConfirmedReuse =
+        isOutsideGracePeriod || isRepeatedAttempt || replacementAlreadyConsumed;
+
+      if (isConfirmedReuse) {
+        // Confirmed Theft / Replay Policy:
+        // Revoke all active sessions for this user to contain the breach.
+        await RefreshTokenModel.updateMany(
+          { userId: new Types.ObjectId(userId) },
+          { isRevoked: true, revokedAt: now },
+        ).exec();
+
+        throw new AppError(
+          401,
+          AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+          'Refresh token reuse detected. All sessions have been revoked for security.',
+        );
+      }
+
+      // Legitimate Concurrent Request Policy:
+      // Within grace window, replacement still active, and first concurrent attempt.
+      // Increment reuseCount to detect subsequent replays.
+      await RefreshTokenModel.findByIdAndUpdate(existingRecord._id, {
+        $inc: { reuseCount: 1 },
+      }).exec();
+
+      throw new AppError(
+        401,
+        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+        'Refresh token was recently rotated. Please use the newly issued session.',
+      );
+    }
+
+    // Revoked without replacement (e.g. explicitly logged out or in-flight rollback)
+    const revokedTime = existingRecord.revokedAt ? existingRecord.revokedAt.getTime() : 0;
+    const elapsedMs = now.getTime() - revokedTime;
+    if (elapsedMs <= REFRESH_ROTATION_GRACE_PERIOD_MS) {
+      throw new AppError(
+        401,
+        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+        'Refresh token was recently rotated. Please use the newly issued session.',
+      );
+    }
+
+    throw new AppError(
+      401,
+      AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+      'Refresh token has been revoked',
+    );
+  }
+
+  /**
+   * Executes token rotation with multi-document transaction when supported by MongoDB,
+   * or compensating rollback when running on standalone deployments without transaction support.
+   */
+  private async executeRotationWithSafety(params: {
+    tokenId: string;
+    userId: string;
+    incomingHash: string;
+    newRecord: RefreshTokenDocument;
+    user: UserDocument;
+    newRefreshToken: string;
+  }): Promise<AuthTokens> {
+    const { tokenId, userId, incomingHash, newRecord, user, newRefreshToken } = params;
+    const now = new Date();
+
+    // -------------------------------------------------------------------------
+    // Strategy A: Multi-document transaction (if supported by MongoDB cluster)
+    // -------------------------------------------------------------------------
+    if (isTransactionSupported()) {
+      let session: mongoose.ClientSession | null = null;
+      try {
+        session = await mongoose.startSession();
+        session.startTransaction();
+
+        const tokenRecord = await RefreshTokenModel.findOneAndUpdate(
+          {
+            _id: new Types.ObjectId(tokenId),
+            tokenHash: incomingHash,
+            isRevoked: false,
+            expiresAt: { $gt: now },
+          },
+          {
+            isRevoked: true,
+            revokedAt: now,
+          },
+          { new: false, session },
+        ).exec();
+
+        if (!tokenRecord) {
+          await session.abortTransaction();
+          await session.endSession();
+          return this.handleUnclaimedToken(tokenId, userId, now);
+        }
+
+        await newRecord.save({ session });
+
+        await RefreshTokenModel.findByIdAndUpdate(
+          tokenRecord._id,
+          { replacedByTokenHash: newRecord.tokenHash },
+          { session },
+        ).exec();
+
+        await session.commitTransaction();
+        await session.endSession();
+
+        const accessToken = generateAccessToken(user);
+        return { accessToken, refreshToken: newRefreshToken };
+      } catch (err: unknown) {
+        if (session) {
+          await session.abortTransaction().catch(() => {});
+          await session.endSession().catch(() => {});
+        }
+
+        const isCapabilityError =
+          err instanceof Error &&
+          err.message.includes('Transaction numbers are only allowed');
+
+        if (!isCapabilityError) {
+          throw err;
+        }
+        // If transactions are not supported, proceed to Strategy B below
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Strategy B: Atomic Claim with Compensating Rollback (Fallback for Standalone)
+    // -------------------------------------------------------------------------
+    // 1. Claim the old token atomically
+    const tokenRecord = await RefreshTokenModel.findOneAndUpdate(
+      {
+        _id: new Types.ObjectId(tokenId),
+        tokenHash: incomingHash,
+        isRevoked: false,
+        expiresAt: { $gt: now },
+      },
+      {
+        isRevoked: true,
+        revokedAt: now,
+      },
+      { new: false },
+    ).exec();
+
+    if (!tokenRecord) {
+      return this.handleUnclaimedToken(tokenId, userId, now);
+    }
+
+    let newRecordSaved = false;
+
+    try {
+      // 2. Persist the replacement token
+      await newRecord.save();
+      newRecordSaved = true;
+
+      // 3. Link the old token to the replacement hash
+      await RefreshTokenModel.findByIdAndUpdate(tokenRecord._id, {
+        replacedByTokenHash: newRecord.tokenHash,
+      }).exec();
+
+      const accessToken = generateAccessToken(user);
+      return { accessToken, refreshToken: newRefreshToken };
+    } catch (rotationError) {
+      // -----------------------------------------------------------------------
+      // Compensating rollback:
+      // A failure occurred after claiming the old token. Roll back the claim
+      // so the user is NOT left unexpectedly logged out due to transient error!
+      // -----------------------------------------------------------------------
+      if (newRecordSaved) {
+        await RefreshTokenModel.findByIdAndDelete(newRecord._id).catch(() => {});
+      }
+
+      await RefreshTokenModel.findByIdAndUpdate(tokenRecord._id, {
+        isRevoked: false,
+        revokedAt: undefined,
+        replacedByTokenHash: undefined,
+      }).catch(() => {});
+
+      throw rotationError;
+    }
   }
 
   /**
