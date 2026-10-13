@@ -15,3 +15,10 @@ export const AUTH_ERRORS = {
   CSRF_TOKEN_MISSING: 'CSRF_TOKEN_MISSING',
   CSRF_TOKEN_INVALID: 'CSRF_TOKEN_INVALID',
 } as const;
+
+/**
+ * Grace period (in milliseconds) allowed for in-flight concurrent refresh requests.
+ * Sibling requests presenting the recently rotated token within this window are rejected
+ * safely without triggering user session revocation.
+ */
+export const REFRESH_ROTATION_GRACE_PERIOD_MS = 15 * 1000; // 15 seconds

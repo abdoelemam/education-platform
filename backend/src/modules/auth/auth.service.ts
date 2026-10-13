@@ -11,7 +11,7 @@ import {
   verifyRefreshToken,
   parseDurationToMs,
 } from './auth.tokens.js';
-import { AUTH_ERRORS } from './auth.constants.js';
+import { AUTH_ERRORS, REFRESH_ROTATION_GRACE_PERIOD_MS } from './auth.constants.js';
 import { config } from '../../config/index.js';
 import { AppError } from '../../errors/index.js';
 import type { RegisterDto, LoginDto, AuthResult, AuthTokens } from './auth.types.js';
@@ -147,25 +147,64 @@ export class AuthService {
     ).exec();
 
     if (!tokenRecord) {
-      // The token was not matched. Look up by ID to distinguish reuse/expired from unknown.
+      // The token was not matched with isRevoked:false.
+      // Look up by ID to distinguish reuse/expired from unknown.
       const existingRecord = await RefreshTokenModel.findById(
         new Types.ObjectId(payload.tokenId),
       ).exec();
 
-      if (existingRecord?.isRevoked && existingRecord.replacedByTokenHash) {
-        // A replacement was already issued — treat as suspected token theft.
-        // Revoke all sessions for this user.
-        await RefreshTokenModel.updateMany(
-          { userId: new Types.ObjectId(payload.sub) },
-          { isRevoked: true, revokedAt: new Date() },
-        ).exec();
-      }
+      if (existingRecord?.isRevoked) {
+        if (existingRecord.expiresAt <= now) {
+          throw new AppError(
+            401,
+            AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+            'Refresh token has expired',
+          );
+        }
 
-      if (existingRecord && existingRecord.expiresAt <= now) {
+        const revokedTime = existingRecord.revokedAt ? existingRecord.revokedAt.getTime() : 0;
+        const elapsedMs = now.getTime() - revokedTime;
+        const isWithinGracePeriod = elapsedMs <= REFRESH_ROTATION_GRACE_PERIOD_MS;
+
+        // Check if token was previously rotated (has replacedByTokenHash)
+        if (existingRecord.replacedByTokenHash) {
+          if (!isWithinGracePeriod) {
+            // Theft detection: Token was rotated outside the grace window and presented again.
+            // Revoke all active sessions for this user.
+            await RefreshTokenModel.updateMany(
+              { userId: new Types.ObjectId(payload.sub) },
+              { isRevoked: true, revokedAt: now },
+            ).exec();
+
+            throw new AppError(
+              401,
+              AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+              'Refresh token reuse detected. All sessions have been revoked for security.',
+            );
+          }
+
+          // Within grace window: this is a legitimate in-flight concurrent request during rotation.
+          // Reject safely without revoking the newly issued session.
+          throw new AppError(
+            401,
+            AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+            'Refresh token was recently rotated. Please use the newly issued session.',
+          );
+        }
+
+        // Token was revoked without replacement (e.g. concurrent in-flight save or logout)
+        if (isWithinGracePeriod) {
+          throw new AppError(
+            401,
+            AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+            'Refresh token was recently rotated. Please use the newly issued session.',
+          );
+        }
+
         throw new AppError(
           401,
           AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-          'Refresh token has expired',
+          'Refresh token has been revoked',
         );
       }
 

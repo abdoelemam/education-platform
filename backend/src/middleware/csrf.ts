@@ -6,36 +6,47 @@ import { AppError } from '../errors/index.js';
 /**
  * CSRF Protection — Double-Submit Cookie Pattern
  *
- * Deployment model:
- *   - React SPA (frontend) served from its own origin (e.g. https://app.example.com)
- *   - Express API (backend) served from its API origin (e.g. https://api.example.com)
- *   - HTTPS in production; both origins share a parent domain (or SameSite=None+Secure)
- *   - Authentication uses HttpOnly cookies for token storage
+ * Supported Deployment Scenarios:
+ *
+ * 1. Same-Origin Architecture (Reverse Proxy / Single Domain)
+ *    - Example: Frontend at https://example.com, API at https://example.com/api
+ *    - COOKIE_SAME_SITE: 'lax'
+ *    - COOKIE_DOMAIN: (unset/omitted — host-only cookie, most secure)
+ *    - CORS_ORIGIN: 'https://example.com'
+ *    - Security: Browsers only attach cookies on first-party requests. The Double-Submit
+ *      cookie pattern provides defence-in-depth against subtle cross-site POST attacks.
+ *
+ * 2. Shared-Domain / Subdomain Architecture (Separate Subdomains)
+ *    - Example: Frontend at https://app.example.com, API at https://api.example.com
+ *    - COOKIE_SAME_SITE: 'lax' (both origins share the same registrable domain 'example.com')
+ *    - COOKIE_DOMAIN: '.example.com' (enables cookie sharing across subdomains)
+ *    - CORS_ORIGIN: 'https://app.example.com' with credentials: true
+ *    - Security: Both subdomains belong to the same site. The double-submit CSRF cookie
+ *      is accessible to app.example.com, while external domains (*.attacker.com) cannot
+ *      read it. Note: Subdomain security assumes all other subdomains on example.com are trusted.
+ *
+ * 3. Cross-Site Cross-Origin Architecture (Distinct Domains)
+ *    - Example: Frontend at https://my-app.vercel.app, API at https://api.render.com
+ *    - COOKIE_SAME_SITE: 'none' (mandatory for cross-site cookie transmission)
+ *    - Secure flag: ALWAYS true (enforced automatically in getBaseCookieOptions)
+ *    - CORS_ORIGIN: 'https://my-app.vercel.app' with credentials: true
+ *    - Security: When SameSite=None is used, ambient cookies are sent with all cross-site
+ *      requests. The Double-Submit cookie pattern is the PRIMARY defense: external sites
+ *      cannot read the non-HttpOnly csrf_token cookie across origins, so they cannot
+ *      populate the required X-CSRF-Token header.
+ *    - Limitation: Strict browsers (e.g., Safari ITP or Chrome third-party cookie phase-out)
+ *      may partition or block cross-site cookies. For production SaaS, Scenario 1 or 2 is
+ *      strongly recommended over Scenario 3.
  *
  * Why CORS alone is not enough:
- *   CORS restricts which origins can READ cross-origin responses, but a forged form
- *   POST or a request from a malicious origin with `credentials: 'include'` can still
- *   cause cookie-authenticated state changes.  A CSRF token carried in a custom header
- *   (X-CSRF-Token) closes this gap because the Same-Origin Policy prevents a third-party
- *   page from reading or setting arbitrary request headers on cross-origin fetch.
+ *    CORS prevents cross-origin scripts from READING responses, but does NOT prevent
+ *    browsers from executing state-changing POST/PUT requests with ambient cookies.
+ *    Custom headers (X-CSRF-Token) trigger CORS preflight and cannot be forged by
+ *    third-party HTML forms or scripts.
  *
- * How it works:
- *   1. After login/register the server calls `setCsrfCookie()` to set a READABLE
- *      (non-HttpOnly) cookie containing a cryptographically random token.
- *   2. The React client reads this cookie and includes the value in the X-CSRF-Token
- *      header on every state-changing request (POST / PUT / PATCH / DELETE).
- *   3. `verifyCsrfToken` middleware validates that the header value matches the cookie
- *      value.  A forged cross-site request cannot set custom headers, so it fails.
- *
- * Local development:
- *   When NODE_ENV !== 'production' the CSRF cookie is not Secure and SameSite defaults
- *   to 'lax', which keeps local http:// development working without TLS.
- *
- * SameSite consideration:
- *   - Same-origin deployment (frontend+backend same domain): SameSite=Lax is sufficient
- *     and CSRF tokens are a defence-in-depth measure.
- *   - Cross-origin deployment (separate domains): SameSite=None+Secure is required for
- *     cookies to be sent at all; CSRF tokens remain the primary cross-site guard.
+ * Local Development:
+ *    When NODE_ENV !== 'production' and COOKIE_SAME_SITE !== 'none', cookies are set
+ *    without the Secure flag to allow seamless testing over http://localhost without TLS.
  */
 
 import { AUTH_ERRORS } from '../modules/auth/auth.constants.js';

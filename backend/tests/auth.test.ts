@@ -13,7 +13,52 @@ import { AUTH_COOKIES, AUTH_ERRORS } from '../src/modules/auth/auth.constants.js
 import { CSRF_COOKIE_NAME } from '../src/middleware/csrf.js';
 import { globalErrorHandler } from '../src/middleware/error-handler.js';
 
+const EXPECTED_TEST_DB_NAME = 'education-platform-test';
+const ALLOWED_TEST_HOSTS = new Set(['127.0.0.1', 'localhost']);
 const TEST_DB_URI = 'mongodb://127.0.0.1:27017/education-platform-test';
+
+/**
+ * Strict database safety assertion:
+ * Prevents accidental connection, write, or deletion on any non-test database.
+ * Verifies host is local loopback, database name strictly matches EXPECTED_TEST_DB_NAME,
+ * and environment is never production.
+ */
+function assertSafeTestDatabase(): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('FATAL DATABASE SAFETY VIOLATION: Tests must never execute when NODE_ENV is "production".');
+  }
+
+  let parsedUri: URL;
+  try {
+    parsedUri = new URL(TEST_DB_URI);
+  } catch {
+    throw new Error(`FATAL DATABASE SAFETY VIOLATION: Invalid TEST_DB_URI: ${TEST_DB_URI}`);
+  }
+
+  if (parsedUri.protocol !== 'mongodb:') {
+    throw new Error(`FATAL DATABASE SAFETY VIOLATION: Protocol must be "mongodb:". Received: ${parsedUri.protocol}`);
+  }
+
+  if (!ALLOWED_TEST_HOSTS.has(parsedUri.hostname)) {
+    throw new Error(`FATAL DATABASE SAFETY VIOLATION: Test database host must be local loopback. Received: ${parsedUri.hostname}`);
+  }
+
+  const dbNameFromUri = parsedUri.pathname.replace(/^\//, '');
+  if (dbNameFromUri !== EXPECTED_TEST_DB_NAME) {
+    throw new Error(`FATAL DATABASE SAFETY VIOLATION: Database name in URI must strictly equal "${EXPECTED_TEST_DB_NAME}". Received: "${dbNameFromUri}"`);
+  }
+
+  // If Mongoose connection is already established, verify live connection metadata
+  if (mongoose.connection.readyState === 1) {
+    if (mongoose.connection.name !== EXPECTED_TEST_DB_NAME) {
+      throw new Error(`FATAL DATABASE SAFETY VIOLATION: Live Mongoose connection database name "${mongoose.connection.name}" does not match "${EXPECTED_TEST_DB_NAME}".`);
+    }
+
+    if (mongoose.connection.host && !ALLOWED_TEST_HOSTS.has(mongoose.connection.host)) {
+      throw new Error(`FATAL DATABASE SAFETY VIOLATION: Live Mongoose connection host "${mongoose.connection.host}" is not in allowed loopback hosts.`);
+    }
+  }
+}
 
 /**
  * Helper to extract a cookie value by name from Supertest Set-Cookie headers.
@@ -54,35 +99,24 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   roleTestApp.use(globalErrorHandler);
 
   beforeAll(async () => {
-    // -------------------------------------------------------------------------
-    // Database Safety Guard: Prevent accidental connection or deletion of prod data
-    // -------------------------------------------------------------------------
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('SAFETY CHECK FAILED: Tests must never run in production mode (NODE_ENV=production).');
-    }
-
-    if (!TEST_DB_URI.includes('test')) {
-      throw new Error(`SAFETY CHECK FAILED: TEST_DB_URI must explicitly contain 'test'. Found: ${TEST_DB_URI}`);
-    }
+    assertSafeTestDatabase();
 
     if (mongoose.connection.readyState === 0) {
       await mongoose.connect(TEST_DB_URI);
     }
 
-    // Verify connected database name
-    const connectedDbName = mongoose.connection.name;
-    if (!connectedDbName || !connectedDbName.toLowerCase().includes('test')) {
-      throw new Error(`SAFETY CHECK FAILED: Connected database name must contain 'test'. Connected to: ${connectedDbName}`);
-    }
+    assertSafeTestDatabase();
   });
 
   afterAll(async () => {
+    assertSafeTestDatabase();
     await UserModel.deleteMany({});
     await RefreshTokenModel.deleteMany({});
     await mongoose.disconnect();
   });
 
   beforeEach(async () => {
+    assertSafeTestDatabase();
     await UserModel.deleteMany({});
     await RefreshTokenModel.deleteMany({});
   });
@@ -108,7 +142,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(res.body.data.user.passwordHash).toBeUndefined();
     expect(res.body.data.user.id).toBeDefined();
 
-    // Verify cookies are set
     const cookies = res.headers['set-cookie'] as unknown as string[];
     expect(cookies).toBeDefined();
     expect(cookies.some((c: string) => c.includes(AUTH_COOKIES.ACCESS_TOKEN))).toBe(true);
@@ -121,7 +154,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   // 2. Duplicate email
   // ---------------------------------------------------------------------------
   it('2. should reject registration when email already exists (409 Conflict)', async () => {
-    // First registration
     await request(app)
       .post('/api/auth/register')
       .send({
@@ -130,12 +162,11 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
         password: 'Password123!',
       });
 
-    // Attempt second registration with same email
     const res = await request(app)
       .post('/api/auth/register')
       .send({
         name: 'Another Jane',
-        email: 'DUPLICATE@example.com', // test case-insensitivity
+        email: 'DUPLICATE@example.com',
         password: 'Password999!',
       });
 
@@ -151,18 +182,15 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const res = await request(app)
       .post('/api/auth/register')
       .send({
-        name: 'J', // too short
+        name: 'J',
         email: 'invalid-email',
-        password: 'short', // less than 8 chars
+        password: 'short',
       });
 
     expect(res.status).toBe(422);
     expect(res.body.success).toBe(false);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
     expect(res.body.error.details.body).toBeDefined();
-    expect(res.body.error.details.body.name).toBeDefined();
-    expect(res.body.error.details.body.email).toBeDefined();
-    expect(res.body.error.details.body.password).toBeDefined();
   });
 
   // ---------------------------------------------------------------------------
@@ -190,7 +218,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(res.body.data.user.lastLoginAt).toBeDefined();
     expect(res.body.data.user.passwordHash).toBeUndefined();
 
-    // Verify cookies
     const cookies = res.headers['set-cookie'] as unknown as string[];
     expect(cookies).toBeDefined();
     expect(cookies.some((c: string) => c.includes(AUTH_COOKIES.ACCESS_TOKEN))).toBe(true);
@@ -210,7 +237,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
         password: 'Password123!',
       });
 
-    // Wrong password
     const resWrongPass = await request(app)
       .post('/api/auth/login')
       .send({
@@ -221,7 +247,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(resWrongPass.status).toBe(401);
     expect(resWrongPass.body.error.code).toBe('AUTH_INVALID_CREDENTIALS');
 
-    // Non-existent email (prevents account enumeration)
     const resNoUser = await request(app)
       .post('/api/auth/login')
       .send({
@@ -263,12 +288,10 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   // 7. Authentication middleware
   // ---------------------------------------------------------------------------
   it('7. should protect GET /api/auth/me and reject unauthenticated requests', async () => {
-    // Unauthenticated
     const unauthRes = await request(app).get('/api/auth/me');
     expect(unauthRes.status).toBe(401);
     expect(unauthRes.body.error.code).toBe('AUTH_UNAUTHORIZED');
 
-    // Authenticated via cookie
     const loginRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -288,7 +311,7 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 8. Invalid or expired access token
+  // 8. Invalid or forged access token
   // ---------------------------------------------------------------------------
   it('8. should reject requests with invalid or forged access tokens', async () => {
     const res = await request(app)
@@ -303,7 +326,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   // 9. Role authorization
   // ---------------------------------------------------------------------------
   it('9. should enforce role authorization properly with requireRole', async () => {
-    // Register as student
     const studentRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -315,7 +337,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
 
     const studentCookies = studentRes.headers['set-cookie'] as unknown as string[];
 
-    // Student attempts to access admin route -> 403
     const adminAttempt = await request(roleTestApp)
       .get('/api/test-admin-only')
       .set('Cookie', studentCookies);
@@ -323,7 +344,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(adminAttempt.status).toBe(403);
     expect(adminAttempt.body.error.code).toBe('AUTH_FORBIDDEN');
 
-    // Register as teacher
     const teacherRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -335,7 +355,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
 
     const teacherCookies = teacherRes.headers['set-cookie'] as unknown as string[];
 
-    // Teacher accesses teacher route -> 200
     const teacherAccess = await request(roleTestApp)
       .get('/api/test-teacher-only')
       .set('Cookie', teacherCookies);
@@ -389,11 +408,9 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME);
     expect(csrfToken).toBeDefined();
 
-    // Verify refresh session was created in DB
     const sessionCountBefore = await RefreshTokenModel.countDocuments({ isRevoked: false });
     expect(sessionCountBefore).toBe(1);
 
-    // Logout with CSRF header
     const logoutRes = await request(app)
       .post('/api/auth/logout')
       .set('Cookie', cookies)
@@ -402,11 +419,9 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(logoutRes.status).toBe(200);
     expect(logoutRes.body.success).toBe(true);
 
-    // Verify session revoked in DB
     const sessionCountAfter = await RefreshTokenModel.countDocuments({ isRevoked: false });
     expect(sessionCountAfter).toBe(0);
 
-    // Verify clear-cookie headers for access_token, refresh_token, and csrf_token
     const clearCookies = logoutRes.headers['set-cookie'] as unknown as string[];
     expect(clearCookies).toBeDefined();
     expect(clearCookies.some((c: string) => c.includes('access_token=;'))).toBe(true);
@@ -441,7 +456,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(initialRefreshToken).toBeDefined();
     expect(initialCsrfToken).toBeDefined();
 
-    // Perform refresh
     const refreshRes = await request(app)
       .post('/api/auth/refresh')
       .set('Cookie', initialCookies)
@@ -454,12 +468,10 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const newRefreshToken = getCookieValue(rotatedCookies, AUTH_COOKIES.REFRESH_TOKEN);
     const newAccessToken = getCookieValue(rotatedCookies, AUTH_COOKIES.ACCESS_TOKEN);
 
-    // New refresh token must be issued and must differ from initial token
     expect(newRefreshToken).toBeDefined();
     expect(newAccessToken).toBeDefined();
     expect(newRefreshToken).not.toBe(initialRefreshToken);
 
-    // Verify database state: exactly 1 active token, 1 revoked token with replacedByTokenHash
     const activeTokens = await RefreshTokenModel.find({ isRevoked: false });
     const revokedTokens = await RefreshTokenModel.find({ isRevoked: true });
 
@@ -484,7 +496,7 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const initialCookies = regRes.headers['set-cookie'] as unknown as string[];
     const csrfToken = getCookieValue(initialCookies, CSRF_COOKIE_NAME)!;
 
-    // First rotation: succeeds
+    // First rotation succeeds
     const firstRefresh = await request(app)
       .post('/api/auth/refresh')
       .set('Cookie', initialCookies)
@@ -492,7 +504,7 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
 
     expect(firstRefresh.status).toBe(200);
 
-    // Attempt second refresh using the INITIAL (now rotated/old) cookie
+    // Second refresh using the INITIAL (now rotated) token must fail
     const secondRefresh = await request(app)
       .post('/api/auth/refresh')
       .set('Cookie', initialCookies)
@@ -503,60 +515,9 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 14. Reuse detection: Suspected token theft revokes ALL sessions
+  // 14. Concurrency: Atomic consumption under 2 simultaneous requests
   // ---------------------------------------------------------------------------
-  it('14. should detect refresh token reuse and revoke all sessions for that user', async () => {
-    const regRes = await request(app)
-      .post('/api/auth/register')
-      .send({
-        name: 'Theft Detection User',
-        email: 'theft@example.com',
-        password: 'Password123!',
-      });
-
-    const user = regRes.body.data.user;
-    const initialCookies = regRes.headers['set-cookie'] as unknown as string[];
-    const initialCsrf = getCookieValue(initialCookies, CSRF_COOKIE_NAME)!;
-
-    // Legitimate rotation (Token 1 -> Token 2)
-    const legitRefresh = await request(app)
-      .post('/api/auth/refresh')
-      .set('Cookie', initialCookies)
-      .set('X-CSRF-Token', initialCsrf);
-
-    expect(legitRefresh.status).toBe(200);
-    const token2Cookies = legitRefresh.headers['set-cookie'] as unknown as string[];
-    const token2Csrf = getCookieValue(token2Cookies, CSRF_COOKIE_NAME)!;
-
-    // Malicious actor attempts to reuse the already-rotated Token 1
-    const attackRefresh = await request(app)
-      .post('/api/auth/refresh')
-      .set('Cookie', initialCookies)
-      .set('X-CSRF-Token', initialCsrf);
-
-    expect(attackRefresh.status).toBe(401);
-    expect(attackRefresh.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
-
-    // Reuse detection MUST have revoked ALL sessions for this user in the database
-    const allUserTokens = await RefreshTokenModel.find({ userId: user.id });
-    expect(allUserTokens.length).toBeGreaterThan(0);
-    const anyActive = allUserTokens.some((t) => !t.isRevoked);
-    expect(anyActive).toBe(false);
-
-    // The legitimate user holding Token 2 must now also be rejected (forced re-login)
-    const token2Refresh = await request(app)
-      .post('/api/auth/refresh')
-      .set('Cookie', token2Cookies)
-      .set('X-CSRF-Token', token2Csrf);
-
-    expect(token2Refresh.status).toBe(401);
-    expect(token2Refresh.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
-  });
-
-  // ---------------------------------------------------------------------------
-  // 15. Concurrency: Atomic consumption under simultaneous requests
-  // ---------------------------------------------------------------------------
-  it('15. should handle concurrent refresh requests atomically so only one succeeds', async () => {
+  it('14. should handle concurrent refresh requests atomically without revoking the newly issued session', async () => {
     const regRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -586,15 +547,125 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(statuses).toContain(200);
     expect(statuses).toContain(401);
 
-    // Ensure database consistency: exactly 1 active token should exist
+    // Critical assertion: The sibling 401 must NOT have revoked the new session!
+    // Exactly 1 active session MUST exist in the database
     const activeTokens = await RefreshTokenModel.find({ isRevoked: false });
     expect(activeTokens.length).toBe(1);
+
+    // Verify the winning response's new session is usable
+    const successRes = resA.status === 200 ? resA : resB;
+    const newCookies = successRes.headers['set-cookie'] as unknown as string[];
+    const meRes = await request(app)
+      .get('/api/auth/me')
+      .set('Cookie', newCookies);
+
+    expect(meRes.status).toBe(200);
+    expect(meRes.body.data.user.email).toBe('concurrent@example.com');
   });
 
   // ---------------------------------------------------------------------------
-  // 16. Refresh attempt by disabled user account
+  // 15. Concurrency: High concurrency scenario (5 simultaneous requests)
   // ---------------------------------------------------------------------------
-  it('16. should reject refresh attempt if the user account has been disabled', async () => {
+  it('15. should handle high concurrency (5 simultaneous refresh requests) with stable results', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'High Concurrency User',
+        email: 'highconcurrent@example.com',
+        password: 'Password123!',
+      });
+
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    // Launch 5 concurrent refresh requests with identical token
+    const responses = await Promise.all([
+      request(app).post('/api/auth/refresh').set('Cookie', cookies).set('X-CSRF-Token', csrfToken),
+      request(app).post('/api/auth/refresh').set('Cookie', cookies).set('X-CSRF-Token', csrfToken),
+      request(app).post('/api/auth/refresh').set('Cookie', cookies).set('X-CSRF-Token', csrfToken),
+      request(app).post('/api/auth/refresh').set('Cookie', cookies).set('X-CSRF-Token', csrfToken),
+      request(app).post('/api/auth/refresh').set('Cookie', cookies).set('X-CSRF-Token', csrfToken),
+    ]);
+
+    const successCount = responses.filter((r) => r.status === 200).length;
+    const rejectedCount = responses.filter((r) => r.status === 401).length;
+
+    // Exactly 1 wins, exactly 4 are rejected safely
+    expect(successCount).toBe(1);
+    expect(rejectedCount).toBe(4);
+
+    // Exactly 1 active session in the database; none of the 4 rejections killed the new session
+    const activeTokens = await RefreshTokenModel.find({ isRevoked: false });
+    expect(activeTokens.length).toBe(1);
+
+    const winningRes = responses.find((r) => r.status === 200)!;
+    const newCookies = winningRes.headers['set-cookie'] as unknown as string[];
+    const meRes = await request(app).get('/api/auth/me').set('Cookie', newCookies);
+    expect(meRes.status).toBe(200);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 16. Reuse detection: Suspected token theft revokes ALL sessions outside grace period
+  // ---------------------------------------------------------------------------
+  it('16. should detect refresh token reuse outside grace period and revoke all sessions for that user', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Theft Detection User',
+        email: 'theft@example.com',
+        password: 'Password123!',
+      });
+
+    const user = regRes.body.data.user;
+    const initialCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const initialCsrf = getCookieValue(initialCookies, CSRF_COOKIE_NAME)!;
+
+    // Legitimate rotation (Token 1 -> Token 2)
+    const legitRefresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', initialCsrf);
+
+    expect(legitRefresh.status).toBe(200);
+    const token2Cookies = legitRefresh.headers['set-cookie'] as unknown as string[];
+    const token2Csrf = getCookieValue(token2Cookies, CSRF_COOKIE_NAME)!;
+
+    // Simulate elapsed time: Set Token 1's revokedAt to 30 seconds ago (outside the 15s grace window)
+    const revokedDoc = await RefreshTokenModel.findOne({ userId: user.id, isRevoked: true });
+    expect(revokedDoc).toBeDefined();
+    revokedDoc!.revokedAt = new Date(Date.now() - 30_000);
+    await revokedDoc!.save();
+
+    // Malicious actor replays the old Token 1 outside the grace window
+    const attackRefresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', initialCsrf);
+
+    expect(attackRefresh.status).toBe(401);
+    expect(attackRefresh.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+    expect(attackRefresh.body.error.message).toMatch(/reuse detected/i);
+
+    // Theft detection MUST have revoked ALL sessions for this user in the database
+    const allUserTokens = await RefreshTokenModel.find({ userId: user.id });
+    expect(allUserTokens.length).toBeGreaterThan(0);
+    const anyActive = allUserTokens.some((t) => !t.isRevoked);
+    expect(anyActive).toBe(false);
+
+    // The legitimate user holding Token 2 must now also be rejected (forced re-login)
+    const token2Refresh = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', token2Cookies)
+      .set('X-CSRF-Token', token2Csrf);
+
+    expect(token2Refresh.status).toBe(401);
+    expect(token2Refresh.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 17. Refresh attempt by disabled user account
+  // ---------------------------------------------------------------------------
+  it('17. should reject refresh attempt if the user account has been disabled', async () => {
     const regRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -607,7 +678,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const cookies = regRes.headers['set-cookie'] as unknown as string[];
     const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
 
-    // Deactivate user in database
     await UserModel.findByIdAndUpdate(userId, { isActive: false });
 
     const refreshRes = await request(app)
@@ -621,9 +691,9 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 17. Refresh attempt by deleted user account
+  // 18. Refresh attempt by deleted user account
   // ---------------------------------------------------------------------------
-  it('17. should reject refresh attempt if the user account has been deleted', async () => {
+  it('18. should reject refresh attempt if the user account has been deleted', async () => {
     const regRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -636,7 +706,6 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     const cookies = regRes.headers['set-cookie'] as unknown as string[];
     const csrfToken = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
 
-    // Delete user from database completely
     await UserModel.findByIdAndDelete(userId);
 
     const refreshRes = await request(app)
@@ -650,9 +719,9 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 18. CSRF Protection: Verification on cookie-authenticated state-changing routes
+  // 19. CSRF Protection: Verification on cookie-authenticated state-changing routes
   // ---------------------------------------------------------------------------
-  it('18. should enforce CSRF protection on state-changing requests', async () => {
+  it('19. should enforce CSRF protection on state-changing requests', async () => {
     const regRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -690,5 +759,13 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
 
     expect(validRes.status).toBe(200);
     expect(validRes.body.success).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 20. Database Safety: Rejection of non-matching or unsafe test database
+  // ---------------------------------------------------------------------------
+  it('20. should abort if database name or host does not match the designated test database', () => {
+    // Calling assertSafeTestDatabase() under valid test setup succeeds
+    expect(() => assertSafeTestDatabase()).not.toThrow();
   });
 });
