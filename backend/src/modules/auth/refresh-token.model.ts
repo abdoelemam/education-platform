@@ -8,6 +8,7 @@ export interface IRefreshToken {
   revokedAt?: Date;
   revocationReason?: 'rotation' | 'logout' | 'security_replay';
   replacedByTokenHash?: string;
+  lastReplayCheckAt?: Date;
   reuseCount?: number;
   createdAt: Date;
   updatedAt: Date;
@@ -52,6 +53,10 @@ const refreshTokenSchema = new Schema<RefreshTokenDocument>(
     },
     replacedByTokenHash: {
       type: String,
+      default: undefined,
+    },
+    lastReplayCheckAt: {
+      type: Date,
       default: undefined,
     },
     reuseCount: {

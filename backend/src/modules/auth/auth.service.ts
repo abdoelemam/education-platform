@@ -244,12 +244,26 @@ export class AuthService {
       existingRecord.replacedByTokenHash &&
       (existingRecord.revocationReason === 'rotation' || !existingRecord.revocationReason)
     ) {
-      // Check chain evidence before changing the replay counter so a failed
-      // lookup cannot turn a transient database error into a false replay.
-      const replacementDoc = await RefreshTokenModel.findOne({
-        tokenHash: existingRecord.replacedByTokenHash,
-        userId: existingRecord.userId,
-      }).exec();
+      // This conditional write is the replay check's linearization point. It
+      // serializes with rotation's isRevoked:false claim on the replacement,
+      // so chain evidence cannot be a stale read from before that rotation.
+      const activeReplacement = await RefreshTokenModel.findOneAndUpdate(
+        {
+          tokenHash: existingRecord.replacedByTokenHash,
+          userId: existingRecord.userId,
+          isRevoked: false,
+        },
+        { $set: { lastReplayCheckAt: now } },
+        { new: true },
+      ).exec();
+
+      let replacementDoc = activeReplacement;
+      if (!replacementDoc) {
+        replacementDoc = await RefreshTokenModel.findOne({
+          tokenHash: existingRecord.replacedByTokenHash,
+          userId: existingRecord.userId,
+        }).exec();
+      }
       const replacementAlreadyConsumed =
         replacementDoc?.isRevoked === true &&
         (replacementDoc.revocationReason === 'rotation' ||

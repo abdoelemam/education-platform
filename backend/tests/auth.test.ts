@@ -1239,4 +1239,87 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
       vi.restoreAllMocks();
     }
   });
+
+  it('29. should observe replacement rotation atomically during replay detection', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Replay Probe Race User',
+        email: 'replay-probe-race@example.com',
+        password: 'Password123!',
+      });
+    const firstCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstCookies, CSRF_COOKIE_NAME)!;
+
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+    const secondCookies = firstRotation.headers['set-cookie'] as unknown as string[];
+    const secondCsrf = getCookieValue(secondCookies, CSRF_COOKIE_NAME)!;
+    const secondToken = getCookieValue(secondCookies, AUTH_COOKIES.REFRESH_TOKEN)!;
+    const secondTokenHash = hashToken(secondToken);
+
+    let probeReached!: () => void;
+    let releaseProbe!: () => void;
+    const probeStarted = new Promise<void>((resolve) => {
+      probeReached = resolve;
+    });
+    const probeRelease = new Promise<void>((resolve) => {
+      releaseProbe = resolve;
+    });
+    const originalFindOneAndUpdate = RefreshTokenModel.findOneAndUpdate.bind(RefreshTokenModel);
+    let pausedProbe = false;
+
+    vi.spyOn(RefreshTokenModel, 'findOneAndUpdate').mockImplementation((...args) => {
+      const query = originalFindOneAndUpdate(...args);
+      const filterText = JSON.stringify(args[0]);
+      const updateText = JSON.stringify(args[1]);
+      if (
+        !pausedProbe &&
+        filterText.includes(secondTokenHash) &&
+        updateText.includes('lastReplayCheckAt')
+      ) {
+        pausedProbe = true;
+        const execute = query.exec.bind(query);
+        query.exec = async (...execArgs) => {
+          probeReached();
+          await probeRelease;
+          return execute(...execArgs);
+        };
+      }
+      return query;
+    });
+
+    const pendingReplay = request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf)
+      .then((response) => response);
+
+    try {
+      const replayRacePoint = await Promise.race([
+        probeStarted.then(() => 'conditional-check'),
+        pendingReplay.then(() => 'replay-completed'),
+      ]);
+      expect(replayRacePoint).toBe('conditional-check');
+
+      const secondRotation = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', secondCookies)
+        .set('X-CSRF-Token', secondCsrf);
+      expect(secondRotation.status).toBe(200);
+
+      releaseProbe();
+      const replayResponse = await pendingReplay;
+      expect(replayResponse.status).toBe(401);
+      expect(replayResponse.body.error.message).toMatch(/reuse detected/i);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(0);
+    } finally {
+      releaseProbe();
+      await pendingReplay;
+      vi.restoreAllMocks();
+    }
+  });
 });

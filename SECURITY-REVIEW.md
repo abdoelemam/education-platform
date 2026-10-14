@@ -38,12 +38,28 @@ claiming and linking the old token. Thus a replay either revokes the old token
 before it can be claimed, or sees and revokes the replacement. Transactional
 deployments keep candidate creation and claim/link in one transaction.
 
+### 4. Replacement-state read raced the replay counter update
+
+The replay handler read whether the replacement was consumed, then incremented
+the parent token's replay counter. If the replacement rotated between those
+operations, the handler could use stale active-state evidence and defer replay
+containment.
+
+**Remediation:** Use a conditional atomic update on the replacement token as the
+state check. It matches only an active replacement and records
+`lastReplayCheckAt`. Rotation uses an atomic claim on that same document, so the
+two operations serialize: if the replay check wins, the replacement was active
+at that point; if rotation wins, the check cannot match and the persisted
+rotation reason / successor link is inspected. Database errors are surfaced.
+A deterministic barrier test rotates the replacement immediately before this
+conditional check and verifies replay containment.
+
 ## Failure handling and verification
 
 Cleanup, transaction-abort, and reconciliation database failures are surfaced
 instead of silently ignored. Tests cover save/claim failures, transaction-abort
-handling, replay/logout distinctions, independent users, and a barrier-controlled
-replay-versus-rotation interleaving.
+handling, replay/logout distinctions, independent users, and barrier-controlled
+replay-versus-rotation interleavings.
 
 Backend verification on the reviewed branch:
 
