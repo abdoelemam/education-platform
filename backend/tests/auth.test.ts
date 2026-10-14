@@ -10,6 +10,7 @@ import { requireAuth, requireRole } from '../src/middleware/auth.js';
 import { asyncHandler } from '../src/utils/async-handler.js';
 import { sendSuccess } from '../src/utils/api-response.js';
 import { AUTH_COOKIES, AUTH_ERRORS } from '../src/modules/auth/auth.constants.js';
+import { hashToken } from '../src/modules/auth/auth.tokens.js';
 import { CSRF_COOKIE_NAME } from '../src/middleware/csrf.js';
 import { globalErrorHandler } from '../src/middleware/error-handler.js';
 
@@ -421,6 +422,8 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
 
     const sessionCountAfter = await RefreshTokenModel.countDocuments({ isRevoked: false });
     expect(sessionCountAfter).toBe(0);
+    const loggedOutToken = await RefreshTokenModel.findOne({ isRevoked: true });
+    expect(loggedOutToken?.revocationReason).toBe('logout');
 
     const clearCookies = logoutRes.headers['set-cookie'] as unknown as string[];
     expect(clearCookies).toBeDefined();
@@ -479,6 +482,7 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(revokedTokens.length).toBe(1);
     expect(revokedTokens[0].replacedByTokenHash).toBe(activeTokens[0].tokenHash);
     expect(revokedTokens[0].revokedAt).toBeDefined();
+    expect(revokedTokens[0].revocationReason).toBe('rotation');
   });
 
   // ---------------------------------------------------------------------------
@@ -564,9 +568,9 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 15. Concurrency: High concurrency scenario (5 simultaneous requests)
+  // 15. Concurrency: Atomic replay accounting under high concurrency
   // ---------------------------------------------------------------------------
-  it('15. should handle high concurrency (5 simultaneous refresh requests) with stable results', async () => {
+  it('15. should atomically detect repeated concurrent refresh-token reuse', async () => {
     const regRes = await request(app)
       .post('/api/auth/register')
       .send({
@@ -594,14 +598,11 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     expect(successCount).toBe(1);
     expect(rejectedCount).toBe(4);
 
-    // Exactly 1 active session in the database; none of the 4 rejections killed the new session
+    // Only the first sibling retry is tolerated. Atomic accounting makes the
+    // remaining concurrent reuses trigger the replay response.
     const activeTokens = await RefreshTokenModel.find({ isRevoked: false });
-    expect(activeTokens.length).toBe(1);
-
-    const winningRes = responses.find((r) => r.status === 200)!;
-    const newCookies = winningRes.headers['set-cookie'] as unknown as string[];
-    const meRes = await request(app).get('/api/auth/me').set('Cookie', newCookies);
-    expect(meRes.status).toBe(200);
+    expect(activeTokens.length).toBe(0);
+    expect(responses.some((r) => /reuse detected/i.test(r.body.error?.message ?? ''))).toBe(true);
   });
 
   // ---------------------------------------------------------------------------
@@ -694,6 +695,10 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
       .set('Cookie', cookies2)
       .set('X-CSRF-Token', csrf2);
     expect(res2.status).toBe(200);
+    const token2Record = await RefreshTokenModel.findOne({
+      tokenHash: hashToken(getCookieValue(cookies2, AUTH_COOKIES.REFRESH_TOKEN)!),
+    });
+    expect(token2Record?.revocationReason).toBe('rotation');
 
     const cookies3 = res2.headers['set-cookie'] as unknown as string[];
     const csrf3 = getCookieValue(cookies3, CSRF_COOKIE_NAME)!;
@@ -948,5 +953,290 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
   it('23. should abort if database name or host does not match the designated test database', () => {
     // Calling assertSafeTestDatabase() under valid test setup succeeds
     expect(() => assertSafeTestDatabase()).not.toThrow();
+  });
+
+  it('24. should not treat a logged-out replacement as proof of refresh-token replay', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Logout Replacement User',
+        email: 'logout-replacement@example.com',
+        password: 'Password123!',
+      });
+    const oldCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const oldCsrf = getCookieValue(oldCookies, CSRF_COOKIE_NAME)!;
+
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({
+        email: 'logout-replacement@example.com',
+        password: 'Password123!',
+      });
+    const independentSessionCookies = loginRes.headers['set-cookie'] as unknown as string[];
+
+    const rotateRes = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', oldCookies)
+      .set('X-CSRF-Token', oldCsrf);
+    expect(rotateRes.status).toBe(200);
+    const replacementCookies = rotateRes.headers['set-cookie'] as unknown as string[];
+    const replacementCsrf = getCookieValue(replacementCookies, CSRF_COOKIE_NAME)!;
+
+    const logoutRes = await request(app)
+      .post('/api/auth/logout')
+      .set('Cookie', replacementCookies)
+      .set('X-CSRF-Token', replacementCsrf);
+    expect(logoutRes.status).toBe(200);
+
+    const replayRes = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', oldCookies)
+      .set('X-CSRF-Token', oldCsrf);
+    expect(replayRes.status).toBe(401);
+    expect(replayRes.body.error.message).toMatch(/recently rotated/i);
+    expect(replayRes.body.error.message).not.toMatch(/reuse detected/i);
+
+    const loggedOutReplacement = await RefreshTokenModel.findOne({
+      isRevoked: true,
+      revocationReason: 'logout',
+    });
+    expect(loggedOutReplacement).toBeDefined();
+    expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+    const independentToken = getCookieValue(independentSessionCookies, AUTH_COOKIES.REFRESH_TOKEN)!;
+    expect(
+      await RefreshTokenModel.countDocuments({
+        tokenHash: hashToken(independentToken),
+        isRevoked: false,
+      }),
+    ).toBe(1);
+  });
+
+  it('25. should revoke only the replaying user\'s sessions after confirmed replay', async () => {
+    const userRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Session Isolation User',
+        email: 'session-isolation@example.com',
+        password: 'Password123!',
+      });
+    const userCookies = userRes.headers['set-cookie'] as unknown as string[];
+    const userCsrf = getCookieValue(userCookies, CSRF_COOKIE_NAME)!;
+    const userId = userRes.body.data.user.id;
+
+    const secondSessionRes = await request(app)
+      .post('/api/auth/login')
+      .send({
+        email: 'session-isolation@example.com',
+        password: 'Password123!',
+      });
+    expect(secondSessionRes.status).toBe(200);
+
+    const otherUserRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Unaffected User',
+        email: 'unaffected@example.com',
+        password: 'Password123!',
+      });
+    const otherUserId = otherUserRes.body.data.user.id;
+    const otherUserToken = getCookieValue(
+      otherUserRes.headers['set-cookie'] as unknown as string[],
+      AUTH_COOKIES.REFRESH_TOKEN,
+    )!;
+
+    const rotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', userCookies)
+      .set('X-CSRF-Token', userCsrf);
+    expect(rotation.status).toBe(200);
+
+    const firstReplay = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', userCookies)
+      .set('X-CSRF-Token', userCsrf);
+    expect(firstReplay.status).toBe(401);
+
+    const confirmedReplay = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', userCookies)
+      .set('X-CSRF-Token', userCsrf);
+    expect(confirmedReplay.status).toBe(401);
+    expect(confirmedReplay.body.error.message).toMatch(/reuse detected/i);
+
+    expect(await RefreshTokenModel.countDocuments({ userId, isRevoked: false })).toBe(0);
+    expect(await RefreshTokenModel.countDocuments({ userId: otherUserId, isRevoked: false })).toBe(1);
+    expect(
+      await RefreshTokenModel.countDocuments({
+        tokenHash: hashToken(otherUserToken),
+        isRevoked: false,
+      }),
+    ).toBe(1);
+  });
+
+  it('26. should preserve the old token when the atomic rotation claim fails', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Claim Failure User',
+        email: 'claim-failure@example.com',
+        password: 'Password123!',
+      });
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrf = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+    vi.spyOn(RefreshTokenModel, 'findOneAndUpdate').mockImplementationOnce(() => {
+      throw new Error('Simulated refresh-token claim failure');
+    });
+
+    try {
+      const failedRefresh = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrf);
+      expect(failedRefresh.status).toBe(500);
+
+      const tokens = await RefreshTokenModel.find({});
+      expect(tokens).toHaveLength(1);
+      expect(tokens[0].isRevoked).toBe(false);
+
+      const retry = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrf);
+      expect(retry.status).toBe(200);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('27. should not let a rotation recreate a session after replay revocation', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Replay Rotation Race User',
+        email: 'replay-rotation-race@example.com',
+        password: 'Password123!',
+      });
+    const firstSessionCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstSessionCookies, CSRF_COOKIE_NAME)!;
+
+    const secondSessionRes = await request(app)
+      .post('/api/auth/login')
+      .send({
+        email: 'replay-rotation-race@example.com',
+        password: 'Password123!',
+      });
+    const secondSessionCookies = secondSessionRes.headers['set-cookie'] as unknown as string[];
+    const secondCsrf = getCookieValue(secondSessionCookies, CSRF_COOKIE_NAME)!;
+
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstSessionCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+
+    const sibling = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstSessionCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(sibling.status).toBe(401);
+
+    let candidateSaved!: () => void;
+    let releaseCandidate!: () => void;
+    const candidateReady = new Promise<void>((resolve) => {
+      candidateSaved = resolve;
+    });
+    const candidateRelease = new Promise<void>((resolve) => {
+      releaseCandidate = resolve;
+    });
+    const originalSave = RefreshTokenModel.prototype.save;
+    let paused = false;
+
+    vi.spyOn(RefreshTokenModel.prototype, 'save').mockImplementation(async function (
+      this: InstanceType<typeof RefreshTokenModel>,
+      ...args: Parameters<typeof originalSave>
+    ) {
+      const saved = await originalSave.apply(this, args);
+      if (!paused) {
+        paused = true;
+        candidateSaved();
+        await candidateRelease;
+      }
+      return saved;
+    });
+
+    const pendingRotation = request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', secondSessionCookies)
+      .set('X-CSRF-Token', secondCsrf)
+      .then((response) => response);
+
+    try {
+      await candidateReady;
+
+      const confirmedReplay = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', firstSessionCookies)
+        .set('X-CSRF-Token', firstCsrf);
+      expect(confirmedReplay.status).toBe(401);
+      expect(confirmedReplay.body.error.message).toMatch(/reuse detected/i);
+
+      releaseCandidate();
+      const racingRotation = await pendingRotation;
+      expect(racingRotation.status).not.toBe(200);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(0);
+    } finally {
+      releaseCandidate();
+      await pendingRotation;
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('28. should abort a failed MongoDB transaction without changing the existing session', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Transaction Failure User',
+        email: 'transaction-failure@example.com',
+        password: 'Password123!',
+      });
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrf = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    let transactionActive = true;
+    const transactionSession = {
+      startTransaction: vi.fn(),
+      inTransaction: vi.fn(() => transactionActive),
+      abortTransaction: vi.fn(async () => {
+        transactionActive = false;
+      }),
+      endSession: vi.fn(async () => undefined),
+    } as unknown as mongoose.ClientSession;
+    const fakeClient = {
+      topology: { description: { type: 'ReplicaSetWithPrimary' } },
+    };
+
+    vi.spyOn(mongoose.connection, 'getClient').mockReturnValue(
+      fakeClient as unknown as ReturnType<typeof mongoose.connection.getClient>,
+    );
+    vi.spyOn(mongoose, 'startSession').mockResolvedValue(transactionSession);
+    vi.spyOn(RefreshTokenModel.prototype, 'save').mockRejectedValueOnce(
+      new Error('Simulated transactional replacement failure'),
+    );
+
+    try {
+      const failedRefresh = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrf);
+
+      expect(failedRefresh.status).toBe(500);
+      expect(transactionSession.abortTransaction).toHaveBeenCalledOnce();
+      expect(transactionSession.endSession).toHaveBeenCalledOnce();
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({})).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
