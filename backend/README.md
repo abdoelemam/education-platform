@@ -59,3 +59,17 @@ src/
 - `POST /api/auth/logout` — Revoke session and clear authentication cookies
 - `GET /api/auth/me` — Retrieve authenticated user profile (protected)
 
+### Videos (approved teachers)
+
+- `POST /api/teacher/videos` — Create video metadata
+- `GET /api/teacher/videos` — List the caller's videos
+- `GET /api/teacher/videos/:videoId` — Get video metadata
+- `POST /api/teacher/videos/:videoId/upload-authorization` — Get signed direct-upload instructions
+- `POST /api/teacher/videos/:videoId/upload-complete` — Verify upload with the provider
+- `GET /api/teacher/videos/:videoId/playback` — Get playback reference (only once ready)
+- `DELETE /api/teacher/videos/:videoId` — Delete metadata and provider asset
+
+State-changing routes require the `X-CSRF-Token` header. Video bytes are
+uploaded directly to the storage provider; see [`../docs/video-system.md`](../docs/video-system.md)
+for the full contract and provider configuration.
+

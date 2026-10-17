@@ -151,18 +151,36 @@ Tasks:
 
 Tasks:
 
-* [ ] Video provider abstraction
-* [ ] Upload authorization
+* [x] Video provider abstraction
+* [x] Upload authorization
 * [ ] Direct/resumable upload
-* [ ] Video metadata
-* [ ] Processing status
-* [ ] Thumbnail
-* [ ] Duration
-* [ ] Playback reference
+* [x] Video metadata
+* [x] Processing status
+* [x] Thumbnail
+* [x] Duration
+* [x] Playback reference
 * [ ] Upload UI
 * [ ] Upload progress
 * [ ] Retry handling
 * [ ] Video lesson preview
+
+Notes:
+
+* Direct upload authorization is implemented with signed, provider-neutral
+  upload instructions. Resumable uploads are not implemented yet.
+* Upload UI, progress, retry handling and lesson preview require the frontend
+  and course lessons; they are deferred.
+
+Definition of done (foundational backend):
+
+```text
+Video provider abstraction          ✅
+Secure direct-upload authorization  ✅
+Video metadata persistence          ✅
+Server-verified processing status   ✅
+Playback gated until provider ready ✅
+20 integration + 9 provider tests  ✅
+```
 
 ---
 
@@ -460,12 +478,31 @@ For every completed phase:
 
 ---
 
+# Agreed Implementation Order
+
+The original plan implemented Categories and Course Management before the Video
+System. For the next work, that ordering is superseded by the agreed sequence
+below. No requirement of the listed phases is changed by this decision.
+
+```text
+Video System
+   ↓
+Course Builder
+   ↓
+Teacher Workflow
+```
+
+Categories and the remaining Course Management work stay defined in this
+roadmap and continue after the agreed sequence.
+
+---
+
 # Current Position
 
 Current phase:
 
 ```text
-Phase 3 — Categories
+Phase 6 — Video System (foundational backend complete)
 ```
 
 Completed:
@@ -474,26 +511,33 @@ Completed:
 Phase 0 — Project Definition
 Phase 1 — Backend Foundation
 Phase 2 — Authentication & Users
+Phase 6 — Video System foundational backend
 ```
 
 Immediate next tasks:
 
 ```text
-1. Category model
-2. Nested category support
-3. Category tree
-4. Admin category CRUD
-5. Public category listing
-6. Category filtering
+1. Course Builder (Phase 5)
+2. Teacher Workflow: course submission → review → approval
 ```
 
-After authentication:
+The remaining Video System items (resumable uploads, upload UI, upload progress,
+retry handling, lesson preview) depend on the frontend and course lessons and
+are deferred until those exist.
+
+Next sequence:
+
+```text
+Video System (foundational backend complete)
+→ Course Builder
+→ Teacher Workflow
+```
+
+Deferred until after that sequence:
 
 ```text
 Categories
-→ Courses
-→ Course Builder
-→ Video System
+→ Course Management (remaining)
 → Enrollment
 → Course Player
 → Progress
