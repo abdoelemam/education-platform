@@ -6,7 +6,10 @@ export interface IRefreshToken {
   expiresAt: Date;
   isRevoked: boolean;
   revokedAt?: Date;
+  revocationReason?: 'rotation' | 'logout' | 'security_replay';
   replacedByTokenHash?: string;
+  predecessorReuseCount?: number;
+  predecessorRotatedAt?: Date;
   reuseCount?: number;
   createdAt: Date;
   updatedAt: Date;
@@ -44,8 +47,21 @@ const refreshTokenSchema = new Schema<RefreshTokenDocument>(
       type: Date,
       default: undefined,
     },
+    revocationReason: {
+      type: String,
+      enum: ['rotation', 'logout', 'security_replay'],
+      default: undefined,
+    },
     replacedByTokenHash: {
       type: String,
+      default: undefined,
+    },
+    predecessorReuseCount: {
+      type: Number,
+      default: 0,
+    },
+    predecessorRotatedAt: {
+      type: Date,
       default: undefined,
     },
     reuseCount: {

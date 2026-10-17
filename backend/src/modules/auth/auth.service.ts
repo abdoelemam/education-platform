@@ -30,6 +30,21 @@ function isTransactionSupported(): boolean {
   return type === 'ReplicaSetWithPrimary' || type === 'Sharded' || type === 'LoadBalanced';
 }
 
+function isTransientTransactionError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+
+  const mongoError = error as {
+    code?: unknown;
+    hasErrorLabel?: (label: string) => boolean;
+  };
+  return (
+    mongoError.code === 112 ||
+    mongoError.hasErrorLabel?.('TransientTransactionError') === true
+  );
+}
+
 export class AuthService {
   constructor(private readonly userRepo: UserRepository = userRepository) {}
 
@@ -126,20 +141,23 @@ export class AuthService {
    *    - Verify user exists and is active before performing any token mutations.
    * 2. Failure-Safety during rotation:
    *    - Uses multi-document MongoDB transaction when supported by the cluster.
-   *    - Uses atomic claim with compensating rollback on standalone deployments:
-   *      If persistence of the replacement token fails, the claim on the old token
-   *      is rolled back, keeping the session active so transient DB glitches do not log the user out.
+   *    - Persists the replacement before atomically claiming and linking the old token
+   *      on standalone deployments. A replay revocation therefore either invalidates
+   *      the old token before it can be claimed or sees and revokes the replacement.
    * 3. Replay vs Concurrency Policy:
-   *    - Confirmed Reuse (Theft):
+   *    - The replay decision is derived entirely from the authoritative state returned by the
+   *      atomic increment of the replacement token's `predecessorReuseCount`. No separate
+   *      "confirmed" verdict is persisted, so a tolerated attempt cannot poison the chain.
+   *    - Confirmed Reuse:
    *      (a) Token rotated outside the grace window (> REFRESH_ROTATION_GRACE_PERIOD_MS).
    *      (b) Token whose replacement has already been consumed/rotated (chain advanced).
-   *      (c) Repeated presentation of an already-rotated token (reuseCount >= 1).
+   *      (c) Repeated presentation of an already-rotated token (atomic replacement reuse count > 1).
    *      Action: Invalidate ALL sessions for the user to contain the breach.
    *    - Concurrent Sibling Request:
    *      (a) Token rotated within grace window (<= REFRESH_ROTATION_GRACE_PERIOD_MS).
-   *      (b) Replacement token is still active (chain has not advanced).
-   *      (c) First re-presentation attempt on this token (reuseCount == 0).
-   *      Action: Increment reuseCount, reject safely with 401 without revoking the active session.
+   *      (b) Replacement has no verified rotation successor.
+   *      (c) First re-presentation attempt on this token (atomic replacement reuse count == 1).
+   *      Action: Reject safely with 401 without revoking the active session.
    */
   async refresh(rawRefreshToken: string): Promise<AuthTokens> {
     const payload = verifyRefreshToken(rawRefreshToken);
@@ -177,7 +195,7 @@ export class AuthService {
       reuseCount: 0,
     });
 
-    // Step 3: Execute rotation with transactional or compensating failure-safety
+    // Step 3: Execute rotation with transactional or atomic-claim failure-safety
     return this.executeRotationWithSafety({
       tokenId: payload.tokenId,
       userId: user._id.toString(),
@@ -194,6 +212,7 @@ export class AuthService {
   private async handleUnclaimedToken(
     tokenId: string,
     userId: string,
+    incomingHash: string,
     now: Date,
   ): Promise<never> {
     const existingRecord = await RefreshTokenModel.findById(
@@ -216,6 +235,21 @@ export class AuthService {
       );
     }
 
+    if (
+      existingRecord.userId.toString() !== userId ||
+      existingRecord.tokenHash !== incomingHash
+    ) {
+      throw new AppError(
+        401,
+        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+        'Refresh token is invalid, expired, or has already been used',
+      );
+    }
+
+    if (existingRecord.revocationReason === 'security_replay') {
+      return this.revokeActiveSessionsForReplay(existingRecord.userId, now);
+    }
+
     if (!existingRecord.isRevoked) {
       // Token exists and is not revoked, but failed the hash match
       throw new AppError(
@@ -228,54 +262,79 @@ export class AuthService {
     // -------------------------------------------------------------------------
     // The token was previously revoked. Check if it was part of a rotation.
     // -------------------------------------------------------------------------
-    if (existingRecord.replacedByTokenHash) {
-      const revokedTime = existingRecord.revokedAt ? existingRecord.revokedAt.getTime() : 0;
-      const elapsedMs = now.getTime() - revokedTime;
-      const isOutsideGracePeriod = elapsedMs > REFRESH_ROTATION_GRACE_PERIOD_MS;
-      const isRepeatedAttempt = (existingRecord.reuseCount ?? 0) >= 1;
+    if (
+      existingRecord.replacedByTokenHash &&
+      (existingRecord.revocationReason === 'rotation' || !existingRecord.revocationReason)
+    ) {
+      // Count the replay on the replacement itself. This atomic single-document
+      // increment is the linearization point shared with rotation's conditional
+      // claim of the same document, so the decision below is derived from the
+      // authoritative post-update state rather than a stale read. Only the count
+      // and timestamps are persisted; the confirmed/rejected verdict is not a
+      // durable flag, so a tolerated attempt cannot poison a later rotation.
+      const replacementDoc = await RefreshTokenModel.findOneAndUpdate(
+        {
+          tokenHash: existingRecord.replacedByTokenHash,
+          userId: existingRecord.userId,
+        },
+        { $inc: { predecessorReuseCount: 1 } },
+        { new: true },
+      ).exec();
 
-      // Check whether the replacement token has already advanced (been rotated/revoked)
-      const replacementDoc = await RefreshTokenModel.findOne({
-        tokenHash: existingRecord.replacedByTokenHash,
-      }).exec();
-      const replacementAlreadyConsumed = replacementDoc?.isRevoked === true;
+      if (!replacementDoc) {
+        // The replacement document is unavailable (e.g. expired and removed by
+        // TTL). Fall back to counting on the predecessor token itself.
+        const fallbackRecord = await RefreshTokenModel.findByIdAndUpdate(
+          existingRecord._id,
+          { $inc: { reuseCount: 1 } },
+          { new: true },
+        ).exec();
+
+        if (!fallbackRecord) {
+          throw new AppError(
+            401,
+            AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+            'Refresh token is invalid, expired, or has already been used',
+          );
+        }
+
+        const fallbackOutsideGrace =
+          now.getTime() - (fallbackRecord.revokedAt?.getTime() ?? now.getTime()) >
+          REFRESH_ROTATION_GRACE_PERIOD_MS;
+        const fallbackRepeated = (fallbackRecord.reuseCount ?? 1) > 1;
+
+        if (fallbackOutsideGrace || fallbackRepeated) {
+          return this.revokeActiveSessionsForReplay(fallbackRecord.userId, now);
+        }
+
+        throw new AppError(
+          401,
+          AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+          'Refresh token was recently rotated. Please use the newly issued session.',
+        );
+      }
+
+      // Grace is measured from when the predecessor was rotated. The
+      // predecessor's revokedAt is set once at rotation and never mutated by
+      // later logouts or replay revocation (both only touch active tokens), so
+      // it is stable evidence rather than a stale read.
+      const rotatedAt = existingRecord.revokedAt ?? replacementDoc.predecessorRotatedAt ?? now;
+      const isOutsideGracePeriod =
+        now.getTime() - rotatedAt.getTime() > REFRESH_ROTATION_GRACE_PERIOD_MS;
+      const isRepeatedAttempt = (replacementDoc.predecessorReuseCount ?? 1) > 1;
+      const replacementAlreadyConsumed =
+        replacementDoc.isRevoked === true &&
+        (replacementDoc.revocationReason === 'rotation' ||
+          replacementDoc.revocationReason === 'security_replay' ||
+          (!replacementDoc.revocationReason && Boolean(replacementDoc.replacedByTokenHash)));
 
       const isConfirmedReuse =
         isOutsideGracePeriod || isRepeatedAttempt || replacementAlreadyConsumed;
 
       if (isConfirmedReuse) {
-        // Confirmed Theft / Replay Policy:
-        // Revoke all active sessions for this user to contain the breach.
-        await RefreshTokenModel.updateMany(
-          { userId: new Types.ObjectId(userId) },
-          { isRevoked: true, revokedAt: now },
-        ).exec();
-
-        throw new AppError(
-          401,
-          AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-          'Refresh token reuse detected. All sessions have been revoked for security.',
-        );
+        return this.revokeActiveSessionsForReplay(existingRecord.userId, now);
       }
 
-      // Legitimate Concurrent Request Policy:
-      // Within grace window, replacement still active, and first concurrent attempt.
-      // Increment reuseCount to detect subsequent replays.
-      await RefreshTokenModel.findByIdAndUpdate(existingRecord._id, {
-        $inc: { reuseCount: 1 },
-      }).exec();
-
-      throw new AppError(
-        401,
-        AUTH_ERRORS.REFRESH_TOKEN_INVALID,
-        'Refresh token was recently rotated. Please use the newly issued session.',
-      );
-    }
-
-    // Revoked without replacement (e.g. explicitly logged out or in-flight rollback)
-    const revokedTime = existingRecord.revokedAt ? existingRecord.revokedAt.getTime() : 0;
-    const elapsedMs = now.getTime() - revokedTime;
-    if (elapsedMs <= REFRESH_ROTATION_GRACE_PERIOD_MS) {
       throw new AppError(
         401,
         AUTH_ERRORS.REFRESH_TOKEN_INVALID,
@@ -290,9 +349,62 @@ export class AuthService {
     );
   }
 
+  private async revokeActiveSessionsForReplay(
+    userId: Types.ObjectId,
+    now: Date,
+  ): Promise<never> {
+    await RefreshTokenModel.updateMany(
+      { userId, isRevoked: false },
+      {
+        $set: {
+          isRevoked: true,
+          revokedAt: now,
+          revocationReason: 'security_replay',
+        },
+      },
+    ).exec();
+
+    throw new AppError(
+      401,
+      AUTH_ERRORS.REFRESH_TOKEN_INVALID,
+      'Refresh token reuse detected. All sessions have been revoked for security.',
+    );
+  }
+
+  private async rejectUnclaimedRotationCandidate(params: {
+    tokenId: string;
+    userId: string;
+    incomingHash: string;
+    now: Date;
+    candidateId: Types.ObjectId;
+  }): Promise<never> {
+    let rejection: unknown;
+    try {
+      await this.handleUnclaimedToken(
+        params.tokenId,
+        params.userId,
+        params.incomingHash,
+        params.now,
+      );
+    } catch (error: unknown) {
+      rejection = error;
+    }
+
+    try {
+      await RefreshTokenModel.findByIdAndDelete(params.candidateId).exec();
+    } catch (cleanupError: unknown) {
+      throw new AggregateError(
+        [rejection, cleanupError],
+        'Refresh token candidate cleanup failed after rotation was rejected',
+      );
+    }
+
+    throw rejection;
+  }
+
   /**
-   * Executes token rotation with multi-document transaction when supported by MongoDB,
-   * or compensating rollback when running on standalone deployments without transaction support.
+   * Executes token rotation transactionally when supported. On standalone deployments,
+   * persists the private replacement candidate before atomically claiming the old token.
    */
   private async executeRotationWithSafety(params: {
     tokenId: string;
@@ -304,120 +416,330 @@ export class AuthService {
   }): Promise<AuthTokens> {
     const { tokenId, userId, incomingHash, newRecord, user, newRefreshToken } = params;
     const now = new Date();
+    const accessToken = generateAccessToken(user);
+    newRecord.predecessorReuseCount = 0;
+    newRecord.predecessorRotatedAt = now;
 
     // -------------------------------------------------------------------------
     // Strategy A: Multi-document transaction (if supported by MongoDB cluster)
     // -------------------------------------------------------------------------
     if (isTransactionSupported()) {
-      let session: mongoose.ClientSession | null = null;
-      try {
-        session = await mongoose.startSession();
-        session.startTransaction();
+      const outcome = await this.runTransactionalRotation({
+        tokenId,
+        userId,
+        incomingHash,
+        newRecord,
+        now,
+      });
 
-        const tokenRecord = await RefreshTokenModel.findOneAndUpdate(
-          {
-            _id: new Types.ObjectId(tokenId),
-            tokenHash: incomingHash,
-            isRevoked: false,
-            expiresAt: { $gt: now },
-          },
-          {
+      if (outcome === 'rotated') {
+        return { accessToken, refreshToken: newRefreshToken };
+      }
+
+      if (outcome === 'unclaimed') {
+        // The session is fully closed at this point, so an expected 401 from
+        // replay evaluation is surfaced as-is and never mistaken for a
+        // transaction failure or trigger a second session cleanup.
+        return this.handleUnclaimedToken(tokenId, userId, incomingHash, now);
+      }
+
+      // outcome === 'unsupported': the cluster cannot run transactions.
+      // Fall through to Strategy B below.
+    }
+
+    // -------------------------------------------------------------------------
+    // Strategy B: Persist candidate first, then atomically claim and link the old token.
+    // The ordering serializes session-wide replay revocation with concurrent rotations.
+    // -------------------------------------------------------------------------
+    try {
+      await newRecord.save();
+    } catch (saveError: unknown) {
+      try {
+        await RefreshTokenModel.findByIdAndDelete(newRecord._id).exec();
+      } catch (cleanupError: unknown) {
+        throw new AggregateError(
+          [saveError, cleanupError],
+          'Refresh token candidate persistence failed and cleanup could not be completed',
+        );
+      }
+      throw saveError;
+    }
+
+    let tokenRecord: RefreshTokenDocument | null;
+    try {
+      tokenRecord = await RefreshTokenModel.findOneAndUpdate(
+        {
+          _id: new Types.ObjectId(tokenId),
+          userId: new Types.ObjectId(userId),
+          tokenHash: incomingHash,
+          isRevoked: false,
+          expiresAt: { $gt: now },
+        },
+        {
+          $set: {
             isRevoked: true,
             revokedAt: now,
+            revocationReason: 'rotation',
+            replacedByTokenHash: newRecord.tokenHash,
           },
-          { new: false, session },
-        ).exec();
-
-        if (!tokenRecord) {
-          await session.abortTransaction();
-          await session.endSession();
-          return this.handleUnclaimedToken(tokenId, userId, now);
-        }
-
-        await newRecord.save({ session });
-
-        await RefreshTokenModel.findByIdAndUpdate(
-          tokenRecord._id,
-          { replacedByTokenHash: newRecord.tokenHash },
-          { session },
-        ).exec();
-
-        await session.commitTransaction();
-        await session.endSession();
-
-        const accessToken = generateAccessToken(user);
-        return { accessToken, refreshToken: newRefreshToken };
-      } catch (err: unknown) {
-        if (session) {
-          await session.abortTransaction().catch(() => {});
-          await session.endSession().catch(() => {});
-        }
-
-        const isCapabilityError =
-          err instanceof Error &&
-          err.message.includes('Transaction numbers are only allowed');
-
-        if (!isCapabilityError) {
-          throw err;
-        }
-        // If transactions are not supported, proceed to Strategy B below
+        },
+        { new: false },
+      ).exec();
+    } catch (claimError: unknown) {
+      let currentRecord: RefreshTokenDocument | null;
+      try {
+        currentRecord = await RefreshTokenModel.findOne({
+          _id: new Types.ObjectId(tokenId),
+          userId: new Types.ObjectId(userId),
+        }).exec();
+      } catch (reconciliationError: unknown) {
+        throw new AggregateError(
+          [claimError, reconciliationError],
+          'Refresh token claim failed and its persisted state could not be verified',
+        );
       }
-    }
 
-    // -------------------------------------------------------------------------
-    // Strategy B: Atomic Claim with Compensating Rollback (Fallback for Standalone)
-    // -------------------------------------------------------------------------
-    // 1. Claim the old token atomically
-    const tokenRecord = await RefreshTokenModel.findOneAndUpdate(
-      {
-        _id: new Types.ObjectId(tokenId),
-        tokenHash: incomingHash,
-        isRevoked: false,
-        expiresAt: { $gt: now },
-      },
-      {
-        isRevoked: true,
-        revokedAt: now,
-      },
-      { new: false },
-    ).exec();
+      if (this.isOwnRotationCommitted(currentRecord, newRecord.tokenHash)) {
+        return { accessToken, refreshToken: newRefreshToken };
+      }
+
+      if (currentRecord?.isRevoked) {
+        return this.rejectUnclaimedRotationCandidate({
+          tokenId,
+          userId,
+          incomingHash,
+          now,
+          candidateId: newRecord._id,
+        });
+      }
+
+      try {
+        await RefreshTokenModel.findByIdAndDelete(newRecord._id).exec();
+      } catch (cleanupError: unknown) {
+        throw new AggregateError(
+          [claimError, cleanupError],
+          'Refresh token claim failed and candidate cleanup could not be completed',
+        );
+      }
+      throw claimError;
+    }
 
     if (!tokenRecord) {
-      return this.handleUnclaimedToken(tokenId, userId, now);
+      return this.rejectUnclaimedRotationCandidate({
+        tokenId,
+        userId,
+        incomingHash,
+        now,
+        candidateId: newRecord._id,
+      });
     }
 
-    let newRecordSaved = false;
+    return { accessToken, refreshToken: newRefreshToken };
+  }
+
+  /**
+   * Attempts a single transactional rotation and always closes its session
+   * exactly once before returning or throwing.
+   *
+   * Outcomes:
+   * - `rotated`: this request's rotation is durably committed.
+   * - `unclaimed`: the claim did not match; the old token must be evaluated by
+   *   the replay policy after the session is closed.
+   * - `unsupported`: the cluster cannot run multi-document transactions.
+   *
+   * Replay evaluation is deliberately NOT performed here. Doing it after the
+   * session is closed keeps an expected 401 from being swallowed by the
+   * transaction error handling and prevents duplicate cleanup.
+   */
+  private async runTransactionalRotation(params: {
+    tokenId: string;
+    userId: string;
+    incomingHash: string;
+    newRecord: RefreshTokenDocument;
+    now: Date;
+  }): Promise<'rotated' | 'unclaimed' | 'unsupported'> {
+    const { tokenId, userId, incomingHash, newRecord, now } = params;
+    let session: mongoose.ClientSession | null = null;
+    let outcome: 'rotated' | 'unclaimed' | null = null;
+    let operationError: unknown = null;
 
     try {
-      // 2. Persist the replacement token
-      await newRecord.save();
-      newRecordSaved = true;
+      session = await mongoose.startSession();
+      session.startTransaction();
 
-      // 3. Link the old token to the replacement hash
-      await RefreshTokenModel.findByIdAndUpdate(tokenRecord._id, {
-        replacedByTokenHash: newRecord.tokenHash,
-      }).exec();
+      await newRecord.save({ session });
 
-      const accessToken = generateAccessToken(user);
-      return { accessToken, refreshToken: newRefreshToken };
-    } catch (rotationError) {
-      // -----------------------------------------------------------------------
-      // Compensating rollback:
-      // A failure occurred after claiming the old token. Roll back the claim
-      // so the user is NOT left unexpectedly logged out due to transient error!
-      // -----------------------------------------------------------------------
-      if (newRecordSaved) {
-        await RefreshTokenModel.findByIdAndDelete(newRecord._id).catch(() => {});
+      const tokenRecord = await RefreshTokenModel.findOneAndUpdate(
+        {
+          _id: new Types.ObjectId(tokenId),
+          userId: new Types.ObjectId(userId),
+          tokenHash: incomingHash,
+          isRevoked: false,
+          expiresAt: { $gt: now },
+        },
+        {
+          $set: {
+            isRevoked: true,
+            revokedAt: now,
+            revocationReason: 'rotation',
+            replacedByTokenHash: newRecord.tokenHash,
+          },
+        },
+        { new: false, session },
+      ).exec();
+
+      if (!tokenRecord) {
+        outcome = 'unclaimed';
+      } else {
+        await session.commitTransaction();
+        outcome = 'rotated';
+      }
+    } catch (err: unknown) {
+      operationError = err;
+    }
+
+    // Close the session exactly once. Abort only when the transaction did not
+    // reach a committed state, and never re-enter cleanup afterwards.
+    const cleanupErrors = await this.closeTransactionSession(session, {
+      abort: outcome !== 'rotated',
+    });
+
+    if (cleanupErrors.length > 0) {
+      if (operationError !== null) {
+        throw new AggregateError(
+          [operationError, ...cleanupErrors],
+          'Refresh token transaction failed and cleanup could not be completed',
+        );
+      }
+      throw new AggregateError(
+        cleanupErrors,
+        'Refresh token transaction closed but session cleanup could not be completed',
+      );
+    }
+
+    if (operationError !== null) {
+      if (this.isTransactionCapabilityError(operationError)) {
+        newRecord.isNew = true;
+        // Transactions are not supported; the caller falls back to Strategy B.
+        return 'unsupported';
       }
 
-      await RefreshTokenModel.findByIdAndUpdate(tokenRecord._id, {
-        isRevoked: false,
-        revokedAt: undefined,
-        replacedByTokenHash: undefined,
-      }).catch(() => {});
+      if (isTransientTransactionError(operationError)) {
+        const currentRecord = await this.readTokenStateForReconciliation(
+          tokenId,
+          userId,
+          operationError,
+        );
 
-      throw rotationError;
+        // Only this request's own candidate hash proves that this rotation
+        // committed before the transient error. A revoked token alone is not
+        // proof of replay.
+        if (this.isOwnRotationCommitted(currentRecord, newRecord.tokenHash)) {
+          return 'rotated';
+        }
+
+        // Revoked by another operation: defer to the replay policy instead of
+        // guessing, and without touching any replay counter here.
+        if (currentRecord?.isRevoked) {
+          return 'unclaimed';
+        }
+
+        // Unresolved state: fail closed rather than report a false outcome.
+        throw operationError;
+      }
+
+      throw operationError;
     }
+
+    if (outcome === 'rotated') {
+      return 'rotated';
+    }
+
+    if (outcome === 'unclaimed') {
+      return 'unclaimed';
+    }
+
+    // Defensive: the attempt neither completed nor reported an error.
+    throw new Error('Refresh token transaction produced no outcome');
+  }
+
+  /**
+   * Closes a client session exactly once. Aborts the transaction only when
+   * requested and still active. Never throws: cleanup failures are returned so
+   * the caller can surface them without masking the original error.
+   */
+  private async closeTransactionSession(
+    session: mongoose.ClientSession | null,
+    options: { abort: boolean },
+  ): Promise<unknown[]> {
+    const cleanupErrors: unknown[] = [];
+
+    if (!session) {
+      return cleanupErrors;
+    }
+
+    if (options.abort) {
+      try {
+        if (session.inTransaction()) {
+          await session.abortTransaction();
+        }
+      } catch (cleanupError: unknown) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+
+    try {
+      await session.endSession();
+    } catch (cleanupError: unknown) {
+      cleanupErrors.push(cleanupError);
+    }
+
+    return cleanupErrors;
+  }
+
+  /**
+   * Re-reads the old token's persisted state to resolve a transient
+   * transaction error. A read failure is surfaced rather than treated as an
+   * unresolved state.
+   */
+  private async readTokenStateForReconciliation(
+    tokenId: string,
+    userId: string,
+    cause: unknown,
+  ): Promise<RefreshTokenDocument | null> {
+    try {
+      return await RefreshTokenModel.findOne({
+        _id: new Types.ObjectId(tokenId),
+        userId: new Types.ObjectId(userId),
+      }).exec();
+    } catch (reconciliationError: unknown) {
+      throw new AggregateError(
+        [cause, reconciliationError],
+        'Refresh transaction conflicted and token state could not be verified',
+      );
+    }
+  }
+
+  /**
+   * Proves that the rotation performed by the current request committed, by
+   * matching the recorded successor hash against this request's candidate.
+   */
+  private isOwnRotationCommitted(
+    record: RefreshTokenDocument | null,
+    candidateTokenHash: string,
+  ): boolean {
+    return (
+      record?.isRevoked === true &&
+      record.revocationReason === 'rotation' &&
+      record.replacedByTokenHash === candidateTokenHash
+    );
+  }
+
+  private isTransactionCapabilityError(error: unknown): boolean {
+    return (
+      error instanceof Error &&
+      error.message.includes('Transaction numbers are only allowed')
+    );
   }
 
   /**
@@ -433,10 +755,16 @@ export class AuthService {
       return;
     }
 
-    await RefreshTokenModel.findByIdAndUpdate(payload.tokenId, {
-      isRevoked: true,
-      revokedAt: new Date(),
-    }).exec();
+    await RefreshTokenModel.findOneAndUpdate(
+      { _id: payload.tokenId, isRevoked: false },
+      {
+        $set: {
+          isRevoked: true,
+          revokedAt: new Date(),
+          revocationReason: 'logout',
+        },
+      },
+    ).exec();
   }
 
   /**
