@@ -75,6 +75,136 @@ function getCookieValue(cookies: string[], name: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Deterministic fake Mongoose client session used to simulate the transactional
+ * (replica set) code path without a real replica set. Declared explicitly so the
+ * tests are not mistaken for real replica-set integration coverage.
+ */
+interface FakeTransactionSession {
+  session: mongoose.ClientSession;
+  startTransaction: ReturnType<typeof vi.fn>;
+  inTransaction: ReturnType<typeof vi.fn>;
+  commitTransaction: ReturnType<typeof vi.fn>;
+  abortTransaction: ReturnType<typeof vi.fn>;
+  endSession: ReturnType<typeof vi.fn>;
+}
+
+function createFakeTransactionSession(
+  options: { abortFails?: boolean } = {},
+): FakeTransactionSession {
+  let active = false;
+  const startTransaction = vi.fn(() => {
+    active = true;
+  });
+  const inTransaction = vi.fn(() => active);
+  const commitTransaction = vi.fn(async () => {
+    active = false;
+  });
+  const abortTransaction = vi.fn(async () => {
+    if (options.abortFails) {
+      throw new Error('Simulated abortTransaction failure');
+    }
+    active = false;
+  });
+  const endSession = vi.fn(async () => {
+    active = false;
+  });
+  const session = {
+    startTransaction,
+    inTransaction,
+    commitTransaction,
+    abortTransaction,
+    endSession,
+  } as unknown as mongoose.ClientSession;
+
+  return { session, startTransaction, inTransaction, commitTransaction, abortTransaction, endSession };
+}
+
+function makeTransientTransactionError(): Error {
+  return Object.assign(new Error('Simulated transient transaction conflict'), {
+    code: 112,
+    hasErrorLabel: (label: string) => label === 'TransientTransactionError',
+  });
+}
+
+/**
+ * Makes the cluster look like a replica set and returns the provided fake
+ * session from `mongoose.startSession`.
+ */
+function stubReplicaSetTopology(fakeSession: mongoose.ClientSession): void {
+  vi.spyOn(mongoose.connection, 'getClient').mockReturnValue({
+    topology: { description: { type: 'ReplicaSetWithPrimary' } },
+  } as unknown as ReturnType<typeof mongoose.connection.getClient>);
+  vi.spyOn(mongoose, 'startSession').mockResolvedValue(fakeSession);
+}
+
+/**
+ * Controls whether the private replacement candidate is persisted. Persisting
+ * models a committed transaction; skipping models an aborted one.
+ */
+function stubCandidatePersistence(params: {
+  fakeSession: mongoose.ClientSession;
+  persist: boolean;
+}): void {
+  const originalSave = RefreshTokenModel.prototype.save;
+  vi.spyOn(RefreshTokenModel.prototype, 'save').mockImplementation(async function (
+    this: InstanceType<typeof RefreshTokenModel>,
+    ...args: Parameters<typeof originalSave>
+  ) {
+    if (args[0]?.session === params.fakeSession) {
+      return params.persist ? originalSave.call(this) : this;
+    }
+    return originalSave.apply(this, args);
+  });
+}
+
+type ClaimBehavior = 'commit-then-transient' | 'transient' | 'null';
+
+/**
+ * Intercepts the first rotation claim.
+ * - `commit-then-transient`: performs the real write, then raises a transient error.
+ * - `transient`: raises a transient error without writing.
+ * - `null`: reports an unmatched claim without writing.
+ */
+function stubTransactionalClaim(params: {
+  fakeSession: mongoose.ClientSession;
+  behavior: ClaimBehavior;
+  transientError: Error;
+}): { claimInjections: () => number } {
+  const originalFindOneAndUpdate = RefreshTokenModel.findOneAndUpdate.bind(RefreshTokenModel);
+  let injections = 0;
+
+  vi.spyOn(RefreshTokenModel, 'findOneAndUpdate').mockImplementation((...args) => {
+    const [filter, update, options] = args;
+    const updateText = JSON.stringify(update);
+    if (injections === 0 && updateText.includes('replacedByTokenHash')) {
+      injections += 1;
+      const queryOptions =
+        options?.session === params.fakeSession
+          ? { ...options, session: undefined }
+          : options;
+      const query = originalFindOneAndUpdate(filter, update, queryOptions);
+
+      if (params.behavior === 'null') {
+        query.exec = (async () => null) as unknown as typeof query.exec;
+        return query;
+      }
+
+      const execute = query.exec.bind(query);
+      query.exec = async (...execArgs) => {
+        if (params.behavior === 'commit-then-transient') {
+          await execute(...execArgs);
+        }
+        throw params.transientError;
+      };
+      return query;
+    }
+    return originalFindOneAndUpdate(...args);
+  });
+
+  return { claimInjections: () => injections };
+}
+
 describe('Phase 2: Authentication & Users Integration Tests', () => {
   const app = createApp();
 
@@ -1279,7 +1409,7 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
       if (
         !pausedProbe &&
         filterText.includes(secondTokenHash) &&
-        updateText.includes('lastReplayCheckAt')
+        updateText.includes('predecessorReuseCount')
       ) {
         pausedProbe = true;
         const execute = query.exec.bind(query);
@@ -1319,6 +1449,645 @@ describe('Phase 2: Authentication & Users Integration Tests', () => {
     } finally {
       releaseProbe();
       await pendingReplay;
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('30. should linearize a sibling replay before a following replacement rotation', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Replay Check Complete Race User',
+        email: 'replay-check-complete-race@example.com',
+        password: 'Password123!',
+      });
+    const firstCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstCookies, CSRF_COOKIE_NAME)!;
+
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+    const secondCookies = firstRotation.headers['set-cookie'] as unknown as string[];
+    const secondCsrf = getCookieValue(secondCookies, CSRF_COOKIE_NAME)!;
+    const secondTokenHash = hashToken(
+      getCookieValue(secondCookies, AUTH_COOKIES.REFRESH_TOKEN)!,
+    );
+
+    let checkCompleted!: () => void;
+    let releaseReplay!: () => void;
+    const checkCompletedPromise = new Promise<void>((resolve) => {
+      checkCompleted = resolve;
+    });
+    const replayRelease = new Promise<void>((resolve) => {
+      releaseReplay = resolve;
+    });
+    const originalFindOneAndUpdate = RefreshTokenModel.findOneAndUpdate.bind(RefreshTokenModel);
+    let pausedCheck = false;
+    let replacementWasActiveAtCheck = false;
+
+    vi.spyOn(RefreshTokenModel, 'findOneAndUpdate').mockImplementation((...args) => {
+      const query = originalFindOneAndUpdate(...args);
+      const filterText = JSON.stringify(args[0]);
+      const updateText = JSON.stringify(args[1]);
+      if (
+        !pausedCheck &&
+        filterText.includes(secondTokenHash) &&
+        updateText.includes('predecessorReuseCount')
+      ) {
+        pausedCheck = true;
+        const execute = query.exec.bind(query);
+        query.exec = async (...execArgs) => {
+          const result = await execute(...execArgs);
+          replacementWasActiveAtCheck = result?.isRevoked === false;
+          checkCompleted();
+          await replayRelease;
+          return result;
+        };
+      }
+      return query;
+    });
+
+    const pendingReplay = request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf)
+      .then((response) => response);
+
+    try {
+      const racePoint = await Promise.race([
+        checkCompletedPromise.then(() => 'check-completed'),
+        pendingReplay.then(() => 'replay-completed'),
+      ]);
+      expect(racePoint).toBe('check-completed');
+      expect(replacementWasActiveAtCheck).toBe(true);
+      const markedReplacement = await RefreshTokenModel.findOne({
+        tokenHash: secondTokenHash,
+      });
+      expect(markedReplacement?.predecessorReuseCount).toBe(1);
+      expect(markedReplacement?.isRevoked).toBe(false);
+
+      const secondRotation = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', secondCookies)
+        .set('X-CSRF-Token', secondCsrf);
+      expect(secondRotation.status).toBe(200);
+
+      releaseReplay();
+      const replayResponse = await pendingReplay;
+      expect(replayResponse.status).toBe(401);
+      expect(replayResponse.body.error.message).toMatch(/recently rotated/i);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+      const thirdCookies = secondRotation.headers['set-cookie'] as unknown as string[];
+      const thirdCsrf = getCookieValue(thirdCookies, CSRF_COOKIE_NAME)!;
+      const nextLegitimateRotation = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', thirdCookies)
+        .set('X-CSRF-Token', thirdCsrf);
+      expect(nextLegitimateRotation.status).toBe(200);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+    } finally {
+      releaseReplay();
+      await pendingReplay;
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('31. should reconcile a transaction conflict after an atomic sibling replay count', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Transactional Replay Marker User',
+        email: 'transactional-replay-marker@example.com',
+        password: 'Password123!',
+      });
+    const firstCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstCookies, CSRF_COOKIE_NAME)!;
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+
+    const secondCookies = firstRotation.headers['set-cookie'] as unknown as string[];
+    const secondCsrf = getCookieValue(secondCookies, CSRF_COOKIE_NAME)!;
+    const secondTokenHash = hashToken(
+      getCookieValue(secondCookies, AUTH_COOKIES.REFRESH_TOKEN)!,
+    );
+    const secondTokenDoc = await RefreshTokenModel.findOne({ tokenHash: secondTokenHash });
+    expect(secondTokenDoc).toBeDefined();
+
+    let transactionActive = false;
+    const transactionSession = {
+      startTransaction: vi.fn(() => {
+        transactionActive = true;
+      }),
+      inTransaction: vi.fn(() => transactionActive),
+      abortTransaction: vi.fn(async () => {
+        transactionActive = false;
+      }),
+      endSession: vi.fn(async () => undefined),
+    } as unknown as mongoose.ClientSession;
+    const fakeClient = {
+      topology: { description: { type: 'ReplicaSetWithPrimary' } },
+    };
+
+    let checkCompleted!: () => void;
+    let releaseReplay!: () => void;
+    const checkCompletedPromise = new Promise<void>((resolve) => {
+      checkCompleted = resolve;
+    });
+    const replayRelease = new Promise<void>((resolve) => {
+      releaseReplay = resolve;
+    });
+    const originalSave = RefreshTokenModel.prototype.save;
+    const originalFindOneAndUpdate = RefreshTokenModel.findOneAndUpdate.bind(RefreshTokenModel);
+    let pausedCheck = false;
+    let injectedConflict = false;
+    const transactionConflict = Object.assign(
+      new Error('Simulated concurrent replacement write conflict'),
+      {
+        code: 112,
+        hasErrorLabel: (label: string) => label === 'TransientTransactionError',
+      },
+    );
+
+    vi.spyOn(mongoose.connection, 'getClient').mockReturnValue(
+      fakeClient as unknown as ReturnType<typeof mongoose.connection.getClient>,
+    );
+    vi.spyOn(mongoose, 'startSession').mockResolvedValue(transactionSession);
+    vi.spyOn(RefreshTokenModel.prototype, 'save').mockImplementation(async function (
+      this: InstanceType<typeof RefreshTokenModel>,
+      ...args: Parameters<typeof originalSave>
+    ) {
+      if (args[0]?.session === transactionSession) {
+        return this;
+      }
+      return originalSave.apply(this, args);
+    });
+    vi.spyOn(RefreshTokenModel, 'findOneAndUpdate').mockImplementation((...args) => {
+      const [filter, update, options] = args;
+      const filterFields = filter as { _id?: mongoose.Types.ObjectId };
+      const updateText = JSON.stringify(update);
+      if (
+        !injectedConflict &&
+        String(filterFields._id) === secondTokenDoc!._id.toString() &&
+        updateText.includes('replacedByTokenHash')
+      ) {
+        injectedConflict = true;
+        throw transactionConflict;
+      }
+
+      const queryOptions =
+        options?.session === transactionSession
+          ? { ...options, session: undefined }
+          : options;
+      const query = originalFindOneAndUpdate(filter, update, queryOptions);
+      const filterText = JSON.stringify(filter);
+      if (
+        !pausedCheck &&
+        filterText.includes(secondTokenHash) &&
+        updateText.includes('predecessorReuseCount')
+      ) {
+        pausedCheck = true;
+        const execute = query.exec.bind(query);
+        query.exec = async (...execArgs) => {
+          const result = await execute(...execArgs);
+          checkCompleted();
+          await replayRelease;
+          return result;
+        };
+      }
+      return query;
+    });
+
+    const pendingReplay = request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf)
+      .then((response) => response);
+
+    try {
+      const racePoint = await Promise.race([
+        checkCompletedPromise.then(() => 'check-completed'),
+        pendingReplay.then(() => 'replay-completed'),
+      ]);
+      expect(racePoint).toBe('check-completed');
+
+      const rotationAfterMarker = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', secondCookies)
+        .set('X-CSRF-Token', secondCsrf);
+      expect(rotationAfterMarker.status).toBe(500);
+      expect(injectedConflict).toBe(true);
+      expect(transactionSession.abortTransaction).toHaveBeenCalled();
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+
+      releaseReplay();
+      const replayResponse = await pendingReplay;
+      expect(replayResponse.status).toBe(401);
+      expect(replayResponse.body.error.message).toMatch(/recently rotated/i);
+      const currentReplacement = await RefreshTokenModel.findOne({
+        tokenHash: secondTokenHash,
+      });
+      expect(currentReplacement?.predecessorReuseCount).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+
+      vi.restoreAllMocks();
+      const retryRotation = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', secondCookies)
+        .set('X-CSRF-Token', secondCsrf);
+      expect(retryRotation.status).toBe(200);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+    } finally {
+      releaseReplay();
+      await pendingReplay;
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('32. should allow replacement rotation after a tolerated sibling replay completes', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Sibling Retry Then Rotate User',
+        email: 'sibling-retry-then-rotate@example.com',
+        password: 'Password123!',
+      });
+    const initialCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const initialCsrf = getCookieValue(initialCookies, CSRF_COOKIE_NAME)!;
+
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', initialCsrf);
+    expect(firstRotation.status).toBe(200);
+    const replacementCookies = firstRotation.headers['set-cookie'] as unknown as string[];
+    const replacementCsrf = getCookieValue(replacementCookies, CSRF_COOKIE_NAME)!;
+
+    const siblingReplay = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', initialCookies)
+      .set('X-CSRF-Token', initialCsrf);
+    expect(siblingReplay.status).toBe(401);
+    expect(siblingReplay.body.error.message).toMatch(/recently rotated/i);
+    expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+
+    const legitimateRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', replacementCookies)
+      .set('X-CSRF-Token', replacementCsrf);
+    expect(legitimateRotation.status).toBe(200);
+    expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+  });
+
+  it('33. should keep the replacement rotatable across successive legitimate rotations after a tolerated sibling retry', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'No Poison User',
+        email: 'no-poison@example.com',
+        password: 'Password123!',
+      });
+    const firstCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstCookies, CSRF_COOKIE_NAME)!;
+
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+    const secondCookies = firstRotation.headers['set-cookie'] as unknown as string[];
+    const secondCsrf = getCookieValue(secondCookies, CSRF_COOKIE_NAME)!;
+
+    // A tolerated in-grace sibling retry is rejected without revocation.
+    const sibling = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(sibling.status).toBe(401);
+    expect(sibling.body.error.message).toMatch(/recently rotated/i);
+    expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+    expect(await RefreshTokenModel.countDocuments({ revocationReason: 'security_replay' })).toBe(0);
+
+    // The replacement is still valid and can be rotated more than once.
+    const secondRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', secondCookies)
+      .set('X-CSRF-Token', secondCsrf);
+    expect(secondRotation.status).toBe(200);
+    const thirdCookies = secondRotation.headers['set-cookie'] as unknown as string[];
+    const thirdCsrf = getCookieValue(thirdCookies, CSRF_COOKIE_NAME)!;
+
+    const thirdRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', thirdCookies)
+      .set('X-CSRF-Token', thirdCsrf);
+    expect(thirdRotation.status).toBe(200);
+
+    // No tolerated attempt must have left durable destructive state behind.
+    expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+    expect(await RefreshTokenModel.countDocuments({ revocationReason: 'security_replay' })).toBe(0);
+  });
+
+  it('34. should not destroy a valid session because of a stale persisted replay verdict', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Stale Verdict User',
+        email: 'stale-verdict@example.com',
+        password: 'Password123!',
+      });
+    const firstCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstCookies, CSRF_COOKIE_NAME)!;
+
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+    const replacementCookies = firstRotation.headers['set-cookie'] as unknown as string[];
+    const replacementCsrf = getCookieValue(replacementCookies, CSRF_COOKIE_NAME)!;
+    const replacementHash = hashToken(
+      getCookieValue(replacementCookies, AUTH_COOKIES.REFRESH_TOKEN)!,
+    );
+
+    // Simulate a leftover "confirmed replay" verdict written by an older
+    // deployment (or an interrupted upgrade). The current design derives the
+    // replay decision from the atomic counter, so a stale verdict must never be
+    // treated as destructive state and revoke a valid session.
+    await RefreshTokenModel.collection.updateOne(
+      { tokenHash: replacementHash },
+      { $set: { predecessorReplayConfirmed: true } },
+    );
+
+    const rotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', replacementCookies)
+      .set('X-CSRF-Token', replacementCsrf);
+    expect(rotation.status).toBe(200);
+    expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+    expect(await RefreshTokenModel.countDocuments({ revocationReason: 'security_replay' })).toBe(0);
+
+    const rotatedCookies = rotation.headers['set-cookie'] as unknown as string[];
+    const meRes = await request(app).get('/api/auth/me').set('Cookie', rotatedCookies);
+    expect(meRes.status).toBe(200);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 35. Transaction reconciliation: our own rotation committed, transient error after
+  //     NOTE: fake transaction session/topology; not a real replica-set run.
+  // ---------------------------------------------------------------------------
+  it('35. should treat a committed rotation as success when a transient error is raised afterwards', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Transient Commit User',
+        email: 'transient-commit@example.com',
+        password: 'Password123!',
+      });
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrf = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    const fake = createFakeTransactionSession();
+    stubReplicaSetTopology(fake.session);
+    stubCandidatePersistence({ fakeSession: fake.session, persist: true });
+    stubTransactionalClaim({
+      fakeSession: fake.session,
+      behavior: 'commit-then-transient',
+      transientError: makeTransientTransactionError(),
+    });
+
+    try {
+      const refreshRes = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrf);
+
+      expect(refreshRes.status).toBe(200);
+
+      const rotatedCookies = refreshRes.headers['set-cookie'] as unknown as string[];
+      const rotatedToken = getCookieValue(rotatedCookies, AUTH_COOKIES.REFRESH_TOKEN)!;
+      const rotatedHash = hashToken(rotatedToken);
+
+      const oldToken = await RefreshTokenModel.findOne({
+        userId: regRes.body.data.user.id,
+        isRevoked: true,
+      });
+      expect(oldToken?.revocationReason).toBe('rotation');
+      expect(oldToken?.replacedByTokenHash).toBe(rotatedHash);
+
+      const candidate = await RefreshTokenModel.findOne({ tokenHash: rotatedHash });
+      expect(candidate?.isRevoked).toBe(false);
+      expect(candidate?.predecessorReuseCount).toBe(0);
+
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({ revocationReason: 'security_replay' })).toBe(0);
+      expect(fake.abortTransaction).toHaveBeenCalledTimes(1);
+      expect(fake.endSession).toHaveBeenCalledTimes(1);
+      expect(fake.commitTransaction).not.toHaveBeenCalled();
+
+      const meRes = await request(app).get('/api/auth/me').set('Cookie', rotatedCookies);
+      expect(meRes.status).toBe(200);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 36. Transaction reconciliation: token revoked by another request (not our own)
+  //     NOTE: fake transaction session/topology; not a real replica-set run.
+  // ---------------------------------------------------------------------------
+  it('36. should not attribute success to a transient rotation whose token was revoked by another request', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Foreign Revoke User',
+        email: 'foreign-revoke@example.com',
+        password: 'Password123!',
+      });
+    const firstCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstCookies, CSRF_COOKIE_NAME)!;
+
+    // A real standalone rotation revokes the old token and links a replacement.
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+    const secondTokenHash = hashToken(
+      getCookieValue(
+        firstRotation.headers['set-cookie'] as unknown as string[],
+        AUTH_COOKIES.REFRESH_TOKEN,
+      )!,
+    );
+
+    const fake = createFakeTransactionSession();
+    stubReplicaSetTopology(fake.session);
+    stubCandidatePersistence({ fakeSession: fake.session, persist: false });
+    stubTransactionalClaim({
+      fakeSession: fake.session,
+      behavior: 'transient',
+      transientError: makeTransientTransactionError(),
+    });
+
+    try {
+      const refreshRes = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', firstCookies)
+        .set('X-CSRF-Token', firstCsrf);
+
+      expect(refreshRes.status).toBe(401);
+      expect(refreshRes.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+      expect(refreshRes.body.error.message).toMatch(/recently rotated/i);
+      expect(refreshRes.body.error.message).not.toMatch(/reuse detected/i);
+
+      const secondToken = await RefreshTokenModel.findOne({ tokenHash: secondTokenHash });
+      expect(secondToken?.isRevoked).toBe(false);
+      expect(secondToken?.predecessorReuseCount).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({ revocationReason: 'security_replay' })).toBe(0);
+      // The aborted candidate must not exist: only the two rotated tokens remain.
+      expect(await RefreshTokenModel.countDocuments({})).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 37. Transaction reconciliation: database failure while re-reading state
+  //     NOTE: fake transaction session/topology; not a real replica-set run.
+  // ---------------------------------------------------------------------------
+  it('37. should surface a reconciliation database failure instead of a false outcome', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Reconciliation Failure User',
+        email: 'reconciliation-failure@example.com',
+        password: 'Password123!',
+      });
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrf = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    const fake = createFakeTransactionSession();
+    stubReplicaSetTopology(fake.session);
+    stubCandidatePersistence({ fakeSession: fake.session, persist: false });
+    stubTransactionalClaim({
+      fakeSession: fake.session,
+      behavior: 'transient',
+      transientError: makeTransientTransactionError(),
+    });
+    vi.spyOn(RefreshTokenModel, 'findOne').mockRejectedValueOnce(
+      new Error('Simulated reconciliation read failure'),
+    );
+
+    try {
+      const refreshRes = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrf);
+
+      // Must not be a 200 (false success) nor a 401 (misleading auth failure).
+      expect(refreshRes.status).toBe(500);
+      expect(refreshRes.body.success).toBe(false);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({})).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({ revocationReason: 'security_replay' })).toBe(0);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 38. Cleanup control flow: expected 401 survives without repeated session cleanup
+  //     NOTE: fake transaction session/topology; not a real replica-set run.
+  // ---------------------------------------------------------------------------
+  it('38. should keep the expected 401 after transaction cleanup without repeating session cleanup', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Unclaimed Cleanup User',
+        email: 'unclaimed-cleanup@example.com',
+        password: 'Password123!',
+      });
+    const firstCookies = regRes.headers['set-cookie'] as unknown as string[];
+    const firstCsrf = getCookieValue(firstCookies, CSRF_COOKIE_NAME)!;
+
+    const firstRotation = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', firstCookies)
+      .set('X-CSRF-Token', firstCsrf);
+    expect(firstRotation.status).toBe(200);
+
+    const fake = createFakeTransactionSession();
+    stubReplicaSetTopology(fake.session);
+    stubCandidatePersistence({ fakeSession: fake.session, persist: false });
+    stubTransactionalClaim({
+      fakeSession: fake.session,
+      behavior: 'null',
+      transientError: makeTransientTransactionError(),
+    });
+
+    try {
+      const refreshRes = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', firstCookies)
+        .set('X-CSRF-Token', firstCsrf);
+
+      expect(refreshRes.status).toBe(401);
+      expect(refreshRes.body.error.code).toBe(AUTH_ERRORS.REFRESH_TOKEN_INVALID);
+      expect(refreshRes.body.error.message).toMatch(/recently rotated/i);
+      expect(fake.abortTransaction).toHaveBeenCalledTimes(1);
+      expect(fake.endSession).toHaveBeenCalledTimes(1);
+      expect(fake.commitTransaction).not.toHaveBeenCalled();
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({})).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 39. Cleanup control flow: cleanup failure is surfaced, never swallowed
+  //     NOTE: fake transaction session/topology; not a real replica-set run.
+  // ---------------------------------------------------------------------------
+  it('39. should surface a session cleanup failure instead of hiding it', async () => {
+    const regRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        name: 'Cleanup Failure User',
+        email: 'cleanup-failure@example.com',
+        password: 'Password123!',
+      });
+    const cookies = regRes.headers['set-cookie'] as unknown as string[];
+    const csrf = getCookieValue(cookies, CSRF_COOKIE_NAME)!;
+
+    const fake = createFakeTransactionSession({ abortFails: true });
+    stubReplicaSetTopology(fake.session);
+    stubCandidatePersistence({ fakeSession: fake.session, persist: false });
+    stubTransactionalClaim({
+      fakeSession: fake.session,
+      behavior: 'null',
+      transientError: makeTransientTransactionError(),
+    });
+
+    try {
+      const refreshRes = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', cookies)
+        .set('X-CSRF-Token', csrf);
+
+      expect(refreshRes.status).toBe(500);
+      expect(refreshRes.body.success).toBe(false);
+      // Cleanup is attempted exactly once and endSession still runs afterwards.
+      expect(fake.abortTransaction).toHaveBeenCalledTimes(1);
+      expect(fake.endSession).toHaveBeenCalledTimes(1);
+      expect(await RefreshTokenModel.countDocuments({ isRevoked: false })).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({})).toBe(1);
+      expect(await RefreshTokenModel.countDocuments({ revocationReason: 'security_replay' })).toBe(0);
+    } finally {
       vi.restoreAllMocks();
     }
   });

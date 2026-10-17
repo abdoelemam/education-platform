@@ -8,7 +8,8 @@ export interface IRefreshToken {
   revokedAt?: Date;
   revocationReason?: 'rotation' | 'logout' | 'security_replay';
   replacedByTokenHash?: string;
-  lastReplayCheckAt?: Date;
+  predecessorReuseCount?: number;
+  predecessorRotatedAt?: Date;
   reuseCount?: number;
   createdAt: Date;
   updatedAt: Date;
@@ -55,7 +56,11 @@ const refreshTokenSchema = new Schema<RefreshTokenDocument>(
       type: String,
       default: undefined,
     },
-    lastReplayCheckAt: {
+    predecessorReuseCount: {
+      type: Number,
+      default: 0,
+    },
+    predecessorRotatedAt: {
       type: Date,
       default: undefined,
     },
