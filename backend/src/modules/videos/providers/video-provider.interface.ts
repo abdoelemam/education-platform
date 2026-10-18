@@ -13,8 +13,9 @@ export interface VideoUploadAuthorizationRequest {
   /** Owner (teacher) id. */
   ownerId: string;
   /**
-   * Provider asset identifier chosen by the server. Reused across
-   * re-authorizations so a retry overwrites the same asset.
+   * Provider asset identifier chosen by the server. It is stable for the
+   * first attempt and rotated when a provider-confirmed but non-ready asset
+   * must be replaced on retry.
    */
   assetId: string;
 }

@@ -8,16 +8,14 @@ import type { ProviderAssetInfo } from '../src/modules/videos/providers/video-pr
 const CLOUD_NAME = 'demo-cloud';
 const API_KEY = 'demo-key';
 const API_SECRET = 'demo-secret';
-const TTL_SECONDS = 900;
+/** Cloudinary's fixed, server-enforced upload-signature window. */
+const CLOUDINARY_TTL_SECONDS = 60 * 60;
 
-function createProvider(
-  uploadAuthorizationTtlSeconds = TTL_SECONDS,
-): CloudinaryVideoProvider {
+function createProvider(): CloudinaryVideoProvider {
   return new CloudinaryVideoProvider({
     cloudName: CLOUD_NAME,
     apiKey: API_KEY,
     apiSecret: API_SECRET,
-    uploadAuthorizationTtlSeconds,
   });
 }
 
@@ -57,6 +55,9 @@ describe('CloudinaryVideoProvider', () => {
     expect(fields.api_key).toBe(API_KEY);
     expect(fields.timestamp).toMatch(/^\d+$/);
     expect(fields.signature).toMatch(/^[0-9a-f]{40}$/);
+    // `overwrite=false` is signed so Cloudinary never replaces an existing
+    // asset, which protects a completed video from a reused older signature.
+    expect(fields.overwrite).toBe('false');
 
     // The provider secret must never be part of the browser payload.
     expect(fields.api_secret).toBeUndefined();
@@ -65,12 +66,15 @@ describe('CloudinaryVideoProvider', () => {
     // Cloudinary SHA-1 signature: sorted key=value pairs + API secret.
     const expectedSignature = crypto
       .createHash('sha1')
-      .update(`public_id=${fields.public_id}&timestamp=${fields.timestamp}${API_SECRET}`)
+      .update(
+        `overwrite=false&public_id=${fields.public_id}&timestamp=${fields.timestamp}${API_SECRET}`,
+      )
       .digest('hex');
     expect(fields.signature).toBe(expectedSignature);
 
+    // Cloudinary enforces this window; it cannot be shortened.
     const expectedExpiryMs =
-      (Number(fields.timestamp) + TTL_SECONDS) * 1000;
+      (Number(fields.timestamp) + CLOUDINARY_TTL_SECONDS) * 1000;
     expect(authorization.expiresAt.getTime()).toBe(expectedExpiryMs);
   });
 
@@ -165,16 +169,24 @@ describe('CloudinaryVideoProvider', () => {
     ).toThrow();
   });
 
-  it('caps signed-upload lifetimes at the provider one-hour limit', async () => {
-    const authorization = await createProvider(9999).createUploadAuthorization({
+  it('signs every authorization with overwrite disabled', async () => {
+    const provider = createProvider();
+    const assetId = 'education-platform/videos/abc';
+
+    const first = await provider.createUploadAuthorization({
       videoId: '664f00000000000000000001',
       ownerId: '664e00000000000000000002',
-      assetId: 'education-platform/videos/abc',
+      assetId,
+    });
+    const second = await provider.createUploadAuthorization({
+      videoId: '664f00000000000000000001',
+      ownerId: '664e00000000000000000002',
+      assetId,
     });
 
-    const expectedExpiryMs =
-      (Number(authorization.fields.timestamp) + 3600) * 1000;
-    expect(authorization.expiresAt.getTime()).toBe(expectedExpiryMs);
+    // A reused signed payload can never overwrite a completed asset.
+    expect(first.fields.overwrite).toBe('false');
+    expect(second.fields.overwrite).toBe('false');
   });
 
   it('deletes assets through the Admin API bulk endpoint by public id', async () => {

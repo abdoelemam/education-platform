@@ -179,7 +179,7 @@ Secure direct-upload authorization  ✅
 Video metadata persistence          ✅
 Server-verified processing status   ✅
 Playback gated until provider ready ✅
-20 integration + 9 provider tests  ✅
+25 integration + 9 provider tests  ✅
 ```
 
 ---

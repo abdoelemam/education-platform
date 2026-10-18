@@ -10,12 +10,15 @@ import type {
 } from './video-provider.interface.js';
 
 /**
- * Cloudinary rejects an upload signature whose timestamp is more than one hour
- * old. Signed instructions can therefore never outlive that window, so the
- * configured TTL is clamped to this maximum to keep the reported `expiresAt`
- * truthful.
+ * Cloudinary enforces a fixed one-hour validity window on upload signatures:
+ * the signed `timestamp` must be within one hour of the request and there is
+ * no parameter to make that window shorter. This is therefore the real,
+ * server-enforced lifetime of the instructions we return, not a preference.
+ *
+ * @see https://cloudinary.com/documentation/upload_images ("The signature is
+ * valid for 1 hour")
  */
-const MAX_UPLOAD_AUTHORIZATION_TTL_SECONDS = 60 * 60;
+const CLOUDINARY_UPLOAD_SIGNATURE_TTL_SECONDS = 60 * 60;
 
 /** Abort a hung Admin API call instead of hanging the originating request. */
 const ADMIN_REQUEST_TIMEOUT_MS = 15_000;
@@ -24,8 +27,6 @@ export interface CloudinaryProviderConfig {
   cloudName: string;
   apiKey: string;
   apiSecret: string;
-  /** Lifetime of the signed upload instructions, in seconds. */
-  uploadAuthorizationTtlSeconds: number;
 }
 
 /**
@@ -48,7 +49,8 @@ interface CloudinaryResource {
  *
  * Uses signature-based direct uploads:
  *   1. The browser asks our API for upload instructions.
- *   2. We sign `public_id` + `timestamp` with the API secret.
+ *   2. We sign `public_id`, `timestamp` and `overwrite=false` with the API
+ *      secret, so the asset can never be replaced by a later upload.
  *   3. The browser uploads directly to Cloudinary. The API server never sees
  *      the file and never exposes `api_secret` (only `api_key`, `timestamp`
  *      and the derived `signature` are returned).
@@ -71,14 +73,15 @@ export class CloudinaryVideoProvider implements VideoProvider {
     request: VideoUploadAuthorizationRequest,
   ): Promise<VideoUploadAuthorization> {
     const timestamp = Math.floor(Date.now() / 1000);
-    const ttlSeconds = Math.min(
-      this.config.uploadAuthorizationTtlSeconds,
-      MAX_UPLOAD_AUTHORIZATION_TTL_SECONDS,
-    );
 
     const signedParams: Record<string, string> = {
       public_id: request.assetId,
       timestamp: String(timestamp),
+      // Never replace an existing asset: when the public id already exists,
+      // Cloudinary returns immediately instead of overwriting it. This is what
+      // prevents a still-valid older signature from replacing a video that has
+      // already uploaded successfully.
+      overwrite: 'false',
     };
 
     const signature = this.sign(signedParams);
@@ -94,7 +97,10 @@ export class CloudinaryVideoProvider implements VideoProvider {
         api_key: this.config.apiKey,
         signature,
       },
-      expiresAt: new Date((timestamp + ttlSeconds) * 1000),
+      // Cloudinary enforces this window itself; it cannot be shortened.
+      expiresAt: new Date(
+        (timestamp + CLOUDINARY_UPLOAD_SIGNATURE_TTL_SECONDS) * 1000,
+      ),
     };
   }
 

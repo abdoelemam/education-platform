@@ -13,8 +13,6 @@ function buildVideoProvider(): VideoProvider {
       cloudName: config.CLOUDINARY_CLOUD_NAME ?? '',
       apiKey: config.CLOUDINARY_API_KEY ?? '',
       apiSecret: config.CLOUDINARY_API_SECRET ?? '',
-      uploadAuthorizationTtlSeconds:
-        config.VIDEO_UPLOAD_AUTHORIZATION_TTL_SECONDS,
     });
 
     if (provider.isConfigured()) {

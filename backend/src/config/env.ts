@@ -40,11 +40,6 @@ const envSchema = z.object({
   CLOUDINARY_API_KEY: z.string().optional(),
   CLOUDINARY_API_SECRET: z.string().optional(),
   VIDEO_UPLOAD_FOLDER: z.string().default('education-platform/videos'),
-  VIDEO_UPLOAD_AUTHORIZATION_TTL_SECONDS: z.coerce
-    .number()
-    .int()
-    .positive()
-    .default(3600),
 });
 
 function loadConfig() {

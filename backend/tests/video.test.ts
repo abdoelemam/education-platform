@@ -849,4 +849,141 @@ describe('Video System Integration Tests', () => {
     expect(storedWhenReady!.uploadedAt?.getTime()).toBe(uploadedAt?.getTime());
     expect(storedWhenReady!.readyAt).toBeDefined();
   });
+
+  // ---------------------------------------------------------------------------
+  // 21. A ready video cannot receive new upload instructions
+  // ---------------------------------------------------------------------------
+  it('21. should not issue new upload instructions for a ready video', async () => {
+    const owner = await registerApprovedTeacher('reauth.owner@example.com');
+    const other = await registerApprovedTeacher('reauth.other@example.com');
+    const videoId = await createVideo(owner);
+    const { assetId } = await authorizeUpload(owner, videoId);
+    fakeProvider.seedAsset(assetId);
+    await completeUpload(owner, videoId);
+
+    const ownerRetry = await request(app)
+      .post(`/api/teacher/videos/${videoId}/upload-authorization`)
+      .set('Cookie', owner.cookies)
+      .set('X-CSRF-Token', owner.csrf);
+
+    expect(ownerRetry.status).toBe(409);
+    expect(ownerRetry.body.error.code).toBe(
+      VIDEO_ERRORS.VIDEO_UPLOAD_ALREADY_COMPLETE,
+    );
+
+    // Ownership is enforced before the ready check.
+    const otherRetry = await request(app)
+      .post(`/api/teacher/videos/${videoId}/upload-authorization`)
+      .set('Cookie', other.cookies)
+      .set('X-CSRF-Token', other.csrf);
+
+    expect(otherRetry.status).toBe(403);
+    expect(otherRetry.body.error.code).toBe(VIDEO_ERRORS.VIDEO_FORBIDDEN);
+
+    // No additional provider authorization was issued for the ready video.
+    expect(fakeProvider.authorizationRequests).toHaveLength(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 22. Retry after an upload that never produced an asset reuses the asset id
+  // ---------------------------------------------------------------------------
+  it('22. should reuse the asset id when retrying an upload with no provider asset', async () => {
+    const teacher = await registerApprovedTeacher('retry.missing@example.com');
+    const videoId = await createVideo(teacher);
+
+    const first = await authorizeUpload(teacher, videoId);
+    const failed = await completeUpload(teacher, videoId);
+    expect(failed.status).toBe(409);
+    expect(failed.body.error.code).toBe(VIDEO_ERRORS.VIDEO_UPLOAD_NOT_FOUND);
+
+    const second = await authorizeUpload(teacher, videoId);
+
+    expect(second.assetId).toBe(first.assetId);
+    expect(fakeProvider.authorizationRequests).toHaveLength(2);
+    // Nothing existed at the provider, so there is nothing to clean up.
+    expect(fakeProvider.deletedAssets).toHaveLength(0);
+
+    fakeProvider.seedAsset(second.assetId);
+    const completed = await completeUpload(teacher, videoId);
+    expect(completed.status).toBe(200);
+    expect(completed.body.data.video.processingStatus).toBe('ready');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 23. Retry after a provider-confirmed processing failure rotates the asset
+  // ---------------------------------------------------------------------------
+  it('23. should rotate the asset id and clean up after a processing failure', async () => {
+    const teacher = await registerApprovedTeacher('retry.broken@example.com');
+    const videoId = await createVideo(teacher);
+
+    const first = await authorizeUpload(teacher, videoId);
+    fakeProvider.seedAsset(first.assetId, {
+      status: 'failed',
+      failureReason: 'transcode failed',
+    });
+
+    const failedComplete = await completeUpload(teacher, videoId);
+    expect(failedComplete.status).toBe(502);
+    expect(failedComplete.body.error.code).toBe(
+      VIDEO_ERRORS.VIDEO_PROVIDER_ERROR,
+    );
+
+    const storedFailed = await VideoModel.findById(videoId).exec();
+    expect(storedFailed!.uploadStatus).toBe('completed');
+    expect(storedFailed!.processingStatus).toBe('failed');
+
+    const second = await authorizeUpload(teacher, videoId);
+
+    expect(second.assetId).not.toBe(first.assetId);
+    expect(second.assetId.startsWith(`${first.assetId}-`)).toBe(true);
+    expect(fakeProvider.deletedAssets).toContain(first.assetId);
+
+    fakeProvider.seedAsset(second.assetId);
+    const completed = await completeUpload(teacher, videoId);
+    expect(completed.status).toBe(200);
+    expect(completed.body.data.video.providerAssetId).toBe(second.assetId);
+    expect(completed.body.data.video.processingStatus).toBe('ready');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 24. Completion trusts the provider even after the recorded window elapsed
+  // ---------------------------------------------------------------------------
+  it('24. should verify completion from the provider after the recorded window elapsed', async () => {
+    const teacher = await registerApprovedTeacher('expired.authorization@example.com');
+    const videoId = await createVideo(teacher);
+    const { assetId } = await authorizeUpload(teacher, videoId);
+    fakeProvider.seedAsset(assetId);
+
+    // The upload happened within Cloudinary's 1-hour window but completion was
+    // reported later; the provider asset is the source of truth, not our clock.
+    await VideoModel.updateOne(
+      { _id: videoId },
+      { uploadAuthorizationExpiresAt: new Date(Date.now() - 60_000) },
+    ).exec();
+
+    const res = await completeUpload(teacher, videoId);
+    expect(res.status).toBe(200);
+    expect(res.body.data.video.processingStatus).toBe('ready');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 25. Other teachers cannot complete someone else's upload
+  // ---------------------------------------------------------------------------
+  it('25. should forbid other teachers from completing an owned upload', async () => {
+    const owner = await registerApprovedTeacher('complete.owner@example.com');
+    const other = await registerApprovedTeacher('complete.other@example.com');
+    const videoId = await createVideo(owner);
+    const { assetId } = await authorizeUpload(owner, videoId);
+    fakeProvider.seedAsset(assetId);
+
+    const res = await request(app)
+      .post(`/api/teacher/videos/${videoId}/upload-complete`)
+      .set('Cookie', other.cookies)
+      .set('X-CSRF-Token', other.csrf);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe(VIDEO_ERRORS.VIDEO_FORBIDDEN);
+    // The provider was never consulted on behalf of the non-owner.
+    expect(fakeProvider.getAssetCalls).toBe(0);
+  });
 });

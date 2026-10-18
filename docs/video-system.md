@@ -34,6 +34,8 @@ Guarantees:
   duration, dimensions, thumbnails and playback URLs.
 - No playback URL is returned until the provider reports the asset ready and
   the requester is authorized.
+- A completed video cannot be replaced by reusing an older upload
+  authorization: signed instructions carry `overwrite=false`.
 
 ## Provider abstraction
 
@@ -69,7 +71,13 @@ required.
 | `CLOUDINARY_API_KEY` | with Cloudinary | – | Sent to the browser (not secret) |
 | `CLOUDINARY_API_SECRET` | with Cloudinary | – | Server-only; never returned |
 | `VIDEO_UPLOAD_FOLDER` | no | `education-platform/videos` | Server-chosen asset id prefix |
-| `VIDEO_UPLOAD_AUTHORIZATION_TTL_SECONDS` | no | `3600` | Lifetime of signed instructions (Cloudinary signatures are valid for at most 1 hour, so larger values are clamped) |
+
+> **Cloudinary signature validity:** signed upload instructions are valid for a
+> **fixed one hour** (Cloudinary requires the signed `timestamp` to be within
+> one hour of the request). There is no parameter to make this window shorter,
+> so no TTL setting is exposed: `expiresAt` is the real, provider-enforced
+> expiry, not a preference. Adding credentials or changing this is not
+> possible through our configuration.
 
 If `VIDEO_PROVIDER=cloudinary` but credentials are missing, the provider
 resolves to the fail-closed adapter and upload authorization returns `503`.
@@ -85,14 +93,23 @@ fake uploads.
   provider until credentials are supplied.
 - Uploads are signed with the API secret using Cloudinary's documented
   algorithm (SHA-1 of sorted `key=value` pairs + secret). Only `api_key`,
-  `timestamp`, `public_id` and the derived signature are returned.
+  `timestamp`, `public_id`, `overwrite` and the derived signature are returned.
+- **Replacement protection:** `overwrite=false` is part of the signed payload,
+  so Cloudinary never replaces an existing asset. A still-valid older
+  authorization therefore cannot overwrite a video that already uploaded
+  successfully, and the asset id cannot be redirected to another asset.
+- **Retry:** because overwrite is disabled, a retry that would target a
+  provider-confirmed asset (for example, one whose processing failed) uses a
+  freshly generated asset id and best-effort deletes the superseded asset. A
+  retry after a failed upload that never created an asset reuses the same id.
+- Signed instructions are valid for a fixed one hour; this is enforced by
+  Cloudinary and cannot be shortened through configuration, so `expiresAt`
+  reports the real window.
 - The adapter uses the Cloudinary Admin API (`fetch`) for `getAsset` and
   `deleteAsset`. No Cloudinary SDK dependency was added. `deleteAsset` uses the
   documented bulk endpoint (`DELETE /resources/video/upload` with a
   `public_ids[]` form field), which is the only Admin API path that deletes by
   public id. Admin API calls are bounded by a request timeout.
-- Signed upload instructions are valid for at most one hour; the configured TTL
-  is clamped to that limit so `expiresAt` never overstates the real window.
 
 ## API contract
 
@@ -156,7 +173,14 @@ Returns `{ "success": true, "data": { "video": { ... } } }`.
 ### `POST /api/teacher/videos/:videoId/upload-authorization`
 
 Returns server-authorized direct-upload instructions. The server chooses the
-asset id (reused on retries).
+asset id and signs it together with `overwrite=false`, so the resulting upload
+cannot replace an existing asset.
+
+The instructions are valid for a **fixed one hour**. This window is enforced by
+Cloudinary and cannot be shortened through configuration; `expiresAt` reports
+that real window. A ready video cannot request new instructions
+(`409 VIDEO_UPLOAD_ALREADY_COMPLETE`), and instructions issued earlier cannot be
+used to replace it because overwrite is disabled.
 
 Response `200`:
 
@@ -173,6 +197,7 @@ Response `200`:
       "fields": {
         "public_id": "education-platform/videos/664f...",
         "timestamp": "1700000000",
+        "overwrite": "false",
         "api_key": "<public key>",
         "signature": "<derived signature>"
       },
@@ -181,6 +206,14 @@ Response `200`:
   }
 }
 ```
+
+Retries:
+
+- a retry after an upload that never created a provider asset reuses the same
+  asset id;
+- a retry that would target a provider-confirmed, non-ready asset (for example,
+  failed processing) uses a new asset id and best-effort deletes the superseded
+  asset, because overwrite is disabled.
 
 The browser must send `uploadUrl` + `fields` as `multipart/form-data` with the
 file in a `file` part. Do not add fields that are not in `fields`; the signature
@@ -199,7 +232,11 @@ The backend calls the provider's `getAsset`:
 - asset ready → `200`, metadata filled from the provider, `playbackUrl` set;
 - provider failure → `502 VIDEO_PROVIDER_ERROR`.
 
-The operation is idempotent once the video is ready.
+The operation is idempotent once the video is ready. The recorded authorization
+`expiresAt` is not enforced here on purpose: the provider asset is the source of
+truth, so a video uploaded within the window is still verified even if the
+completion call arrives later, while a video that was never uploaded is caught
+by the missing provider asset.
 
 ### `GET /api/teacher/videos/:videoId/playback`
 
@@ -266,8 +303,7 @@ To enable real uploads:
 1. Create a Cloudinary account (free tier is sufficient to start).
 2. Set `VIDEO_PROVIDER=cloudinary` plus `CLOUDINARY_CLOUD_NAME`,
    `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` in the backend environment.
-3. Optionally adjust `VIDEO_UPLOAD_FOLDER` and
-   `VIDEO_UPLOAD_AUTHORIZATION_TTL_SECONDS`.
+3. Optionally adjust `VIDEO_UPLOAD_FOLDER`.
 4. Restart the backend. `POST .../upload-authorization` should stop returning
    `503`.
 5. Upload a small video through the direct-upload flow and confirm

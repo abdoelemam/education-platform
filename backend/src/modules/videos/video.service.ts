@@ -1,5 +1,7 @@
+import { randomBytes } from 'node:crypto';
 import { config } from '../../config/index.js';
 import { AppError } from '../../errors/index.js';
+import { logger } from '../../utils/index.js';
 import type { AuthUser } from '../users/user.types.js';
 import { VIDEO_ERRORS } from './video.constants.js';
 import { toPublicVideo } from './video.mapper.js';
@@ -101,7 +103,21 @@ export class VideoService {
       );
     }
 
-    const assetId = video.providerAssetId ?? this.buildAssetId(video._id.toString());
+    const previousAssetId = video.providerAssetId;
+
+    // A provider-confirmed asset that is not ready (for example, failed
+    // processing) cannot be overwritten: signed uploads are `overwrite=false`.
+    // A retry therefore targets a fresh asset id, and the superseded asset is
+    // cleaned up so retries do not leave orphaned storage behind.
+    const needsRotation =
+      Boolean(previousAssetId) && video.uploadStatus === 'completed';
+    const assetId = needsRotation
+      ? this.buildRetryAssetId(video._id.toString())
+      : previousAssetId ?? this.buildAssetId(video._id.toString());
+
+    if (needsRotation && previousAssetId) {
+      await this.deleteSupersededAsset(previousAssetId);
+    }
 
     const authorization = await this.provider.createUploadAuthorization({
       videoId: video._id.toString(),
@@ -149,6 +165,10 @@ export class VideoService {
   }): Promise<PublicVideo> {
     const video = await this.requireAccessibleVideo(params.videoId, params.requester);
 
+    // Authorization expiry is intentionally not enforced here: the provider is
+    // the source of truth. A video uploaded before the window closed must still
+    // be verified, while one that was never uploaded is caught below by the
+    // missing asset at the provider.
     // Idempotent once ready.
     if (video.processingStatus === 'ready') {
       return toPublicVideo(video);
@@ -292,6 +312,30 @@ export class VideoService {
   private buildAssetId(videoId: string): string {
     const folder = config.VIDEO_UPLOAD_FOLDER.replace(/^\/+|\/+$/g, '');
     return folder ? `${folder}/${videoId}` : videoId;
+  }
+
+  private buildRetryAssetId(videoId: string): string {
+    return `${this.buildAssetId(videoId)}-${randomBytes(6).toString('hex')}`;
+  }
+
+  /**
+   * Remove a superseded, non-ready attempt so retries do not leave orphaned
+   * storage. Cleanup is best effort: failing to delete the old asset must not
+   * block the new upload.
+   */
+  private async deleteSupersededAsset(assetId: string): Promise<void> {
+    if (!this.provider.deleteAsset) {
+      return;
+    }
+
+    try {
+      await this.provider.deleteAsset(assetId);
+    } catch (error) {
+      logger.warn('Failed to clean up a superseded video asset', {
+        assetId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 }
 
