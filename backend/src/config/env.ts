@@ -27,6 +27,19 @@ const envSchema = z.object({
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
   COOKIE_SAME_SITE: z.enum(['lax', 'strict', 'none']).default('lax'),
   COOKIE_DOMAIN: z.string().optional(),
+
+  // ---------------------------------------------------------------------------
+  // Video storage provider
+  //
+  // Video bytes are uploaded directly from the browser to the provider; the
+  // API only issues short-lived signed upload instructions. Credentials are
+  // optional at startup and the provider fails closed (HTTP 503) when missing.
+  // ---------------------------------------------------------------------------
+  VIDEO_PROVIDER: z.enum(['cloudinary', 'unconfigured']).default('unconfigured'),
+  CLOUDINARY_CLOUD_NAME: z.string().optional(),
+  CLOUDINARY_API_KEY: z.string().optional(),
+  CLOUDINARY_API_SECRET: z.string().optional(),
+  VIDEO_UPLOAD_FOLDER: z.string().default('education-platform/videos'),
 });
 
 function loadConfig() {

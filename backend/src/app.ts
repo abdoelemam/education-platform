@@ -10,13 +10,23 @@ import {
 } from './middleware/index.js';
 import { healthRoutes } from './modules/health/index.js';
 import { authRoutes } from './modules/auth/index.js';
+import { createVideoRouter } from './modules/videos/index.js';
+import type { VideoService } from './modules/videos/index.js';
+
+export interface CreateAppOptions {
+  /**
+   * Optional video service override. Used by tests to inject a fake storage
+   * provider instead of contacting a real provider.
+   */
+  videoService?: VideoService;
+}
 
 /**
  * Create and configure the Express application.
  *
  * Separated from server startup so the app can be tested independently.
  */
-export function createApp(): express.Express {
+export function createApp(options: CreateAppOptions = {}): express.Express {
   const app = express();
 
   // ---------------------------------------------------------------------------
@@ -48,6 +58,7 @@ export function createApp(): express.Express {
   // All API routes are prefixed with /api
   app.use('/api', healthRoutes);
   app.use('/api/auth', authRoutes);
+  app.use('/api/teacher/videos', createVideoRouter(options.videoService));
 
   // Future module routes will be registered here:
   // app.use('/api/auth', authRoutes);

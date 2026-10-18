@@ -339,6 +339,33 @@ The application database stores the provider reference and metadata.
 
 The exact provider should remain replaceable.
 
+Implementation (Phase 6 foundational backend):
+
+```text
+backend/src/modules/videos/
+├── video.model.ts
+├── video.repository.ts
+├── video.service.ts
+├── video.controller.ts
+├── video.routes.ts
+├── video.validation.ts
+└── providers/
+    ├── video-provider.interface.ts
+    ├── cloudinary.video-provider.ts
+    └── unconfigured.video-provider.ts
+```
+
+- `VideoProvider` isolates provider-specific upload authorization, asset
+  verification and deletion, so providers can be replaced without touching the
+  service or routes.
+- The browser uploads directly to the provider with short-lived signed
+  instructions; the API never proxies video bytes.
+- MongoDB stores only metadata and the provider reference.
+- Duration, dimensions, processing status and playback URLs come from
+  server-side provider verification, never from the client.
+- Without configuration the fail-closed adapter returns `503` instead of faking
+  a successful upload.
+
 ---
 
 # 13. Payment Architecture
@@ -489,6 +516,7 @@ Teacher APIs:
 
 ```text
 /api/teacher/*
+/api/teacher/videos/*
 ```
 
 Admin APIs:
