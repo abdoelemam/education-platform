@@ -17,7 +17,28 @@ const OBJECT_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
 const objectId = (label: string) =>
   z.string().regex(OBJECT_ID_PATTERN, `Invalid ${label}`);
 
-const HTTP_URL_PATTERN = /^https?:\/\//i;
+/**
+ * Accept only absolute http(s) URLs with a usable host.
+ *
+ * The prefix check requires the canonical `//` form and rejects other schemes.
+ * The WHATWG parser then rejects malformed input that a prefix-only check would
+ * let through, such as `https://`, invalid hosts or out-of-range ports.
+ */
+function isValidHttpUrl(value: string): boolean {
+  if (!/^https?:\/\//i.test(value)) {
+    return false;
+  }
+
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      /[a-z0-9]/i.test(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
 
 const title = (max: number) =>
   z
@@ -32,6 +53,17 @@ const description = (max: number) =>
     .trim()
     .max(max, `Description cannot exceed ${max} characters`)
     .optional();
+
+const documentUrlSchema = z
+  .string()
+  .trim()
+  .max(
+    LESSON_DOCUMENT_URL_MAX,
+    `Document URL cannot exceed ${LESSON_DOCUMENT_URL_MAX} characters`,
+  )
+  .refine(isValidHttpUrl, {
+    message: 'Document URL must be a valid http(s) URL',
+  });
 
 // ---------------------------------------------------------------------------
 // Course
@@ -155,16 +187,7 @@ export const createLessonSchema = z.discriminatedUnion('type', [
   z.object({
     ...lessonBase,
     type: z.literal('document'),
-    documentUrl: z
-      .string()
-      .trim()
-      .max(
-        LESSON_DOCUMENT_URL_MAX,
-        `Document URL cannot exceed ${LESSON_DOCUMENT_URL_MAX} characters`,
-      )
-      .refine((value) => HTTP_URL_PATTERN.test(value), {
-        message: 'Document URL must be a valid http(s) URL',
-      }),
+    documentUrl: documentUrlSchema,
     documentName: z
       .string()
       .trim()
@@ -199,17 +222,7 @@ export const updateLessonSchema = z
         `Content cannot exceed ${LESSON_TEXT_CONTENT_MAX} characters`,
       )
       .optional(),
-    documentUrl: z
-      .string()
-      .trim()
-      .max(
-        LESSON_DOCUMENT_URL_MAX,
-        `Document URL cannot exceed ${LESSON_DOCUMENT_URL_MAX} characters`,
-      )
-      .refine((value) => HTTP_URL_PATTERN.test(value), {
-        message: 'Document URL must be a valid http(s) URL',
-      })
-      .optional(),
+    documentUrl: documentUrlSchema.optional(),
     documentName: z
       .string()
       .trim()

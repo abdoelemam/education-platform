@@ -827,6 +827,113 @@ describe('Course Builder Integration Tests', () => {
     expect(bad.body.error.code).toBe('VALIDATION_ERROR');
   });
 
+  it('accepts absolute http and https document URLs on creation', async () => {
+    const teacher = await registerApprovedTeacher('document-valid@test.com');
+    const course = await createCourse(teacher);
+    const withSection = await addSection(teacher, course.id);
+    const sectionId = withSection.sections[0].id;
+
+    const validUrls = [
+      'http://example.com/handout.pdf',
+      'https://example.com/handout.pdf',
+      'https://cdn.example.com:8443/files/handout.pdf?v=2#page=3',
+      'HTTP://EXAMPLE.COM/HANDOUT.PDF',
+    ];
+
+    for (const documentUrl of validUrls) {
+      const res = await addLesson(teacher, course.id, sectionId, {
+        type: 'document',
+        title: 'Handout',
+        documentUrl,
+      });
+
+      expect(res.status).toBe(201);
+      const lessons = res.body.data.course.sections[0].lessons as LessonDto[];
+      expect(lessons[lessons.length - 1].documentUrl).toBe(documentUrl);
+    }
+  });
+
+  it('rejects malformed and non-http(s) document URLs on creation', async () => {
+    const teacher = await registerApprovedTeacher('document-invalid@test.com');
+    const course = await createCourse(teacher);
+    const withSection = await addSection(teacher, course.id);
+    const sectionId = withSection.sections[0].id;
+
+    const invalidUrls = [
+      // Prefix-only / malformed.
+      'https://',
+      'http://',
+      'not-a-url',
+      'example.com/handout.pdf',
+      '//example.com/handout.pdf',
+      'https://exa mple.com/handout.pdf',
+      'https://example.com:99999/handout.pdf',
+      // Disallowed protocols.
+      'javascript:alert(1)',
+      'file:///etc/passwd',
+      'ftp://example.com/handout.pdf',
+    ];
+
+    for (const documentUrl of invalidUrls) {
+      const res = await addLesson(teacher, course.id, sectionId, {
+        type: 'document',
+        title: 'Bad handout',
+        documentUrl,
+      });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    }
+
+    // No invalid lesson was persisted.
+    expect(await LessonModel.countDocuments({ sectionId })).toBe(0);
+  });
+
+  it('applies document URL validation on update', async () => {
+    const teacher = await registerApprovedTeacher('document-update@test.com');
+    const course = await createCourse(teacher);
+    const withSection = await addSection(teacher, course.id);
+    const sectionId = withSection.sections[0].id;
+
+    const created = await addLesson(teacher, course.id, sectionId, {
+      type: 'document',
+      title: 'Handout',
+      documentUrl: 'https://example.com/handout.pdf',
+    });
+    const lessonId = created.body.data.course.sections[0].lessons[0].id;
+
+    const patchUrl = (documentUrl: string) =>
+      request(app)
+        .patch(
+          `/api/teacher/courses/${course.id}/sections/${sectionId}/lessons/${lessonId}`,
+        )
+        .set('Cookie', teacher.cookies)
+        .set('X-CSRF-Token', teacher.csrf)
+        .send({ documentUrl });
+
+    const valid = await patchUrl('http://cdn.example.com/handout-v2.pdf');
+    expect(valid.status).toBe(200);
+    expect(valid.body.data.course.sections[0].lessons[0].documentUrl).toBe(
+      'http://cdn.example.com/handout-v2.pdf',
+    );
+
+    for (const documentUrl of [
+      'https://',
+      'https://exa mple.com/handout.pdf',
+      'javascript:alert(1)',
+      'file:///etc/passwd',
+      'ftp://example.com/handout.pdf',
+    ]) {
+      const res = await patchUrl(documentUrl);
+      expect(res.status).toBe(422);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    }
+
+    // Rejected updates must not change the stored value.
+    const stored = await LessonModel.findById(lessonId).exec();
+    expect(stored?.documentUrl).toBe('http://cdn.example.com/handout-v2.pdf');
+  });
+
   it('requires the type-specific payload on creation', async () => {
     const teacher = await registerApprovedTeacher('payload@test.com');
     const course = await createCourse(teacher);
