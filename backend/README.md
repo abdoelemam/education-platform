@@ -20,6 +20,10 @@ src/
 ├── errors/          # AppError and error classes
 ├── middleware/       # Express middleware (error handler, validation, logging)
 ├── modules/         # Feature-based modules
+│   ├── auth/        # Authentication and sessions
+│   ├── courses/     # Course Builder (courses, sections, lessons)
+│   ├── users/       # User accounts and roles
+│   ├── videos/      # Provider-agnostic video system
 │   └── health/      # Health check endpoint
 ├── utils/           # Shared utilities (logger, async handler, API responses)
 ├── app.ts           # Express app factory
@@ -72,4 +76,24 @@ src/
 State-changing routes require the `X-CSRF-Token` header. Video bytes are
 uploaded directly to the storage provider; see [`../docs/video-system.md`](../docs/video-system.md)
 for the full contract and provider configuration.
+
+### Courses (approved teachers)
+
+- `POST /api/teacher/courses` — Create a draft course
+- `GET /api/teacher/courses` — List the caller's courses (paginated)
+- `GET /api/teacher/courses/:courseId` — Get a course with its sections and lessons
+- `PATCH /api/teacher/courses/:courseId` — Update course metadata
+- `DELETE /api/teacher/courses/:courseId` — Delete a course and cascade its content
+- `POST /api/teacher/courses/:courseId/sections` — Add a section
+- `PATCH /api/teacher/courses/:courseId/sections/:sectionId` — Edit a section
+- `DELETE /api/teacher/courses/:courseId/sections/:sectionId` — Delete a section and its lessons
+- `PUT /api/teacher/courses/:courseId/sections/reorder` — Reorder sections
+- `POST /api/teacher/courses/:courseId/sections/:sectionId/lessons` — Add a lesson
+- `PATCH /api/teacher/courses/:courseId/sections/:sectionId/lessons/:lessonId` — Edit a lesson
+- `DELETE /api/teacher/courses/:courseId/sections/:sectionId/lessons/:lessonId` — Delete a lesson
+- `PUT /api/teacher/courses/:courseId/sections/:sectionId/lessons/reorder` — Reorder lessons
+
+State-changing routes require the `X-CSRF-Token` header. Video lessons reference
+an existing video by id and never duplicate the video pipeline. See
+[`../docs/course-builder.md`](../docs/course-builder.md) for the full contract.
 

@@ -107,12 +107,12 @@ Tasks:
 
 Tasks:
 
-* [ ] Course model
-* [ ] Course creation
-* [ ] Course editing
-* [ ] Course drafts
-* [ ] Course status
-* [ ] Course slug
+* [x] Course model
+* [x] Course creation
+* [x] Course editing
+* [x] Course drafts
+* [x] Course status
+* [x] Course slug
 * [ ] Thumbnail
 * [ ] Category
 * [ ] Pricing
@@ -125,25 +125,52 @@ Tasks:
 * [ ] Course publishing
 * [ ] Admin moderation
 
+Notes: the Course Builder delivered the Course model, creation/editing of course
+metadata, draft status and a server-generated unique slug. The status lifecycle
+field exists with `draft` as the only reachable value; transitions
+(submission/review/publishing) belong to the Teacher Workflow phase. The
+remaining metadata (thumbnail, category, pricing, level, language, outcomes,
+requirements) stays deferred as agreed.
+
 ---
 
 # Phase 5 — Course Builder
 
+Status: Backend complete (frontend deferred — the frontend app is not initialized yet)
+
 Tasks:
 
-* [ ] Sections
-* [ ] Lessons
-* [ ] Lesson types
-* [ ] Add section
-* [ ] Edit section
-* [ ] Delete section
-* [ ] Reorder sections
-* [ ] Add lesson
-* [ ] Edit lesson
-* [ ] Delete lesson
-* [ ] Reorder lessons
-* [ ] Course builder API
+* [x] Sections
+* [x] Lessons
+* [x] Lesson types
+* [x] Add section
+* [x] Edit section
+* [x] Delete section
+* [x] Reorder sections
+* [x] Add lesson
+* [x] Edit lesson
+* [x] Delete lesson
+* [x] Reorder lessons
+* [x] Course builder API
 * [ ] Course builder frontend
+
+Notes: lesson types `video`, `text` and `document` are implemented. The `quiz`
+lesson type exists in the domain model but cannot be created until the Quiz
+System (Phase 10) exists; creating one returns `LESSON_TYPE_UNSUPPORTED`.
+Video lessons reference the existing Video System by id and never duplicate
+upload, storage, processing or playback.
+
+Definition of done (backend):
+
+```text
+Course creation + metadata           ✅
+Sections (CRUD + ordering)           ✅
+Lessons (CRUD + ordering + types)    ✅
+Ownership + role authorization       ✅
+Video lesson linking                 ✅
+Validation + standard responses      ✅
+38 integration tests                 ✅
+```
 
 ---
 
@@ -502,7 +529,7 @@ roadmap and continue after the agreed sequence.
 Current phase:
 
 ```text
-Phase 6 — Video System (foundational backend complete)
+Phase 5 — Course Builder (backend complete; frontend deferred)
 ```
 
 Completed:
@@ -512,13 +539,14 @@ Phase 0 — Project Definition
 Phase 1 — Backend Foundation
 Phase 2 — Authentication & Users
 Phase 6 — Video System foundational backend
+Phase 5 — Course Builder backend
 ```
 
 Immediate next tasks:
 
 ```text
-1. Course Builder (Phase 5)
-2. Teacher Workflow: course submission → review → approval
+1. Teacher Workflow: course submission → review → approval
+2. Course Builder frontend (once the frontend app is initialized)
 ```
 
 The remaining Video System items (resumable uploads, upload UI, upload progress,
@@ -529,7 +557,7 @@ Next sequence:
 
 ```text
 Video System (foundational backend complete)
-→ Course Builder
+→ Course Builder (backend complete)
 → Teacher Workflow
 ```
 
