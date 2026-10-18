@@ -107,17 +107,12 @@ export class VideoService {
 
     // A provider-confirmed asset that is not ready (for example, failed
     // processing) cannot be overwritten: signed uploads are `overwrite=false`.
-    // A retry therefore targets a fresh asset id, and the superseded asset is
-    // cleaned up so retries do not leave orphaned storage behind.
+    // A retry therefore targets a fresh asset id.
     const needsRotation =
       Boolean(previousAssetId) && video.uploadStatus === 'completed';
     const assetId = needsRotation
       ? this.buildRetryAssetId(video._id.toString())
       : previousAssetId ?? this.buildAssetId(video._id.toString());
-
-    if (needsRotation && previousAssetId) {
-      await this.deleteSupersededAsset(previousAssetId);
-    }
 
     const authorization = await this.provider.createUploadAuthorization({
       videoId: video._id.toString(),
@@ -139,6 +134,13 @@ export class VideoService {
 
     if (!updated) {
       throw new AppError(404, VIDEO_ERRORS.VIDEO_NOT_FOUND, 'Video not found');
+    }
+
+    // Delete the superseded asset only after the new asset id is persisted, so a
+    // failed authorization or DB write never leaves the record pointing at an
+    // already-deleted asset. Cleanup stays best effort.
+    if (needsRotation && previousAssetId) {
+      await this.deleteSupersededAsset(previousAssetId);
     }
 
     return {

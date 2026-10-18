@@ -3,10 +3,14 @@ import request from 'supertest';
 import mongoose from 'mongoose';
 import bcrypt from 'bcrypt';
 import { createApp } from '../src/app.js';
+import { AppError } from '../src/errors/index.js';
 import { UserModel } from '../src/modules/users/user.model.js';
 import { RefreshTokenModel } from '../src/modules/auth/refresh-token.model.js';
 import { VideoModel } from '../src/modules/videos/video.model.js';
-import { videoRepository } from '../src/modules/videos/video.repository.js';
+import {
+  videoRepository,
+  VideoRepository,
+} from '../src/modules/videos/video.repository.js';
 import { VideoService } from '../src/modules/videos/video.service.js';
 import { UnconfiguredVideoProvider } from '../src/modules/videos/providers/unconfigured.video-provider.js';
 import { VIDEO_ERRORS } from '../src/modules/videos/video.constants.js';
@@ -98,6 +102,8 @@ class FakeVideoProvider implements VideoProvider {
   readonly authorizationRequests: VideoUploadAuthorizationRequest[] = [];
   readonly deletedAssets: string[] = [];
   getAssetCalls = 0;
+  /** When set, the next authorization request fails like a provider outage. */
+  failNextAuthorization = false;
 
   isConfigured(): boolean {
     return true;
@@ -106,6 +112,15 @@ class FakeVideoProvider implements VideoProvider {
   async createUploadAuthorization(
     input: VideoUploadAuthorizationRequest,
   ): Promise<VideoUploadAuthorization> {
+    if (this.failNextAuthorization) {
+      this.failNextAuthorization = false;
+      throw new AppError(
+        502,
+        VIDEO_ERRORS.VIDEO_PROVIDER_ERROR,
+        'Fake provider unavailable',
+      );
+    }
+
     this.authorizationRequests.push(input);
 
     return {
@@ -172,6 +187,26 @@ class FakeVideoProvider implements VideoProvider {
     this.authorizationRequests.length = 0;
     this.deletedAssets.length = 0;
     this.getAssetCalls = 0;
+    this.failNextAuthorization = false;
+  }
+}
+
+/**
+ * Repository wrapper whose writes can be forced to fail, proving that a failed
+ * DB update never triggers deletion of the superseded provider asset.
+ */
+class UpdateFailingVideoRepository extends VideoRepository {
+  failUpdates = false;
+
+  override async updateById(
+    id: string,
+    update: Parameters<VideoRepository['updateById']>[1],
+    unset: string[] = [],
+  ) {
+    if (this.failUpdates) {
+      return null;
+    }
+    return super.updateById(id, update, unset);
   }
 }
 
@@ -985,5 +1020,90 @@ describe('Video System Integration Tests', () => {
     expect(res.body.error.code).toBe(VIDEO_ERRORS.VIDEO_FORBIDDEN);
     // The provider was never consulted on behalf of the non-owner.
     expect(fakeProvider.getAssetCalls).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 26. A failed authorization must not delete the superseded asset
+  // ---------------------------------------------------------------------------
+  it('26. should not delete the superseded asset when issuing instructions fails', async () => {
+    const teacher = await registerApprovedTeacher('rotation.auth.fail@example.com');
+    const videoId = await createVideo(teacher);
+
+    const first = await authorizeUpload(teacher, videoId);
+    fakeProvider.seedAsset(first.assetId, {
+      status: 'failed',
+      failureReason: 'transcode failed',
+    });
+    const failedComplete = await completeUpload(teacher, videoId);
+    expect(failedComplete.status).toBe(502);
+
+    // A rotation is now required; make the provider fail to issue instructions.
+    fakeProvider.failNextAuthorization = true;
+
+    const res = await request(app)
+      .post(`/api/teacher/videos/${videoId}/upload-authorization`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe(VIDEO_ERRORS.VIDEO_PROVIDER_ERROR);
+    // The old asset is untouched because the new state was never persisted.
+    expect(fakeProvider.deletedAssets).toHaveLength(0);
+
+    const stored = await VideoModel.findById(videoId).exec();
+    expect(stored!.providerAssetId).toBe(first.assetId);
+    expect(stored!.processingStatus).toBe('failed');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 27. A failed DB write must not delete the superseded asset
+  // ---------------------------------------------------------------------------
+  it('27. should not delete the superseded asset when saving the new state fails', async () => {
+    const failingRepo = new UpdateFailingVideoRepository();
+    const failingApp = createApp({
+      videoService: new VideoService(failingRepo, fakeProvider),
+    });
+    const teacher = await registerApprovedTeacher('rotation.db.fail@example.com');
+
+    const created = await request(failingApp)
+      .post('/api/teacher/videos')
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Rotation DB failure' });
+    expect(created.status).toBe(201);
+    const videoId = created.body.data.video.id as string;
+
+    const first = await request(failingApp)
+      .post(`/api/teacher/videos/${videoId}/upload-authorization`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+    expect(first.status).toBe(200);
+    const assetId = first.body.data.upload.assetId as string;
+
+    fakeProvider.seedAsset(assetId, {
+      status: 'failed',
+      failureReason: 'transcode failed',
+    });
+    const failedComplete = await request(failingApp)
+      .post(`/api/teacher/videos/${videoId}/upload-complete`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+    expect(failedComplete.status).toBe(502);
+
+    // The write now fails, so the new asset id cannot be persisted.
+    failingRepo.failUpdates = true;
+
+    const res = await request(failingApp)
+      .post(`/api/teacher/videos/${videoId}/upload-authorization`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe(VIDEO_ERRORS.VIDEO_NOT_FOUND);
+    // No deletion is attempted before the new state is committed.
+    expect(fakeProvider.deletedAssets).toHaveLength(0);
+
+    const stored = await VideoModel.findById(videoId).exec();
+    expect(stored!.providerAssetId).toBe(assetId);
   });
 });

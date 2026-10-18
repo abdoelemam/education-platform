@@ -212,8 +212,11 @@ Retries:
 - a retry after an upload that never created a provider asset reuses the same
   asset id;
 - a retry that would target a provider-confirmed, non-ready asset (for example,
-  failed processing) uses a new asset id and best-effort deletes the superseded
-  asset, because overwrite is disabled.
+  failed processing) uses a new asset id, then best-effort deletes the
+  superseded asset **after** the new asset id is persisted, because overwrite is
+  disabled. A failed authorization or DB write therefore never leaves the record
+  pointing at an already-deleted asset (the abandoned asset is simply left for a
+  later retry or cleanup).
 
 The browser must send `uploadUrl` + `fields` as `multipart/form-data` with the
 file in a `file` part. Do not add fields that are not in `fields`; the signature
