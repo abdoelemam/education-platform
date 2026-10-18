@@ -12,6 +12,8 @@ import { healthRoutes } from './modules/health/index.js';
 import { authRoutes } from './modules/auth/index.js';
 import { createVideoRouter } from './modules/videos/index.js';
 import type { VideoService } from './modules/videos/index.js';
+import { createCourseRouter } from './modules/courses/index.js';
+import type { CourseService } from './modules/courses/index.js';
 
 export interface CreateAppOptions {
   /**
@@ -19,6 +21,11 @@ export interface CreateAppOptions {
    * provider instead of contacting a real provider.
    */
   videoService?: VideoService;
+  /**
+   * Optional course service override. Used by tests to inject fake
+   * repositories instead of touching the database directly.
+   */
+  courseService?: CourseService;
 }
 
 /**
@@ -59,6 +66,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.use('/api', healthRoutes);
   app.use('/api/auth', authRoutes);
   app.use('/api/teacher/videos', createVideoRouter(options.videoService));
+  app.use('/api/teacher/courses', createCourseRouter(options.courseService));
 
   // Future module routes will be registered here:
   // app.use('/api/auth', authRoutes);

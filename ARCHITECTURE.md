@@ -311,6 +311,26 @@ Lesson
 
 Reordering must be persisted through dedicated APIs.
 
+## Implementation Notes (Phase 5)
+
+* `Course`, `Section` and `Lesson` are separate MongoDB collections. Sections
+  reference their course and lessons reference both their section and course,
+  which keeps ordering, scoped lookups and cascade deletes simple.
+* Ordering is stored as a 1-based `order` field. Add operations append after the
+  current maximum; dedicated reorder endpoints accept the complete ordered id
+  list and rewrite only the `order` fields.
+* Every course operation is scoped to the course owner. Admins may bypass
+  ownership. A section or lesson id from another course is treated as missing.
+* Video lessons store a `videoId` reference to the existing Video System. The
+  video must exist and belong to the course owner; upload, storage, processing
+  and playback remain owned by the Video System.
+* Lesson types are `video`, `text`, `document` and `quiz`. `quiz` is reserved
+  until the Quiz System exists and is rejected on write.
+* Deleting a course cascades to its sections and lessons. Videos are
+  independent assets and are never deleted by the course module.
+
+The full HTTP contract is documented in [`docs/course-builder.md`](docs/course-builder.md).
+
 ---
 
 # 12. Video Architecture
