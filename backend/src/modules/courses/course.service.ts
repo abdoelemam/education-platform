@@ -8,11 +8,14 @@ import {
   type VideoRepository,
 } from '../videos/video.repository.js';
 import {
+  COURSE_DELETABLE_STATUSES,
   COURSE_EDITABLE_STATUSES,
+  COURSE_EDIT_LOCK_TTL_MS,
   COURSE_ERRORS,
   COURSE_SLUG_MAX,
   COURSE_SLUG_MAX_ATTEMPTS,
   COURSE_STATUS_TRANSITIONS,
+  type CourseErrorCode,
 } from './course.constants.js';
 import {
   courseRepository,
@@ -29,14 +32,14 @@ import {
   type LessonRepository,
   type LessonUpdate,
 } from './lesson.repository.js';
-import { toCourseDetail, toPublicCourse } from './course.mapper.js';
+import { toCourseDetail, toManagedCourse } from './course.mapper.js';
 import type {
   CourseDetail,
   CourseDocument,
   CourseStatus,
   LessonDocument,
   LessonType,
-  PublicCourse,
+  ManagedCourse,
   SectionDocument,
 } from './course.types.js';
 import type {
@@ -51,7 +54,11 @@ import type {
 const SLUG_BASE_MAX = COURSE_SLUG_MAX - 20;
 
 export interface PaginatedCourses {
-  items: PublicCourse[];
+  /**
+   * Owner/admin course-management items. A future public catalog must use the
+   * review-free `PublicCourse` mapper instead.
+   */
+  items: ManagedCourse[];
   page: number;
   limit: number;
   total: number;
@@ -186,7 +193,7 @@ export class CourseService {
     });
 
     return {
-      items: items.map(toPublicCourse),
+      items: items.map(toManagedCourse),
       page: params.page,
       limit: params.limit,
       total,
@@ -207,52 +214,76 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateCourseInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const update: CourseUpdate = {};
+        const unset: string[] = [];
+
+        if (params.input.title !== undefined) {
+          update.title = params.input.title;
+          // The slug is a stable identifier and is intentionally not regenerated.
+        }
+
+        if (params.input.description !== undefined) {
+          if (params.input.description === '') {
+            unset.push('description');
+          } else {
+            update.description = params.input.description;
+          }
+        }
+
+        const updated = await this.courseRepo.updateById(
+          course._id.toString(),
+          update,
+          unset,
+        );
+
+        if (!updated) {
+          throw new AppError(
+            404,
+            COURSE_ERRORS.COURSE_NOT_FOUND,
+            'Course not found',
+          );
+        }
+
+        return this.buildDetail(updated);
+      },
     );
-
-    const update: CourseUpdate = {};
-    const unset: string[] = [];
-
-    if (params.input.title !== undefined) {
-      update.title = params.input.title;
-      // The slug is a stable identifier and is intentionally not regenerated.
-    }
-
-    if (params.input.description !== undefined) {
-      if (params.input.description === '') {
-        unset.push('description');
-      } else {
-        update.description = params.input.description;
-      }
-    }
-
-    const updated = await this.courseRepo.updateById(
-      course._id.toString(),
-      update,
-      unset,
-    );
-
-    if (!updated) {
-      throw new AppError(404, COURSE_ERRORS.COURSE_NOT_FOUND, 'Course not found');
-    }
-
-    return this.buildDetail(updated);
   }
 
+  /**
+   * Delete a draft or rejected course and cascade to its content.
+   *
+   * Courses under review or already approved are intentionally not deletable:
+   * deletion would silently withdraw a submission or remove reviewed content.
+   * An admin must reject a pending course before the owner can clean it up; an
+   * explicit withdrawal flow is a future feature.
+   */
   async deleteCourse(params: {
     courseId: string;
     requester: AuthUser;
   }): Promise<void> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const courseId = course._id.toString();
+    await this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_DELETABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_DELETABLE,
+      'deleted',
+      async (course) => {
+        const courseId = course._id.toString();
 
-    // Cascade to content. Videos are independent assets that may be reused by
-    // other lessons, so they are never deleted here.
-    await this.lessonRepo.deleteByCourse(courseId);
-    await this.sectionRepo.deleteByCourse(courseId);
-    await this.courseRepo.deleteById(courseId);
+        // Cascade to content. Videos are independent assets that may be reused
+        // by other lessons, so they are never deleted here.
+        await this.lessonRepo.deleteByCourse(courseId);
+        await this.sectionRepo.deleteByCourse(courseId);
+        await this.courseRepo.deleteById(courseId);
+      },
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -275,18 +306,11 @@ export class CourseService {
     );
     this.assertTransition(course.status, 'pending_review');
 
-    // A new submission replaces the previous review outcome.
-    const updated = await this.courseRepo.transitionStatus(
-      course._id.toString(),
-      [course.status],
-      { status: 'pending_review', submittedAt: new Date() },
-      ['reviewedAt', 'reviewedBy', 'rejectionReason'],
-    );
-
-    if (!updated) {
-      throw this.concurrentTransitionError();
-    }
-
+    // A new submission replaces the previous review outcome. The transition is
+    // conditional on the edit lease being free: if a content write claimed the
+    // lease just before this request, submission fails rather than freezing a
+    // version that is still being written.
+    const updated = await this.transitionToPendingReview(course);
     return this.buildDetail(updated);
   }
 
@@ -310,7 +334,7 @@ export class CourseService {
     });
 
     return {
-      items: items.map(toPublicCourse),
+      items: items.map(toManagedCourse),
       page: params.page,
       limit: params.limit,
       total,
@@ -352,6 +376,7 @@ export class CourseService {
         reviewedBy: new Types.ObjectId(params.requester.id),
       },
       ['rejectionReason'],
+      this.submissionGuard(course),
     );
 
     if (!updated) {
@@ -384,6 +409,7 @@ export class CourseService {
         rejectionReason: params.reason,
       },
       [],
+      this.submissionGuard(course),
     );
 
     if (!updated) {
@@ -402,22 +428,26 @@ export class CourseService {
     requester: AuthUser;
     input: CreateSectionInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const courseId = course._id.toString();
+        const order = (await this.sectionRepo.maxOrder(courseId)) + 1;
+
+        await this.sectionRepo.create({
+          courseId,
+          title: params.input.title,
+          description: params.input.description,
+          order,
+        });
+
+        return this.buildDetail(course);
+      },
     );
-    const courseId = course._id.toString();
-
-    const order = (await this.sectionRepo.maxOrder(courseId)) + 1;
-
-    await this.sectionRepo.create({
-      courseId,
-      title: params.input.title,
-      description: params.input.description,
-      order,
-    });
-
-    return this.buildDetail(course);
   }
 
   async updateSection(params: {
@@ -426,33 +456,42 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateSectionInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+
+        const update: SectionUpdate = {};
+        const unset: string[] = [];
+
+        if (params.input.title !== undefined) {
+          update.title = params.input.title;
+        }
+
+        if (params.input.description !== undefined) {
+          if (params.input.description === '') {
+            unset.push('description');
+          } else {
+            update.description = params.input.description;
+          }
+        }
+
+        await this.sectionRepo.updateById(
+          section._id.toString(),
+          update,
+          unset,
+        );
+
+        return this.buildDetail(course);
+      },
     );
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
-
-    const update: SectionUpdate = {};
-    const unset: string[] = [];
-
-    if (params.input.title !== undefined) {
-      update.title = params.input.title;
-    }
-
-    if (params.input.description !== undefined) {
-      if (params.input.description === '') {
-        unset.push('description');
-      } else {
-        update.description = params.input.description;
-      }
-    }
-
-    await this.sectionRepo.updateById(section._id.toString(), update, unset);
-
-    return this.buildDetail(course);
   }
 
   async deleteSection(params: {
@@ -460,20 +499,25 @@ export class CourseService {
     sectionId: string;
     requester: AuthUser;
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
-    );
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
 
-    // Lessons belong to the section; deleting it cascades to them.
-    await this.lessonRepo.deleteBySection(section._id.toString());
-    await this.sectionRepo.deleteById(section._id.toString());
+        // Lessons belong to the section; deleting it cascades to them.
+        await this.lessonRepo.deleteBySection(section._id.toString());
+        await this.sectionRepo.deleteById(section._id.toString());
 
-    return this.buildDetail(course);
+        return this.buildDetail(course);
+      },
+    );
   }
 
   async reorderSections(params: {
@@ -481,24 +525,28 @@ export class CourseService {
     requester: AuthUser;
     sectionIds: string[];
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
-    );
-    const courseId = course._id.toString();
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const courseId = course._id.toString();
+        const sections = await this.sectionRepo.listByCourse(courseId);
+        assertSameIdSet(
+          sections.map((section) => section._id.toString()),
+          params.sectionIds,
+        );
 
-    const sections = await this.sectionRepo.listByCourse(courseId);
-    assertSameIdSet(
-      sections.map((section) => section._id.toString()),
-      params.sectionIds,
-    );
+        await this.sectionRepo.updateOrders(
+          courseId,
+          params.sectionIds.map((id, index) => ({ id, order: index + 1 })),
+        );
 
-    await this.sectionRepo.updateOrders(
-      courseId,
-      params.sectionIds.map((id, index) => ({ id, order: index + 1 })),
+        return this.buildDetail(course);
+      },
     );
-
-    return this.buildDetail(course);
   }
 
   // -------------------------------------------------------------------------
@@ -511,29 +559,35 @@ export class CourseService {
     requester: AuthUser;
     input: CreateLessonInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+
+        const payload = await this.resolveCreatePayload(course, params.input);
+        const order =
+          (await this.lessonRepo.maxOrder(section._id.toString())) + 1;
+
+        await this.lessonRepo.create({
+          courseId: course._id.toString(),
+          sectionId: section._id.toString(),
+          title: params.input.title,
+          description: params.input.description,
+          type: params.input.type,
+          order,
+          ...payload,
+        });
+
+        return this.buildDetail(course);
+      },
     );
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
-
-    const payload = await this.resolveCreatePayload(course, params.input);
-    const order = (await this.lessonRepo.maxOrder(section._id.toString())) + 1;
-
-    await this.lessonRepo.create({
-      courseId: course._id.toString(),
-      sectionId: section._id.toString(),
-      title: params.input.title,
-      description: params.input.description,
-      type: params.input.type,
-      order,
-      ...payload,
-    });
-
-    return this.buildDetail(course);
   }
 
   async updateLesson(params: {
@@ -543,108 +597,121 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateLessonInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+        const lesson = await this.requireLesson(
+          course._id.toString(),
+          section._id.toString(),
+          params.lessonId,
+        );
+
+        const update: LessonUpdate = {};
+        const unset: string[] = [];
+
+        if (params.input.title !== undefined) {
+          update.title = params.input.title;
+        }
+
+        if (params.input.description !== undefined) {
+          if (params.input.description === '') {
+            unset.push('description');
+          } else {
+            update.description = params.input.description;
+          }
+        }
+
+        const effectiveType: LessonType = params.input.type ?? lesson.type;
+
+        if (effectiveType === 'quiz') {
+          throw new AppError(
+            400,
+            COURSE_ERRORS.LESSON_TYPE_UNSUPPORTED,
+            'Quiz lessons are not supported yet',
+          );
+        }
+
+        if (
+          params.input.type !== undefined &&
+          params.input.type !== lesson.type
+        ) {
+          update.type = params.input.type;
+        }
+
+        // Type-specific payloads must match the effective type. This rejects
+        // conflicting updates such as sending `videoId` to a text lesson.
+        if (params.input.videoId !== undefined && effectiveType !== 'video') {
+          throw this.invalidPayload('videoId is only valid for video lessons');
+        }
+        if (params.input.content !== undefined && effectiveType !== 'text') {
+          throw this.invalidPayload('content is only valid for text lessons');
+        }
+        if (
+          (params.input.documentUrl !== undefined ||
+            params.input.documentName !== undefined) &&
+          effectiveType !== 'document'
+        ) {
+          throw this.invalidPayload(
+            'Document fields are only valid for document lessons',
+          );
+        }
+
+        if (effectiveType === 'video') {
+          if (params.input.videoId !== undefined) {
+            update.videoId = await this.resolveLessonVideo(
+              course,
+              params.input.videoId,
+            );
+          } else if (lesson.type !== 'video') {
+            throw this.missingPayload('A video lesson requires a videoId');
+          }
+          unset.push('content', 'documentUrl', 'documentName');
+        } else if (effectiveType === 'text') {
+          if (params.input.content !== undefined) {
+            update.content = params.input.content;
+          } else if (lesson.type !== 'text') {
+            throw this.missingPayload('A text lesson requires content');
+          }
+          unset.push('videoId', 'documentUrl', 'documentName');
+        } else {
+          if (params.input.documentUrl !== undefined) {
+            update.documentUrl = params.input.documentUrl;
+          } else if (lesson.type !== 'document') {
+            throw this.missingPayload(
+              'A document lesson requires a documentUrl',
+            );
+          }
+          if (params.input.documentName !== undefined) {
+            update.documentName = params.input.documentName;
+          }
+          unset.push('videoId', 'content');
+        }
+
+        const updated = await this.lessonRepo.updateById(
+          lesson._id.toString(),
+          update,
+          unset,
+        );
+
+        if (!updated) {
+          throw new AppError(
+            404,
+            COURSE_ERRORS.LESSON_NOT_FOUND,
+            'Lesson not found',
+          );
+        }
+
+        return this.buildDetail(course);
+      },
     );
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
-    const lesson = await this.requireLesson(
-      course._id.toString(),
-      section._id.toString(),
-      params.lessonId,
-    );
-
-    const update: LessonUpdate = {};
-    const unset: string[] = [];
-
-    if (params.input.title !== undefined) {
-      update.title = params.input.title;
-    }
-
-    if (params.input.description !== undefined) {
-      if (params.input.description === '') {
-        unset.push('description');
-      } else {
-        update.description = params.input.description;
-      }
-    }
-
-    const effectiveType: LessonType = params.input.type ?? lesson.type;
-
-    if (effectiveType === 'quiz') {
-      throw new AppError(
-        400,
-        COURSE_ERRORS.LESSON_TYPE_UNSUPPORTED,
-        'Quiz lessons are not supported yet',
-      );
-    }
-
-    if (params.input.type !== undefined && params.input.type !== lesson.type) {
-      update.type = params.input.type;
-    }
-
-    // Type-specific payloads must match the effective type. This rejects
-    // conflicting updates such as sending `videoId` to a text lesson.
-    if (params.input.videoId !== undefined && effectiveType !== 'video') {
-      throw this.invalidPayload('videoId is only valid for video lessons');
-    }
-    if (params.input.content !== undefined && effectiveType !== 'text') {
-      throw this.invalidPayload('content is only valid for text lessons');
-    }
-    if (
-      (params.input.documentUrl !== undefined ||
-        params.input.documentName !== undefined) &&
-      effectiveType !== 'document'
-    ) {
-      throw this.invalidPayload(
-        'Document fields are only valid for document lessons',
-      );
-    }
-
-    if (effectiveType === 'video') {
-      if (params.input.videoId !== undefined) {
-        update.videoId = await this.resolveLessonVideo(course, params.input.videoId);
-      } else if (lesson.type !== 'video') {
-        throw this.missingPayload('A video lesson requires a videoId');
-      }
-      unset.push('content', 'documentUrl', 'documentName');
-    } else if (effectiveType === 'text') {
-      if (params.input.content !== undefined) {
-        update.content = params.input.content;
-      } else if (lesson.type !== 'text') {
-        throw this.missingPayload('A text lesson requires content');
-      }
-      unset.push('videoId', 'documentUrl', 'documentName');
-    } else {
-      if (params.input.documentUrl !== undefined) {
-        update.documentUrl = params.input.documentUrl;
-      } else if (lesson.type !== 'document') {
-        throw this.missingPayload('A document lesson requires a documentUrl');
-      }
-      if (params.input.documentName !== undefined) {
-        update.documentName = params.input.documentName;
-      }
-      unset.push('videoId', 'content');
-    }
-
-    const updated = await this.lessonRepo.updateById(
-      lesson._id.toString(),
-      update,
-      unset,
-    );
-
-    if (!updated) {
-      throw new AppError(
-        404,
-        COURSE_ERRORS.LESSON_NOT_FOUND,
-        'Lesson not found',
-      );
-    }
-
-    return this.buildDetail(course);
   }
 
   async deleteLesson(params: {
@@ -653,23 +720,28 @@ export class CourseService {
     lessonId: string;
     requester: AuthUser;
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
-    );
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
-    const lesson = await this.requireLesson(
-      course._id.toString(),
-      section._id.toString(),
-      params.lessonId,
-    );
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+        const lesson = await this.requireLesson(
+          course._id.toString(),
+          section._id.toString(),
+          params.lessonId,
+        );
 
-    await this.lessonRepo.deleteById(lesson._id.toString());
+        await this.lessonRepo.deleteById(lesson._id.toString());
 
-    return this.buildDetail(course);
+        return this.buildDetail(course);
+      },
+    );
   }
 
   async reorderLessons(params: {
@@ -678,27 +750,34 @@ export class CourseService {
     requester: AuthUser;
     lessonIds: string[];
   }): Promise<CourseDetail> {
-    const course = await this.requireEditableCourse(
+    return this.withCourseMutationLock(
       params.courseId,
       params.requester,
-    );
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
 
-    const lessons = await this.lessonRepo.listBySection(section._id.toString());
-    assertSameIdSet(
-      lessons.map((lesson) => lesson._id.toString()),
-      params.lessonIds,
-    );
+        const lessons = await this.lessonRepo.listBySection(
+          section._id.toString(),
+        );
+        assertSameIdSet(
+          lessons.map((lesson) => lesson._id.toString()),
+          params.lessonIds,
+        );
 
-    await this.lessonRepo.updateOrders(
-      section._id.toString(),
-      params.lessonIds.map((id, index) => ({ id, order: index + 1 })),
-    );
+        await this.lessonRepo.updateOrders(
+          section._id.toString(),
+          params.lessonIds.map((id, index) => ({ id, order: index + 1 })),
+        );
 
-    return this.buildDetail(course);
+        return this.buildDetail(course);
+      },
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -743,16 +822,192 @@ export class CourseService {
   }
 
   /**
-   * Content mutations are only allowed while the course is a draft or was
-   * rejected. Once submitted, the admin reviews a frozen version.
+   * Serialize a content mutation with submission/review.
+   *
+   * Ownership and the status rule are checked first for precise errors; the
+   * database lease is then claimed atomically. Submission requires the lease to
+   * be free, so an edit that started just before submission either completes
+   * before the submission or prevents it with COURSE_EDIT_IN_PROGRESS.
    */
-  private async requireEditableCourse(
+  private async withCourseMutationLock<T>(
     courseId: string,
     requester: AuthUser,
-  ): Promise<CourseDocument> {
+    allowedStatuses: readonly CourseStatus[],
+    statusErrorCode: CourseErrorCode,
+    action: 'edited' | 'deleted',
+    operation: (course: CourseDocument) => Promise<T>,
+  ): Promise<T> {
     const course = await this.requireOwnedCourse(courseId, requester);
-    this.assertEditable(course);
-    return course;
+    this.assertStatusAllowed(course, allowedStatuses, statusErrorCode, action);
+
+    const locked = await this.acquireContentLock(
+      courseId,
+      requester,
+      allowedStatuses,
+      statusErrorCode,
+      action,
+    );
+
+    try {
+      return await operation(locked);
+    } finally {
+      if (locked.editLockToken) {
+        await this.courseRepo.releaseEditLock(
+          locked._id.toString(),
+          locked.editLockToken,
+        );
+      }
+    }
+  }
+
+  private async acquireContentLock(
+    courseId: string,
+    requester: AuthUser,
+    allowedStatuses: readonly CourseStatus[],
+    statusErrorCode: CourseErrorCode,
+    action: 'edited' | 'deleted',
+  ): Promise<CourseDocument> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const locked = await this.courseRepo.acquireEditLock(
+        courseId,
+        allowedStatuses,
+      );
+      if (locked) {
+        return locked;
+      }
+
+      const current = await this.requireOwnedCourse(courseId, requester);
+      this.assertStatusAllowed(
+        current,
+        allowedStatuses,
+        statusErrorCode,
+        action,
+      );
+
+      if (!current.editLocked) {
+        // The lease was released between the failed claim and this read.
+        continue;
+      }
+
+      if (!this.isEditLockStale(current)) {
+        throw this.editInProgressError();
+      }
+
+      const cleared = await this.courseRepo.clearStaleEditLock(
+        courseId,
+        allowedStatuses,
+        this.editLockCutoff(),
+      );
+      if (!cleared) {
+        // Another request refreshed or released the lease; re-evaluate.
+        continue;
+      }
+    }
+
+    throw this.editInProgressError();
+  }
+
+  /**
+   * Move a draft or rejected course to `pending_review`, but only while no
+   * content edit is in flight. A concurrent submission or status change is
+   * reported as a conflict rather than retried blindly, which prevents a stale
+   * submit request from resubmitting a version the owner has not seen.
+   */
+  private async transitionToPendingReview(
+    course: CourseDocument,
+  ): Promise<CourseDocument> {
+    const courseId = course._id.toString();
+    const fromStatus = course.status;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const updated = await this.courseRepo.transitionStatusIfIdle(
+        courseId,
+        [fromStatus],
+        {
+          status: 'pending_review',
+          submittedAt: this.nextSubmissionTime(course),
+        },
+        ['reviewedAt', 'reviewedBy', 'rejectionReason'],
+        this.submissionGuard(course),
+      );
+
+      if (updated) {
+        return updated;
+      }
+
+      const current = await this.requireCourse(courseId);
+
+      if (current.status !== fromStatus) {
+        throw this.concurrentTransitionError();
+      }
+
+      if (!current.editLocked) {
+        // The status changed and changed back, or another request won the
+        // transition. Do not silently resubmit a version the owner has not
+        // seen; make the client reload.
+        throw this.concurrentTransitionError();
+      }
+
+      if (!this.isEditLockStale(current)) {
+        throw this.editInProgressError();
+      }
+
+      const cleared = await this.courseRepo.clearStaleEditLock(
+        courseId,
+        [fromStatus],
+        this.editLockCutoff(),
+      );
+      if (!cleared) {
+        // Another request changed the lease; re-evaluate on the next pass.
+        continue;
+      }
+    }
+
+    throw this.editInProgressError();
+  }
+
+  /**
+   * Pin a review decision to the submission the admin actually loaded. Without
+   * this, an approve/reject request that read submission S1 could win the CAS
+   * after the owner was rejected and resubmitted S2, silently reviewing content
+   * the admin never saw.
+   */
+  private submissionGuard(course: CourseDocument): Record<string, unknown> {
+    return course.submittedAt
+      ? { submittedAt: course.submittedAt }
+      : { submittedAt: { $exists: false } };
+  }
+
+  /**
+   * Keep submission timestamps strictly increasing per course. This makes
+   * `submittedAt` a reliable submission identity even if two submissions occur
+   * within the same clock millisecond.
+   */
+  private nextSubmissionTime(course: CourseDocument): Date {
+    const previous = course.submittedAt?.getTime() ?? 0;
+    return new Date(Math.max(Date.now(), previous + 1));
+  }
+
+  private isEditLockStale(course: CourseDocument): boolean {
+    if (!course.editLocked) {
+      return false;
+    }
+    if (!course.editLockedAt) {
+      return true;
+    }
+    return Date.now() - course.editLockedAt.getTime() > COURSE_EDIT_LOCK_TTL_MS;
+  }
+
+  private editLockCutoff(): Date {
+    return new Date(Date.now() - COURSE_EDIT_LOCK_TTL_MS);
+  }
+
+  private editInProgressError(): AppError {
+    return new AppError(
+      409,
+      COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+      'A content edit is in progress; reload and retry',
+    );
   }
 
   /**
@@ -792,12 +1047,17 @@ export class CourseService {
     }
   }
 
-  private assertEditable(course: CourseDocument): void {
-    if (!COURSE_EDITABLE_STATUSES.includes(course.status)) {
+  private assertStatusAllowed(
+    course: CourseDocument,
+    allowedStatuses: readonly CourseStatus[],
+    errorCode: CourseErrorCode,
+    action: 'edited' | 'deleted',
+  ): void {
+    if (!allowedStatuses.includes(course.status)) {
       throw new AppError(
         409,
-        COURSE_ERRORS.COURSE_NOT_EDITABLE,
-        `A course in "${course.status}" status cannot be edited`,
+        errorCode,
+        `A course in "${course.status}" status cannot be ${action}`,
       );
     }
   }

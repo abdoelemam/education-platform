@@ -62,6 +62,22 @@ const courseSchema = new Schema<CourseDocument>(
       maxlength: [1000, 'Rejection reason cannot exceed 1000 characters'],
       default: undefined,
     },
+    /**
+     * Internal edit lease. Not client-controlled and never mapped to API
+     * responses. Submission refuses to run while this is true.
+     */
+    editLocked: {
+      type: Boolean,
+      default: false,
+    },
+    editLockedAt: {
+      type: Date,
+      default: undefined,
+    },
+    editLockToken: {
+      type: String,
+      default: undefined,
+    },
   },
   {
     timestamps: true,

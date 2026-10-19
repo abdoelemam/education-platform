@@ -161,6 +161,10 @@ archived
 an approved course becomes publicly available. A rejected course can be edited
 and resubmitted.
 
+Content is frozen while a course is under review or approved. A pending or
+approved course cannot be deleted; it must be rejected before cleanup. Review
+decisions apply only to the submission the reviewer inspected.
+
 Typical teacher workflow:
 
 ```text

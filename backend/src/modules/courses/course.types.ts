@@ -44,6 +44,18 @@ export interface ICourse {
   reviewedBy?: Types.ObjectId;
   /** Present only while the course is rejected; cleared on resubmission. */
   rejectionReason?: string;
+  /**
+   * Internal content-edit lease. A request that changes course content claims
+   * this boolean before writing and releases it afterwards. Submission needs an
+   * unlocked course, so a write that started just before submission cannot land
+   * after the review snapshot is taken. Never accepted from clients and never
+   * serialized in API responses.
+   */
+  editLocked: boolean;
+  /** When the current edit lease was claimed; used to recover abandoned locks. */
+  editLockedAt?: Date;
+  /** Opaque token identifying the current lease holder. */
+  editLockToken?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -133,7 +145,11 @@ export interface PublicSection {
 }
 
 /**
- * Sanitized course representation (metadata only).
+ * Audience-neutral course metadata.
+ *
+ * This is the mapper used for any future public/catalog response. It must not
+ * contain review internals (`submittedAt`, `reviewedAt`, `reviewedBy`,
+ * `rejectionReason`) or edit-lock fields.
  */
 export interface PublicCourse {
   id: string;
@@ -142,6 +158,17 @@ export interface PublicCourse {
   slug: string;
   description?: string;
   status: CourseStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Authorized course-management representation.
+ *
+ * Review metadata is part of the teacher/admin workflow and is only returned by
+ * owner or admin endpoints. It is never accepted as input.
+ */
+export interface ManagedCourse extends PublicCourse {
   /** ISO timestamp of the current review submission, when one exists. */
   submittedAt?: string;
   /** ISO timestamp of the admin review decision, when one exists. */
@@ -150,14 +177,12 @@ export interface PublicCourse {
   reviewedBy?: string;
   /** Reason supplied by the admin for the current rejection. */
   rejectionReason?: string;
-  createdAt: string;
-  updatedAt: string;
 }
 
 /**
  * Full course representation used by the Course Builder: metadata plus the
  * ordered section/lesson structure.
  */
-export interface CourseDetail extends PublicCourse {
+export interface CourseDetail extends ManagedCourse {
   sections: PublicSection[];
 }

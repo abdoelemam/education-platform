@@ -22,6 +22,7 @@ export { SectionModel } from './section.model.js';
 export { LessonModel } from './lesson.model.js';
 export {
   toPublicCourse,
+  toManagedCourse,
   toPublicSection,
   toPublicLesson,
   toCourseDetail,

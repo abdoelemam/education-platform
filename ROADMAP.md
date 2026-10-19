@@ -187,16 +187,22 @@ Tasks:
 * [x] Admin approval (`pending_review` → `approved`)
 * [x] Admin rejection with a validated reason (`pending_review` → `rejected`)
 * [x] Edit locking while submitted/approved
+* [x] Exclusive content-edit lease with crash recovery
 * [x] Rejected-course editing and resubmission
 * [x] Server-owned review fields
-* [x] Concurrent-transition protection
+* [x] Concurrent approve/reject/submission protection
+* [x] Stale review decisions pinned to the reviewed submission
+* [x] Deletion policy for pending/approved courses
 * [ ] Moderation UI
 * [ ] Course publishing (`approved` → `published`)
 
 Notes: submission is owner-only; approval/rejection is admin-only. A rejected
 course can be edited and resubmitted, which clears the previous review outcome.
-Approval is a review result, not publication. Runtime checks are covered by 19
-integration tests in `backend/tests/teacher-workflow.test.ts`.
+Approval is a review result, not publication. Content edits and deletion use an
+exclusive per-course lease; pending/approved courses cannot be deleted. Stale
+submit/review requests are pinned to the submission they loaded. Runtime checks
+are covered by 35 integration tests in
+`backend/tests/teacher-workflow.test.ts`.
 
 ---
 

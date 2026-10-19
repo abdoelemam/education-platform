@@ -3,6 +3,7 @@ import type {
   CourseDocument,
   ICourse,
   LessonDocument,
+  ManagedCourse,
   PublicCourse,
   PublicLesson,
   PublicSection,
@@ -12,7 +13,9 @@ import type {
 type CourseLike = CourseDocument | (ICourse & { _id: unknown });
 
 /**
- * Map a Course document into a sanitized, metadata-only representation.
+ * Map a Course document into the audience-neutral representation. Review
+ * metadata and edit-lock internals are deliberately excluded so this mapper is
+ * safe to reuse for public course catalog responses.
  */
 export function toPublicCourse(course: CourseLike): PublicCourse {
   return {
@@ -22,12 +25,22 @@ export function toPublicCourse(course: CourseLike): PublicCourse {
     slug: course.slug,
     description: course.description,
     status: course.status,
+    createdAt: course.createdAt.toISOString(),
+    updatedAt: course.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * Map a Course document into the authorized owner/admin representation,
+ * including review metadata but never edit-lock internals.
+ */
+export function toManagedCourse(course: CourseLike): ManagedCourse {
+  return {
+    ...toPublicCourse(course),
     submittedAt: course.submittedAt?.toISOString(),
     reviewedAt: course.reviewedAt?.toISOString(),
     reviewedBy: course.reviewedBy?.toString(),
     rejectionReason: course.rejectionReason,
-    createdAt: course.createdAt.toISOString(),
-    updatedAt: course.updatedAt.toISOString(),
   };
 }
 
@@ -88,7 +101,7 @@ export function toCourseDetail(
   }
 
   return {
-    ...toPublicCourse(course),
+    ...toManagedCourse(course),
     sections: sections.map((section) =>
       toPublicSection(section, lessonsBySection.get(section._id.toString()) ?? []),
     ),

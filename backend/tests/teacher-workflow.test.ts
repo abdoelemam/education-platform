@@ -9,7 +9,21 @@ import { VideoModel } from '../src/modules/videos/video.model.js';
 import { CourseModel } from '../src/modules/courses/course.model.js';
 import { SectionModel } from '../src/modules/courses/section.model.js';
 import { LessonModel } from '../src/modules/courses/lesson.model.js';
-import { COURSE_ERRORS } from '../src/modules/courses/course.constants.js';
+import {
+  COURSE_EDITABLE_STATUSES,
+  COURSE_EDIT_LOCK_TTL_MS,
+  COURSE_ERRORS,
+} from '../src/modules/courses/course.constants.js';
+import { CourseRepository } from '../src/modules/courses/course.repository.js';
+import { CourseService } from '../src/modules/courses/course.service.js';
+import {
+  toManagedCourse,
+  toPublicCourse,
+} from '../src/modules/courses/course.mapper.js';
+import { sectionRepository } from '../src/modules/courses/section.repository.js';
+import { lessonRepository } from '../src/modules/courses/lesson.repository.js';
+import { videoRepository } from '../src/modules/videos/video.repository.js';
+import type { AuthUser } from '../src/modules/users/user.types.js';
 import { AUTH_ERRORS } from '../src/modules/auth/auth.constants.js';
 import { CSRF_COOKIE_NAME } from '../src/middleware/csrf.js';
 
@@ -368,6 +382,8 @@ describe('Teacher Workflow Integration Tests', () => {
       reviewedBy: teacher.userId,
       reviewedAt: new Date().toISOString(),
       rejectionReason: 'self-approved',
+      editLocked: true,
+      editLockedAt: new Date().toISOString(),
     });
 
     expect(res.status).toBe(200);
@@ -375,6 +391,9 @@ describe('Teacher Workflow Integration Tests', () => {
     expect(submitted.status).toBe('pending_review');
     expect(submitted.reviewedBy).toBeUndefined();
     expect(submitted.rejectionReason).toBeUndefined();
+    expect(submitted).not.toHaveProperty('editLocked');
+    expect(submitted).not.toHaveProperty('editLockedAt');
+    expect(submitted).not.toHaveProperty('editLockToken');
 
     const stored = await CourseModel.findById(course.id).exec();
     expect(stored?.status).toBe('pending_review');
@@ -842,8 +861,13 @@ describe('Teacher Workflow Integration Tests', () => {
         status: 'approved',
         ownerId: other.userId,
         slug: 'attacker-chosen-slug',
+        submittedAt: new Date(0).toISOString(),
         reviewedBy: teacher.userId,
+        reviewedAt: new Date(0).toISOString(),
         rejectionReason: 'forged',
+        editLocked: true,
+        editLockedAt: new Date().toISOString(),
+        editLockToken: 'forged-token',
       });
 
     expect(res.status).toBe(200);
@@ -852,7 +876,593 @@ describe('Teacher Workflow Integration Tests', () => {
     expect(updated.status).toBe('draft');
     expect(updated.ownerId).toBe(teacher.userId);
     expect(updated.slug).toBe(course.slug);
+    expect(updated.submittedAt).toBeUndefined();
+    expect(updated.reviewedAt).toBeUndefined();
     expect(updated.reviewedBy).toBeUndefined();
     expect(updated.rejectionReason).toBeUndefined();
+    expect(updated).not.toHaveProperty('editLocked');
+    expect(updated).not.toHaveProperty('editLockedAt');
+    expect(updated).not.toHaveProperty('editLockToken');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 4. Edit/submission races and deletion policy
+  // ---------------------------------------------------------------------------
+  it('blocks submission while a content edit lease is held, then allows retry', async () => {
+    const teacher = await registerApprovedTeacher('lease-submit@test.com');
+    const course = await createCourse(teacher);
+    const repo = new CourseRepository();
+
+    const locked = await repo.acquireEditLock(
+      course.id,
+      COURSE_EDITABLE_STATUSES,
+    );
+    expect(locked).not.toBeNull();
+    expect(locked?.editLocked).toBe(true);
+
+    const blocked = await submit(teacher, course.id);
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    );
+    expect((await CourseModel.findById(course.id).exec())?.status).toBe('draft');
+
+    await repo.releaseEditLock(course.id, locked!.editLockToken!);
+
+    const retried = await submit(teacher, course.id);
+    expect(retried.status).toBe(200);
+    const submitted = retried.body.data.course as CourseDto;
+    expect(submitted.status).toBe('pending_review');
+    expect(submitted).not.toHaveProperty('editLocked');
+    expect(submitted).not.toHaveProperty('editLockedAt');
+  });
+
+  it('serializes content edits with the per-course lease', async () => {
+    const teacher = await registerApprovedTeacher('lease-edit@test.com');
+    const course = await createCourse(teacher, 'Original Title');
+    const repo = new CourseRepository();
+
+    const locked = await repo.acquireEditLock(
+      course.id,
+      COURSE_EDITABLE_STATUSES,
+    );
+
+    const blocked = await request(app)
+      .patch(`/api/teacher/courses/${course.id}`)      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Concurrent edit' });
+
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    );
+    expect((await CourseModel.findById(course.id).exec())?.title).toBe(
+      'Original Title',
+    );
+
+    await repo.releaseEditLock(course.id, locked!.editLockToken!);
+
+    const allowed = await request(app)
+      .patch(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Sequential edit' });
+
+    expect(allowed.status).toBe(200);
+    expect(allowed.body.data.course.title).toBe('Sequential edit');
+  });
+
+  it('recovers an abandoned edit lease before submitting', async () => {
+    const teacher = await registerApprovedTeacher('lease-stale@test.com');
+    const course = await createCourse(teacher);
+
+    await CourseModel.updateOne(
+      { _id: course.id },
+      {
+        $set: {
+          editLocked: true,
+          editLockedAt: new Date(
+            Date.now() - COURSE_EDIT_LOCK_TTL_MS - 1000,
+          ),
+        },
+      },
+    ).exec();
+
+    const res = await submit(teacher, course.id);
+    expect(res.status).toBe(200);
+    expect(res.body.data.course.status).toBe('pending_review');
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.editLocked).toBe(false);
+    expect(stored?.editLockedAt).toBeUndefined();
+    expect(stored?.editLockToken).toBeUndefined();
+  });
+
+  it('does not let a stale holder release a newer edit lease', async () => {
+    const teacher = await registerApprovedTeacher('lease-token@test.com');
+    const course = await createCourse(teacher);
+    const repo = new CourseRepository();
+
+    const staleLock = await repo.acquireEditLock(
+      course.id,
+      COURSE_EDITABLE_STATUSES,
+    );
+    expect(staleLock?.editLockToken).toBeDefined();
+
+    await CourseModel.updateOne(
+      { _id: course.id },
+      {
+        $set: {
+          editLockedAt: new Date(
+            Date.now() - COURSE_EDIT_LOCK_TTL_MS - 1000,
+          ),
+        },
+      },
+    ).exec();
+
+    expect(
+      await repo.clearStaleEditLock(
+        course.id,
+        COURSE_EDITABLE_STATUSES,
+        new Date(Date.now() - COURSE_EDIT_LOCK_TTL_MS),
+      ),
+    ).toBe(true);
+
+    const freshLock = await repo.acquireEditLock(
+      course.id,
+      COURSE_EDITABLE_STATUSES,
+    );
+    expect(freshLock?.editLockToken).toBeDefined();
+    expect(freshLock?.editLockToken).not.toBe(staleLock?.editLockToken);
+
+    // The old, recovered request must not be able to release the new holder.
+    await repo.releaseEditLock(course.id, staleLock!.editLockToken!);
+    const stillLocked = await CourseModel.findById(course.id).exec();
+    expect(stillLocked?.editLocked).toBe(true);
+    expect(stillLocked?.editLockToken).toBe(freshLock?.editLockToken);
+
+    await repo.releaseEditLock(course.id, freshLock!.editLockToken!);
+    const unlocked = await CourseModel.findById(course.id).exec();
+    expect(unlocked?.editLocked).toBe(false);
+    expect(unlocked?.editLockToken).toBeUndefined();
+  });
+
+  it('serializes concurrent submissions', async () => {
+    const teacher = await registerApprovedTeacher('concurrent-submit@test.com');
+    const course = await createCourse(teacher);
+
+    const [first, second] = await Promise.all([
+      submit(teacher, course.id),
+      submit(teacher, course.id),
+    ]);
+
+    expect([first.status, second.status].sort((a, b) => a - b)).toEqual([
+      200, 409,
+    ]);
+    const loser = first.status === 409 ? first : second;
+    expect(loser.body.error.code).toBe(
+      COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+    );
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.status).toBe('pending_review');
+    expect(stored?.submittedAt).toBeInstanceOf(Date);
+  });
+
+  it('allows only one of concurrent approve/reject decisions', async () => {
+    const teacher = await registerApprovedTeacher('concurrent-review@test.com');
+    const admin = await createAdmin('concurrent-review-admin@test.com');
+    const course = await createPendingCourse(teacher);
+
+    const [approveRes, rejectRes] = await Promise.all([
+      approve(admin, course.id),
+      reject(admin, course.id, { reason: 'Concurrent rejection' }),
+    ]);
+
+    expect(
+      [approveRes.status, rejectRes.status].sort((a, b) => a - b),
+    ).toEqual([200, 409]);
+    const loser = approveRes.status === 409 ? approveRes : rejectRes;
+    expect(loser.body.error.code).toBe(
+      COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+    );
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(['approved', 'rejected']).toContain(stored?.status);
+    expect(stored?.reviewedBy?.toString()).toBe(admin.userId);
+    expect(stored?.reviewedAt).toBeInstanceOf(Date);
+
+    if (approveRes.status === 200) {
+      expect(stored?.status).toBe('approved');
+      expect(stored?.rejectionReason).toBeUndefined();
+    } else {
+      expect(stored?.status).toBe('rejected');
+      expect(stored?.rejectionReason).toBe('Concurrent rejection');
+    }
+  });
+
+  it('allows only one of concurrent approvals', async () => {
+    const teacher = await registerApprovedTeacher('double-approve@test.com');
+    const admin = await createAdmin('double-approve-admin@test.com');
+    const course = await createPendingCourse(teacher);
+
+    const [first, second] = await Promise.all([
+      approve(admin, course.id),
+      approve(admin, course.id),
+    ]);
+
+    expect([first.status, second.status].sort((a, b) => a - b)).toEqual([
+      200, 409,
+    ]);
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.status).toBe('approved');
+    expect(stored?.reviewedBy?.toString()).toBe(admin.userId);
+  });
+
+  it('does not apply a stale review decision to a newer submission', async () => {
+    const teacher = await registerApprovedTeacher('stale-review@test.com');
+    const admin = await createAdmin('stale-review-admin@test.com');
+    const course = await createPendingCourse(teacher);
+
+    const staleSubmission = await CourseModel.findById(course.id).exec();
+    expect(staleSubmission?.submittedAt).toBeInstanceOf(Date);
+
+    expect(
+      (await reject(admin, course.id, { reason: 'Fix the first submission' }))
+        .status,
+    ).toBe(200);
+
+    const edit = await request(app)
+      .patch(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Revised for the second submission' });
+    expect(edit.status).toBe(200);
+
+    // Ensure the resubmission has a distinct timestamp from the first one.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const resubmitted = await submit(teacher, course.id);
+    expect(resubmitted.status).toBe(200);
+    const newSubmittedAt = resubmitted.body.data.course.submittedAt as string;
+    expect(newSubmittedAt).not.toBe(staleSubmission?.submittedAt?.toISOString());
+
+    // Simulate an admin request that read submission S1 but reaches the
+    // service after the owner rejected/edited/resubmitted as S2.
+    const staleRepo = new CourseRepository();
+    staleRepo.findById = async () => staleSubmission;
+    const service = new CourseService(
+      staleRepo,
+      sectionRepository,
+      lessonRepository,
+      videoRepository,
+    );
+    const adminUser: AuthUser = {
+      id: admin.userId,
+      email: 'stale-review-admin@test.com',
+      role: 'admin',
+      teacherStatus: 'none',
+      isActive: true,
+    };
+
+    await expect(
+      service.approveCourse({ courseId: course.id, requester: adminUser }),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      code: COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+    });
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.status).toBe('pending_review');
+    expect(stored?.reviewedBy).toBeUndefined();
+    expect(stored?.submittedAt?.toISOString()).toBe(newSubmittedAt);
+  });
+
+  it('does not apply a stale submission request to a newer review cycle', async () => {
+    const teacher = await registerApprovedTeacher('stale-submit@test.com');
+    const admin = await createAdmin('stale-submit-admin@test.com');
+    const course = await createCourse(teacher);
+
+    expect((await submit(teacher, course.id)).status).toBe(200);
+    expect(
+      (await reject(admin, course.id, { reason: 'First pass' })).status,
+    ).toBe(200);
+
+    const staleRejected = await CourseModel.findById(course.id).exec();
+    expect(staleRejected?.status).toBe('rejected');
+    expect(staleRejected?.submittedAt).toBeInstanceOf(Date);
+
+    const resubmitted = await submit(teacher, course.id);
+    expect(resubmitted.status).toBe(200);
+    const secondSubmittedAt = resubmitted.body.data.course
+      .submittedAt as string;
+    expect(secondSubmittedAt).not.toBe(
+      staleRejected?.submittedAt?.toISOString(),
+    );
+
+    expect(
+      (await reject(admin, course.id, { reason: 'Second pass' })).status,
+    ).toBe(200);
+
+    // Simulate a submit request that read the first rejection but reaches the
+    // service after the owner has already resubmitted and been rejected again.
+    const staleRepo = new CourseRepository();
+    staleRepo.findById = async () => staleRejected;
+    const service = new CourseService(
+      staleRepo,
+      sectionRepository,
+      lessonRepository,
+      videoRepository,
+    );
+    const ownerUser: AuthUser = {
+      id: teacher.userId,
+      email: 'stale-submit@test.com',
+      role: 'teacher',
+      teacherStatus: 'approved',
+      isActive: true,
+    };
+
+    await expect(
+      service.submitCourse({ courseId: course.id, requester: ownerUser }),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      code: COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+    });
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.status).toBe('rejected');
+    expect(stored?.submittedAt?.toISOString()).toBe(secondSubmittedAt);
+    expect(stored?.rejectionReason).toBe('Second pass');
+  });
+
+  it('does not delete a course under review or after approval', async () => {
+    const teacher = await registerApprovedTeacher('delete-pending@test.com');
+    const admin = await createAdmin('delete-pending-admin@test.com');
+    const course = await createCourse(teacher);
+    const withSection = await addSection(teacher, course.id);
+    const sectionId = withSection.sections[0].id;
+    await addTextLesson(teacher, course.id, sectionId);
+    expect((await submit(teacher, course.id)).status).toBe(200);
+
+    const ownerDelete = await request(app)
+      .delete(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+    expect(ownerDelete.status).toBe(409);
+    expect(ownerDelete.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_NOT_DELETABLE,
+    );
+
+    const adminDelete = await request(app)
+      .delete(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', admin.cookies)
+      .set('X-CSRF-Token', admin.csrf);
+    expect(adminDelete.status).toBe(409);
+    expect(adminDelete.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_NOT_DELETABLE,
+    );
+
+    expect((await approve(admin, course.id)).status).toBe(200);
+
+    const approvedDelete = await request(app)
+      .delete(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+    expect(approvedDelete.status).toBe(409);
+    expect(approvedDelete.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_NOT_DELETABLE,
+    );
+
+    // The reviewed course and its content survive every attempt.
+    expect(await CourseModel.findById(course.id).exec()).not.toBeNull();
+    expect(await SectionModel.countDocuments({ courseId: course.id })).toBe(1);
+    expect(await LessonModel.countDocuments({ courseId: course.id })).toBe(1);
+  });
+
+  it('deletes a rejected course and cascades its content', async () => {
+    const teacher = await registerApprovedTeacher('delete-rejected@test.com');
+    const admin = await createAdmin('delete-rejected-admin@test.com');
+    const course = await createCourse(teacher);
+    const withSection = await addSection(teacher, course.id);
+    const sectionId = withSection.sections[0].id;
+    await addTextLesson(teacher, course.id, sectionId);
+    expect((await submit(teacher, course.id)).status).toBe(200);
+    expect(
+      (await reject(admin, course.id, { reason: 'Start over' })).status,
+    ).toBe(200);
+
+    const res = await request(app)
+      .delete(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+
+    expect(res.status).toBe(200);
+    expect(await CourseModel.findById(course.id).exec()).toBeNull();
+    expect(await SectionModel.countDocuments({ courseId: course.id })).toBe(0);
+    expect(await LessonModel.countDocuments({ courseId: course.id })).toBe(0);
+  });
+
+  it('does not delete while a content edit is in progress', async () => {
+    const teacher = await registerApprovedTeacher('delete-locked@test.com');
+    const course = await createCourse(teacher);
+    const repo = new CourseRepository();
+
+    const locked = await repo.acquireEditLock(
+      course.id,
+      COURSE_EDITABLE_STATUSES,
+    );
+
+    const blocked = await request(app)
+      .delete(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    );
+    expect(await CourseModel.findById(course.id).exec()).not.toBeNull();
+
+    await repo.releaseEditLock(course.id, locked!.editLockToken!);
+
+    const allowed = await request(app)
+      .delete(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf);
+    expect(allowed.status).toBe(200);
+    expect(await CourseModel.findById(course.id).exec()).toBeNull();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 5. Review metadata exposure and mutation authorization
+  // ---------------------------------------------------------------------------
+  it('ignores client-supplied review metadata on rejection', async () => {
+    const teacher = await registerApprovedTeacher('reject-fields@test.com');
+    const admin = await createAdmin('reject-fields-admin@test.com');
+    const course = await createPendingCourse(teacher);
+
+    const res = await reject(admin, course.id, {
+      reason: '  Add a thumbnail before resubmitting.  ',
+      status: 'approved',
+      reviewedBy: teacher.userId,
+      reviewedAt: new Date(0).toISOString(),
+      submittedAt: new Date(0).toISOString(),
+      rejectionReason: 'forged',
+    });
+
+    expect(res.status).toBe(200);
+    const rejected = res.body.data.course as CourseDto;
+    expect(rejected.status).toBe('rejected');
+    expect(rejected.reviewedBy).toBe(admin.userId);
+    expect(rejected.reviewedAt).not.toBe(new Date(0).toISOString());
+    expect(rejected.submittedAt).toBe(course.submittedAt);
+    expect(rejected.rejectionReason).toBe(
+      'Add a thumbnail before resubmitting.',
+    );
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.status).toBe('rejected');
+    expect(stored?.reviewedBy?.toString()).toBe(admin.userId);
+    expect(stored?.rejectionReason).toBe(
+      'Add a thumbnail before resubmitting.',
+    );
+    expect(stored?.submittedAt?.toISOString()).toBe(course.submittedAt);
+  });
+
+  it('keeps review metadata out of the audience-neutral mapper', async () => {
+    const teacher = await registerApprovedTeacher('mapper@test.com');
+    const admin = await createAdmin('mapper-admin@test.com');
+    const course = await createPendingCourse(teacher);
+    expect(
+      (await reject(admin, course.id, { reason: 'Fix it' })).status,
+    ).toBe(200);
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored).not.toBeNull();
+
+    const publicDto = toPublicCourse(stored!);
+    for (const key of [
+      'submittedAt',
+      'reviewedAt',
+      'reviewedBy',
+      'rejectionReason',
+      'editLocked',
+      'editLockedAt',
+      'editLockToken',
+    ]) {
+      expect(publicDto).not.toHaveProperty(key);
+    }
+
+    const managedDto = toManagedCourse(stored!);
+    expect(managedDto.submittedAt).toBeDefined();
+    expect(managedDto.reviewedAt).toBeDefined();
+    expect(managedDto.reviewedBy).toBe(admin.userId);
+    expect(managedDto.rejectionReason).toBe('Fix it');
+    expect(managedDto).not.toHaveProperty('editLocked');
+    expect(managedDto).not.toHaveProperty('editLockedAt');
+    expect(managedDto).not.toHaveProperty('editLockToken');
+  });
+
+  it('forbids another teacher from mutating course metadata or deleting it', async () => {
+    const owner = await registerApprovedTeacher('mutate-owner@test.com');
+    const intruder = await registerApprovedTeacher('mutate-intruder@test.com');
+    const course = await createCourse(owner, 'Owner Course');
+    const withSection = await addSection(owner, course.id);
+    const sectionId = withSection.sections[0].id;
+    await addTextLesson(owner, course.id, sectionId);
+
+    const patch = await request(app)
+      .patch(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', intruder.cookies)
+      .set('X-CSRF-Token', intruder.csrf)
+      .send({ title: 'Hijacked' });
+    expect(patch.status).toBe(403);
+    expect(patch.body.error.code).toBe(COURSE_ERRORS.COURSE_FORBIDDEN);
+
+    const remove = await request(app)
+      .delete(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', intruder.cookies)
+      .set('X-CSRF-Token', intruder.csrf);
+    expect(remove.status).toBe(403);
+    expect(remove.body.error.code).toBe(COURSE_ERRORS.COURSE_FORBIDDEN);
+
+    const addNewSection = await request(app)
+      .post(`/api/teacher/courses/${course.id}/sections`)
+      .set('Cookie', intruder.cookies)
+      .set('X-CSRF-Token', intruder.csrf)
+      .send({ title: 'Hijacked section' });
+    expect(addNewSection.status).toBe(403);
+    expect(addNewSection.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_FORBIDDEN,
+    );
+
+    const addNewLesson = await request(app)
+      .post(`/api/teacher/courses/${course.id}/sections/${sectionId}/lessons`)
+      .set('Cookie', intruder.cookies)
+      .set('X-CSRF-Token', intruder.csrf)
+      .send({ type: 'text', title: 'Hijacked lesson', content: 'x' });
+    expect(addNewLesson.status).toBe(403);
+    expect(addNewLesson.body.error.code).toBe(
+      COURSE_ERRORS.COURSE_FORBIDDEN,
+    );
+
+    expect((await CourseModel.findById(course.id).exec())?.title).toBe(
+      'Owner Course',
+    );
+    expect(await SectionModel.countDocuments({ courseId: course.id })).toBe(1);
+    expect(await LessonModel.countDocuments({ courseId: course.id })).toBe(1);
+  });
+
+  it('rejects students and pending teachers from workflow mutations', async () => {
+    const pendingTeacher = await registerUser({
+      email: 'pending-mutations@test.com',
+      role: 'teacher',
+    });
+    const student = await registerUser({
+      email: 'student-mutations@test.com',
+      role: 'student',
+    });
+    const courseId = new mongoose.Types.ObjectId().toString();
+
+    for (const session of [pendingTeacher, student]) {
+      const patch = await request(app)
+        .patch(`/api/teacher/courses/${courseId}`)
+        .set('Cookie', session.cookies)
+        .set('X-CSRF-Token', session.csrf)
+        .send({ title: 'Not allowed' });
+      expect(patch.status).toBe(403);
+      expect(patch.body.error.code).toBe(AUTH_ERRORS.FORBIDDEN);
+
+      const addSectionRes = await request(app)
+        .post(`/api/teacher/courses/${courseId}/sections`)
+        .set('Cookie', session.cookies)
+        .set('X-CSRF-Token', session.csrf)
+        .send({ title: 'Not allowed' });
+      expect(addSectionRes.status).toBe(403);
+      expect(addSectionRes.body.error.code).toBe(AUTH_ERRORS.FORBIDDEN);
+
+      const submitRes = await submit(session, courseId);
+      expect(submitRes.status).toBe(403);
+      expect(submitRes.body.error.code).toBe(AUTH_ERRORS.FORBIDDEN);
+    }
   });
 });

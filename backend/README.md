@@ -83,7 +83,7 @@ for the full contract and provider configuration.
 - `GET /api/teacher/courses` — List the caller's courses (paginated)
 - `GET /api/teacher/courses/:courseId` — Get a course with its sections and lessons
 - `PATCH /api/teacher/courses/:courseId` — Update course metadata
-- `DELETE /api/teacher/courses/:courseId` — Delete a course and cascade its content
+- `DELETE /api/teacher/courses/:courseId` — Delete a draft/rejected course and cascade its content
 - `POST /api/teacher/courses/:courseId/sections` — Add a section
 - `PATCH /api/teacher/courses/:courseId/sections/:sectionId` — Edit a section
 - `DELETE /api/teacher/courses/:courseId/sections/:sectionId` — Delete a section and its lessons
@@ -106,5 +106,8 @@ an existing video by id and never duplicate the video pipeline. See
 - `POST /api/admin/courses/:courseId/reject` — Reject a pending submission with `{ "reason": "…" }`
 
 Only the course owner may submit a course; only admins may approve or reject.
-Approval is a review outcome; publishing remains a later phase.
+Approval is a review outcome; publishing remains a later phase. Content edits
+claim an exclusive per-course lease, so a write that starts just before
+submission cannot land after review. Pending/approved courses cannot be deleted
+(`409 COURSE_NOT_DELETABLE`).
 

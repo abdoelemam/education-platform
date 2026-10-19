@@ -17,6 +17,8 @@ export const COURSE_ERRORS = {
   INVALID_REORDER: 'INVALID_REORDER',
   INVALID_STATUS_TRANSITION: 'INVALID_STATUS_TRANSITION',
   COURSE_NOT_EDITABLE: 'COURSE_NOT_EDITABLE',
+  COURSE_NOT_DELETABLE: 'COURSE_NOT_DELETABLE',
+  COURSE_EDIT_IN_PROGRESS: 'COURSE_EDIT_IN_PROGRESS',
 } as const;
 
 export type CourseErrorCode = (typeof COURSE_ERRORS)[keyof typeof COURSE_ERRORS];
@@ -76,3 +78,22 @@ export const COURSE_EDITABLE_STATUSES: readonly CourseStatus[] = [
   'draft',
   'rejected',
 ];
+
+/**
+ * Only untouched drafts and rejected submissions may be deleted. A course that
+ * is under review or has been approved must be preserved: deleting it would
+ * silently withdraw a submission or remove reviewed content. Pending courses
+ * must be rejected by an admin before cleanup; an explicit withdraw flow is a
+ * future feature.
+ */
+export const COURSE_DELETABLE_STATUSES: readonly CourseStatus[] = [
+  'draft',
+  'rejected',
+];
+
+/**
+ * A content-edit lease older than this is treated as abandoned (for example,
+ * after a process crash) and may be cleared by a later request. Normal content
+ * writes finish far below this threshold.
+ */
+export const COURSE_EDIT_LOCK_TTL_MS = 5 * 60 * 1000;

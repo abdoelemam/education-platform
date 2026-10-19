@@ -347,13 +347,24 @@ draft ──owner submit──▶ pending_review ──admin approve──▶ ap
 * Content edits are allowed only in `draft` or `rejected`. A submitted or
   approved course is frozen so the reviewed version cannot change underneath
   the reviewer.
+* Every content mutation claims an exclusive per-course edit lease in MongoDB
+  before writing and releases it afterwards. Submission only transitions while
+  the lease is free, so an edit that began just before submission cannot land
+  after the review snapshot is taken. A five-minute lease is recoverable after a
+  crash, and a per-acquisition token prevents an old request from releasing a
+  newer holder's lease.
 * A rejected course is editable and resubmittable. Resubmission clears the old
   rejection reason, reviewer and review timestamp, then records a new
   `submittedAt`.
 * Status, reviewer identity, review timestamps and rejection reasons are
-  server-owned; clients cannot set them through course/lesson payloads.
-* Transitions use a compare-and-set update (`status` must still match), so
-  concurrent review decisions cannot both succeed.
+  server-owned; clients cannot set them through course/lesson payloads. Review
+  metadata is mapped only into owner/admin responses.
+* Transitions use a compare-and-set update (`status` must still match). Both
+  submission and review decisions pin the `submittedAt` value the caller loaded,
+  so a stale submit or review request cannot act on a newer review cycle.
+* A course can be deleted only in `draft` or `rejected`; pending and approved
+  courses return `COURSE_NOT_DELETABLE` rather than silently withdrawing a
+  submission or deleting reviewed content. Deletion also takes the edit lease.
 * Admins get a read-only moderation queue and detail view under
   `/api/admin/courses`; all review mutations require CSRF.
 
