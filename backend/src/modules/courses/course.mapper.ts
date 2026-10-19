@@ -22,6 +22,10 @@ export function toPublicCourse(course: CourseLike): PublicCourse {
     slug: course.slug,
     description: course.description,
     status: course.status,
+    submittedAt: course.submittedAt?.toISOString(),
+    reviewedAt: course.reviewedAt?.toISOString(),
+    reviewedBy: course.reviewedBy?.toString(),
+    rejectionReason: course.rejectionReason,
     createdAt: course.createdAt.toISOString(),
     updatedAt: course.updatedAt.toISOString(),
   };

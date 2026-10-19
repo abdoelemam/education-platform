@@ -24,18 +24,65 @@ Decisions:
 - **Ownership is the authorization boundary.** Every operation loads the course
   and requires `course.ownerId === requester.id`, except admins. A section or
   lesson id from another course is treated as missing (`404`).
-- **Server-owned fields.** `ownerId`, `slug`, `status` and `order` are never
-  accepted from the client. Unknown body fields are stripped by Zod.
+- **Server-owned fields.** `ownerId`, `slug`, `status`, `order`, `submittedAt`,
+  `reviewedAt`, `reviewedBy` and `rejectionReason` are never accepted from the
+  client. Unknown body fields are stripped by Zod.
+- **Review state machine.** The Teacher Workflow owns the only reachable
+  transitions: `draft`/`rejected` → `pending_review` (owner) and
+  `pending_review` → `approved`/`rejected` (admin). Editing is frozen while a
+  course is `pending_review` or `approved`, so an admin reviews exactly the
+  version that was submitted.
+- **Compare-and-set transitions.** Review transitions update the course only if
+  its stored status is still the expected one, so two concurrent reviewers (or
+  a reviewer and the owner) cannot both win.
+
+## Lifecycle
+
+```text
+draft ──submit (owner)──▶ pending_review ──approve (admin)──▶ approved
+                                 │
+                                 └──reject (admin + reason)──▶ rejected
+
+rejected ──edit + submit (owner)──▶ pending_review
+```
+
+| From | To | Actor | Notes |
+| --- | --- | --- | --- |
+| `draft` | `pending_review` | Course owner | Sets `submittedAt`; clears any previous review |
+| `rejected` | `pending_review` | Course owner | Same; the old rejection reason is cleared |
+| `pending_review` | `approved` | Admin | Sets `reviewedAt` / `reviewedBy`; publishing is a later phase |
+| `pending_review` | `rejected` | Admin | Sets `reviewedAt` / `reviewedBy` and the required `rejectionReason` |
+
+`approved`, `published` and `archived` are terminal for this phase. In
+particular, an `approved` course cannot be edited or resubmitted; a future
+publishing/edit-and-resubmit flow will define that path. Deleting a course is
+still an owner action and effectively withdraws any submission.
+
+### Editing rules
+
+- Editable: `draft`, `rejected`.
+- Locked (`409 COURSE_NOT_EDITABLE`): `pending_review`, `approved`, `published`,
+  `archived`.
+- A rejected course can be edited freely and then resubmitted. Resubmission
+  clears `rejectionReason`, `reviewedAt` and `reviewedBy`, and replaces
+  `submittedAt` with the new submission time.
+- Submission does not require content completeness; publication validation is a
+  later phase.
 
 ## Authentication and CSRF
 
-All routes are mounted under `/api/teacher/courses` and require:
+Teacher routes are mounted under `/api/teacher/courses` and require:
 
 - an authenticated **approved teacher** (admins bypass teacher verification);
 - a valid `X-CSRF-Token` header on state-changing requests (`POST`, `PATCH`,
   `PUT`, `DELETE`).
 
 Students and pending teachers receive `403`.
+
+Moderation routes are mounted under `/api/admin/courses` and require an
+authenticated **admin**. Non-admin users receive `403`; state-changing review
+decisions also require a valid CSRF token. Submission is owner-only: an admin
+cannot submit a teacher's course on their behalf.
 
 ## Data model
 
@@ -47,10 +94,14 @@ Students and pending teachers receive `403`.
 | `title` | Required, 1–200 chars |
 | `slug` | Server-generated, unique, stable (not regenerated on rename) |
 | `description` | Optional, up to 5000 chars |
-| `status` | Lifecycle enum; the Course Builder only creates `draft` |
+| `status` | `draft` \| `pending_review` \| `approved` \| `rejected` \| `published` \| `archived` |
+| `submittedAt` | Set on each owner submission |
+| `reviewedAt`, `reviewedBy` | Set by the admin decision for the current submission |
+| `rejectionReason` | Present only on `rejected`; cleared on resubmission |
 | `createdAt`, `updatedAt` | Timestamps |
 
-Index: `{ ownerId: 1, createdAt: -1 }`, unique `{ slug: 1 }`.
+Indexes: `{ ownerId: 1, createdAt: -1 }`, unique `{ slug: 1 }`,
+`{ status: 1, createdAt: -1 }` (moderation queue).
 
 ### Section
 
@@ -126,6 +177,7 @@ Errors:
 | `GET` | `/api/teacher/courses/:courseId` | Get a course with sections and lessons |
 | `PATCH` | `/api/teacher/courses/:courseId` | Update `title` / `description` |
 | `DELETE` | `/api/teacher/courses/:courseId` | Delete the course and cascade its content |
+| `POST` | `/api/teacher/courses/:courseId/submit` | Owner submits a draft/rejected course for review |
 
 Create body:
 
@@ -188,6 +240,41 @@ Reorder body:
 { "lessonIds": ["<id-3>", "<id-1>", "<id-2>"] }
 ```
 
+### Teacher submission
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/api/teacher/courses/:courseId/submit` | Submit a `draft` or `rejected` course for admin review |
+
+No request body is required. Client-supplied `status`, `reviewedBy`,
+`reviewedAt` or `rejectionReason` values are ignored. Returns the updated course
+with `status: "pending_review"` and a fresh `submittedAt`. All content mutations
+are then locked until the admin decides.
+
+### Admin moderation
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/admin/courses?status=&page=&limit=` | Moderation queue; defaults to `pending_review` |
+| `GET` | `/api/admin/courses/:courseId` | Full course content for review, regardless of owner |
+| `POST` | `/api/admin/courses/:courseId/approve` | Approve a `pending_review` course |
+| `POST` | `/api/admin/courses/:courseId/reject` | Reject a `pending_review` course with a reason |
+
+The queue returns metadata-only course summaries (`PublicCourse`) with the
+standard pagination `meta`. `status` accepts any lifecycle value, so admins can
+also inspect drafts, rejected, approved or archived courses.
+
+Rejection body:
+
+```json
+{ "reason": "Add a course thumbnail and a second section before resubmitting." }
+```
+
+`reason` is required, trimmed, 1–1000 characters. The trimmed reason is stored
+in `rejectionReason` and exposed to the owner (and to admins). It is cleared
+when the owner resubmits. Approving or rejecting a course that is not
+`pending_review` returns `409 INVALID_STATUS_TRANSITION`.
+
 ## Errors
 
 | Code | Status | Meaning |
@@ -201,6 +288,8 @@ Reorder body:
 | `LESSON_VIDEO_NOT_FOUND` | 404 | Referenced video does not exist |
 | `LESSON_VIDEO_FORBIDDEN` | 403 | Referenced video is owned by someone else |
 | `INVALID_REORDER` | 400 | Reorder list is not an exact permutation of current ids |
+| `INVALID_STATUS_TRANSITION` | 409 | The requested review transition is not allowed from the current status |
+| `COURSE_NOT_EDITABLE` | 409 | Content was edited while the course is under review or approved |
 | `VALIDATION_ERROR` | 422 | Request body/params/query failed Zod validation |
 
 ## Deletion semantics
@@ -213,15 +302,22 @@ Reorder body:
 
 ## Tests
 
-`backend/tests/course.test.ts` covers authentication/authorization, ownership
-isolation, slug generation, metadata updates, section/lesson CRUD, validation,
-ordering persistence, video ownership rules, type switching and cascading
-deletes (38 integration tests).
+- `backend/tests/course.test.ts` (41 integration tests) covers
+  authentication/authorization, ownership isolation, slug generation, metadata
+  updates, section/lesson CRUD, validation, ordering persistence, video
+  ownership rules, type switching and cascading deletes.
+- `backend/tests/teacher-workflow.test.ts` (19 integration tests) covers
+  submission, non-owner/admin submission attempts, admin queue/detail, approve
+  and reject transitions, rejection reason validation, non-admin moderation
+  attempts, server-owned field tampering, edit locking and rejected-course
+  editing/resubmission.
+
+The full backend suite currently has 135 passing tests.
 
 ## Known limitations / follow-ups
 
-- The frontend Course Builder UI is not implemented (the frontend app is not
-  initialized yet).
+- The frontend Course Builder and moderation UI are not implemented (the
+  frontend app is not initialized yet).
 - `quiz` lessons wait for the Quiz System (Phase 10).
 - Document lessons store an external URL; a document storage/upload provider is
   a future concern.
@@ -231,5 +327,12 @@ deletes (38 integration tests).
 - Cascade deletes are sequential rather than transactional. If a mid-delete
   database error occurs, retrying the same delete removes any remaining
   sections/lessons.
-- Course publishing, submission, categories, pricing and the remaining Course
-  Management metadata belong to later phases and are intentionally absent.
+- Publishing (`approved` → `published`), archiving, submission withdrawal and a
+  post-approval edit/re-review flow are later phases and are intentionally
+  absent. Submission also does not validate content completeness; publishing
+  requirements will.
+- The edit freeze is checked when a request starts. Concurrent in-flight edits
+  racing a submission are not prevented by a distributed lock; review
+  transitions themselves are compare-and-set and therefore safe.
+- Course publishing, categories, pricing and the remaining Course Management
+  metadata belong to later phases and are intentionally absent.

@@ -80,6 +80,14 @@ export function createCourseRouter(service: CourseService = courseService): Rout
     asyncHandler(controller.remove),
   );
 
+  // Owner submits the current draft (or a fixed rejected course) for review.
+  router.post(
+    '/:courseId/submit',
+    verifyCsrfToken,
+    validate({ params: courseIdParamSchema }),
+    asyncHandler(controller.submitForReview),
+  );
+
   // -------------------------------------------------------------------------
   // Sections
   // -------------------------------------------------------------------------

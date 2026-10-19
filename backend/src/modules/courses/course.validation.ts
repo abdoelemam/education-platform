@@ -3,6 +3,7 @@ import {
   COURSE_DESCRIPTION_MAX,
   COURSE_PAGE_DEFAULT_LIMIT,
   COURSE_PAGE_MAX_LIMIT,
+  COURSE_REJECTION_REASON_MAX,
   COURSE_TITLE_MAX,
   LESSON_DESCRIPTION_MAX,
   LESSON_DOCUMENT_URL_MAX,
@@ -11,7 +12,7 @@ import {
   SECTION_DESCRIPTION_MAX,
   SECTION_TITLE_MAX,
 } from './course.constants.js';
-import { LESSON_TYPES } from './course.types.js';
+import { COURSE_STATUSES, LESSON_TYPES } from './course.types.js';
 
 const OBJECT_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
 const objectId = (label: string) =>
@@ -98,6 +99,46 @@ export const listCoursesQuerySchema = z.object({
 });
 
 export type ListCoursesQuery = z.infer<typeof listCoursesQuerySchema>;
+
+// ---------------------------------------------------------------------------
+// Teacher Workflow / moderation
+// ---------------------------------------------------------------------------
+
+/**
+ * Admin moderation queue. Defaults to the pending submissions an admin needs
+ * to review; any lifecycle status can be requested for history views.
+ */
+export const listReviewCoursesQuerySchema = z.object({
+  status: z.enum(COURSE_STATUSES).default('pending_review'),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(COURSE_PAGE_MAX_LIMIT)
+    .default(COURSE_PAGE_DEFAULT_LIMIT),
+});
+
+export type ListReviewCoursesQuery = z.infer<
+  typeof listReviewCoursesQuerySchema
+>;
+
+/**
+ * A rejection must explain what the teacher needs to fix. The service stores
+ * the reason and the owner can read it until the course is resubmitted.
+ */
+export const rejectCourseSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(1, 'Rejection reason is required')
+    .max(
+      COURSE_REJECTION_REASON_MAX,
+      `Rejection reason cannot exceed ${COURSE_REJECTION_REASON_MAX} characters`,
+    ),
+});
+
+export type RejectCourseInput = z.infer<typeof rejectCourseSchema>;
 
 // ---------------------------------------------------------------------------
 // Route params

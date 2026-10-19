@@ -121,16 +121,17 @@ Tasks:
 * [ ] Learning outcomes
 * [ ] Requirements
 * [ ] Course preview
-* [ ] Course submission
+* [x] Course submission
 * [ ] Course publishing
-* [ ] Admin moderation
+* [x] Admin moderation
 
 Notes: the Course Builder delivered the Course model, creation/editing of course
-metadata, draft status and a server-generated unique slug. The status lifecycle
-field exists with `draft` as the only reachable value; transitions
-(submission/review/publishing) belong to the Teacher Workflow phase. The
-remaining metadata (thumbnail, category, pricing, level, language, outcomes,
-requirements) stays deferred as agreed.
+metadata, draft status and a server-generated unique slug. The Teacher Workflow
+phase added the review lifecycle (`draft`/`rejected` → `pending_review` →
+`approved`/`rejected`), owner-only submission and admin-only moderation.
+Publishing (`approved` → `published`) and the remaining metadata (thumbnail,
+category, pricing, level, language, outcomes, requirements) stay deferred as
+agreed.
 
 ---
 
@@ -169,8 +170,33 @@ Lessons (CRUD + ordering + types)    ✅
 Ownership + role authorization       ✅
 Video lesson linking                 ✅
 Validation + standard responses      ✅
-38 integration tests                 ✅
+41 integration tests                 ✅
 ```
+
+---
+
+# Teacher Workflow — Course Review & Approval
+
+Status: Backend complete (moderation UI deferred with the frontend)
+
+Tasks:
+
+* [x] Explicit review state machine
+* [x] Owner submission (`draft`/`rejected` → `pending_review`)
+* [x] Admin moderation queue and detail view
+* [x] Admin approval (`pending_review` → `approved`)
+* [x] Admin rejection with a validated reason (`pending_review` → `rejected`)
+* [x] Edit locking while submitted/approved
+* [x] Rejected-course editing and resubmission
+* [x] Server-owned review fields
+* [x] Concurrent-transition protection
+* [ ] Moderation UI
+* [ ] Course publishing (`approved` → `published`)
+
+Notes: submission is owner-only; approval/rejection is admin-only. A rejected
+course can be edited and resubmitted, which clears the previous review outcome.
+Approval is a review result, not publication. Runtime checks are covered by 19
+integration tests in `backend/tests/teacher-workflow.test.ts`.
 
 ---
 
@@ -529,7 +555,7 @@ roadmap and continue after the agreed sequence.
 Current phase:
 
 ```text
-Phase 5 — Course Builder (backend complete; frontend deferred)
+Phase 5 — Course Builder + Teacher Workflow (backends complete; frontends deferred)
 ```
 
 Completed:
@@ -540,13 +566,14 @@ Phase 1 — Backend Foundation
 Phase 2 — Authentication & Users
 Phase 6 — Video System foundational backend
 Phase 5 — Course Builder backend
+Teacher Workflow — course submission, review and approval backend
 ```
 
 Immediate next tasks:
 
 ```text
-1. Teacher Workflow: course submission → review → approval
-2. Course Builder frontend (once the frontend app is initialized)
+1. Course Builder + moderation frontend (once the frontend app is initialized)
+2. Course publishing (approved → published)
 ```
 
 The remaining Video System items (resumable uploads, upload UI, upload progress,
@@ -558,7 +585,7 @@ Next sequence:
 ```text
 Video System (foundational backend complete)
 → Course Builder (backend complete)
-→ Teacher Workflow
+→ Teacher Workflow (backend complete)
 ```
 
 Deferred until after that sequence:

@@ -151,10 +151,15 @@ Courses can move through:
 ```text
 draft
 pending_review
-published
+approved
 rejected
+published
 archived
 ```
+
+`approved` is the admin review outcome; `published` is the later state in which
+an approved course becomes publicly available. A rejected course can be edited
+and resubmitted.
 
 Typical teacher workflow:
 

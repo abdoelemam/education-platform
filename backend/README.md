@@ -92,8 +92,19 @@ for the full contract and provider configuration.
 - `PATCH /api/teacher/courses/:courseId/sections/:sectionId/lessons/:lessonId` — Edit a lesson
 - `DELETE /api/teacher/courses/:courseId/sections/:sectionId/lessons/:lessonId` — Delete a lesson
 - `PUT /api/teacher/courses/:courseId/sections/:sectionId/lessons/reorder` — Reorder lessons
+- `POST /api/teacher/courses/:courseId/submit` — Submit a draft/rejected course for review
 
 State-changing routes require the `X-CSRF-Token` header. Video lessons reference
 an existing video by id and never duplicate the video pipeline. See
 [`../docs/course-builder.md`](../docs/course-builder.md) for the full contract.
+
+### Course moderation (admins)
+
+- `GET /api/admin/courses?status=&page=&limit=` — Moderation queue (defaults to `pending_review`)
+- `GET /api/admin/courses/:courseId` — Full course content for review
+- `POST /api/admin/courses/:courseId/approve` — Approve a pending submission
+- `POST /api/admin/courses/:courseId/reject` — Reject a pending submission with `{ "reason": "…" }`
+
+Only the course owner may submit a course; only admins may approve or reject.
+Approval is a review outcome; publishing remains a later phase.
 

@@ -1,14 +1,18 @@
 import { randomBytes } from 'node:crypto';
+import { Types } from 'mongoose';
 import { AppError } from '../../errors/index.js';
+import { AUTH_ERRORS } from '../auth/auth.constants.js';
 import type { AuthUser } from '../users/user.types.js';
 import {
   videoRepository,
   type VideoRepository,
 } from '../videos/video.repository.js';
 import {
+  COURSE_EDITABLE_STATUSES,
   COURSE_ERRORS,
   COURSE_SLUG_MAX,
   COURSE_SLUG_MAX_ATTEMPTS,
+  COURSE_STATUS_TRANSITIONS,
 } from './course.constants.js';
 import {
   courseRepository,
@@ -29,6 +33,7 @@ import { toCourseDetail, toPublicCourse } from './course.mapper.js';
 import type {
   CourseDetail,
   CourseDocument,
+  CourseStatus,
   LessonDocument,
   LessonType,
   PublicCourse,
@@ -202,7 +207,10 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateCourseInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
 
     const update: CourseUpdate = {};
     const unset: string[] = [];
@@ -248,6 +256,144 @@ export class CourseService {
   }
 
   // -------------------------------------------------------------------------
+  // Teacher Workflow (submission + admin review)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Owner submits a `draft` or `rejected` course for admin review.
+   *
+   * Only the owner may submit: an admin cannot submit on a teacher's behalf,
+   * because submission is the owner's declaration that the content is ready.
+   */
+  async submitCourse(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<CourseDetail> {
+    const course = await this.requireCourseOwner(
+      params.courseId,
+      params.requester,
+    );
+    this.assertTransition(course.status, 'pending_review');
+
+    // A new submission replaces the previous review outcome.
+    const updated = await this.courseRepo.transitionStatus(
+      course._id.toString(),
+      [course.status],
+      { status: 'pending_review', submittedAt: new Date() },
+      ['reviewedAt', 'reviewedBy', 'rejectionReason'],
+    );
+
+    if (!updated) {
+      throw this.concurrentTransitionError();
+    }
+
+    return this.buildDetail(updated);
+  }
+
+  /**
+   * Admin moderation queue. Defaults to `pending_review` at the route layer;
+   * any status can be requested for history views.
+   */
+  async listCoursesForReview(params: {
+    requester: AuthUser;
+    status: CourseStatus;
+    page: number;
+    limit: number;
+  }): Promise<PaginatedCourses> {
+    this.assertAdmin(params.requester);
+
+    const skip = (params.page - 1) * params.limit;
+    const { items, total } = await this.courseRepo.listByStatus({
+      status: params.status,
+      skip,
+      limit: params.limit,
+    });
+
+    return {
+      items: items.map(toPublicCourse),
+      page: params.page,
+      limit: params.limit,
+      total,
+      totalPages: params.limit > 0 ? Math.ceil(total / params.limit) : 0,
+    };
+  }
+
+  /**
+   * Full course content for a reviewing admin, regardless of owner.
+   */
+  async getCourseForReview(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<CourseDetail> {
+    this.assertAdmin(params.requester);
+    const course = await this.requireCourse(params.courseId);
+    return this.buildDetail(course);
+  }
+
+  /**
+   * Admin approves a `pending_review` submission. Approval is a review
+   * outcome, not publication: `approved` → `published` belongs to a later
+   * phase.
+   */
+  async approveCourse(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<CourseDetail> {
+    this.assertAdmin(params.requester);
+    const course = await this.requireCourse(params.courseId);
+    this.assertTransition(course.status, 'approved');
+
+    const updated = await this.courseRepo.transitionStatus(
+      course._id.toString(),
+      [course.status],
+      {
+        status: 'approved',
+        reviewedAt: new Date(),
+        reviewedBy: new Types.ObjectId(params.requester.id),
+      },
+      ['rejectionReason'],
+    );
+
+    if (!updated) {
+      throw this.concurrentTransitionError();
+    }
+
+    return this.buildDetail(updated);
+  }
+
+  /**
+   * Admin rejects a `pending_review` submission. The reason is required and is
+   * returned to the owner; it is cleared when the owner resubmits.
+   */
+  async rejectCourse(params: {
+    courseId: string;
+    requester: AuthUser;
+    reason: string;
+  }): Promise<CourseDetail> {
+    this.assertAdmin(params.requester);
+    const course = await this.requireCourse(params.courseId);
+    this.assertTransition(course.status, 'rejected');
+
+    const updated = await this.courseRepo.transitionStatus(
+      course._id.toString(),
+      [course.status],
+      {
+        status: 'rejected',
+        reviewedAt: new Date(),
+        reviewedBy: new Types.ObjectId(params.requester.id),
+        rejectionReason: params.reason,
+      },
+      [],
+    );
+
+    if (!updated) {
+      throw this.concurrentTransitionError();
+    }
+
+    return this.buildDetail(updated);
+  }
+
+  // -------------------------------------------------------------------------
   // Sections
   // -------------------------------------------------------------------------
 
@@ -256,7 +402,10 @@ export class CourseService {
     requester: AuthUser;
     input: CreateSectionInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const courseId = course._id.toString();
 
     const order = (await this.sectionRepo.maxOrder(courseId)) + 1;
@@ -277,7 +426,10 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateSectionInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const section = await this.requireSection(
       course._id.toString(),
       params.sectionId,
@@ -308,7 +460,10 @@ export class CourseService {
     sectionId: string;
     requester: AuthUser;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const section = await this.requireSection(
       course._id.toString(),
       params.sectionId,
@@ -326,7 +481,10 @@ export class CourseService {
     requester: AuthUser;
     sectionIds: string[];
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const courseId = course._id.toString();
 
     const sections = await this.sectionRepo.listByCourse(courseId);
@@ -353,7 +511,10 @@ export class CourseService {
     requester: AuthUser;
     input: CreateLessonInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const section = await this.requireSection(
       course._id.toString(),
       params.sectionId,
@@ -382,7 +543,10 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateLessonInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const section = await this.requireSection(
       course._id.toString(),
       params.sectionId,
@@ -489,7 +653,10 @@ export class CourseService {
     lessonId: string;
     requester: AuthUser;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const section = await this.requireSection(
       course._id.toString(),
       params.sectionId,
@@ -511,7 +678,10 @@ export class CourseService {
     requester: AuthUser;
     lessonIds: string[];
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    const course = await this.requireEditableCourse(
+      params.courseId,
+      params.requester,
+    );
     const section = await this.requireSection(
       course._id.toString(),
       params.sectionId,
@@ -545,15 +715,21 @@ export class CourseService {
     return toCourseDetail(course, sections, lessons);
   }
 
-  private async requireOwnedCourse(
-    courseId: string,
-    requester: AuthUser,
-  ): Promise<CourseDocument> {
+  private async requireCourse(courseId: string): Promise<CourseDocument> {
     const course = await this.courseRepo.findById(courseId);
 
     if (!course) {
       throw new AppError(404, COURSE_ERRORS.COURSE_NOT_FOUND, 'Course not found');
     }
+
+    return course;
+  }
+
+  private async requireOwnedCourse(
+    courseId: string,
+    requester: AuthUser,
+  ): Promise<CourseDocument> {
+    const course = await this.requireCourse(courseId);
 
     if (requester.role !== 'admin' && course.ownerId.toString() !== requester.id) {
       throw new AppError(
@@ -564,6 +740,74 @@ export class CourseService {
     }
 
     return course;
+  }
+
+  /**
+   * Content mutations are only allowed while the course is a draft or was
+   * rejected. Once submitted, the admin reviews a frozen version.
+   */
+  private async requireEditableCourse(
+    courseId: string,
+    requester: AuthUser,
+  ): Promise<CourseDocument> {
+    const course = await this.requireOwnedCourse(courseId, requester);
+    this.assertEditable(course);
+    return course;
+  }
+
+  /**
+   * Submission is strictly an owner action; the admin ownership bypass does
+   * not apply here.
+   */
+  private async requireCourseOwner(
+    courseId: string,
+    requester: AuthUser,
+  ): Promise<CourseDocument> {
+    const course = await this.requireCourse(courseId);
+
+    if (course.ownerId.toString() !== requester.id) {
+      throw new AppError(
+        403,
+        COURSE_ERRORS.COURSE_FORBIDDEN,
+        'Only the course owner can submit it for review',
+      );
+    }
+
+    return course;
+  }
+
+  private assertAdmin(requester: AuthUser): void {
+    if (requester.role !== 'admin') {
+      throw new AppError(403, AUTH_ERRORS.FORBIDDEN, 'Admin access required');
+    }
+  }
+
+  private assertTransition(from: CourseStatus, to: CourseStatus): void {
+    if (!COURSE_STATUS_TRANSITIONS[from].includes(to)) {
+      throw new AppError(
+        409,
+        COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+        `A course in "${from}" status cannot be transitioned to "${to}"`,
+      );
+    }
+  }
+
+  private assertEditable(course: CourseDocument): void {
+    if (!COURSE_EDITABLE_STATUSES.includes(course.status)) {
+      throw new AppError(
+        409,
+        COURSE_ERRORS.COURSE_NOT_EDITABLE,
+        `A course in "${course.status}" status cannot be edited`,
+      );
+    }
+  }
+
+  private concurrentTransitionError(): AppError {
+    return new AppError(
+      409,
+      COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+      'The course status changed while processing this request; reload and retry',
+    );
   }
 
   private async requireSection(

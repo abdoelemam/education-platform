@@ -329,6 +329,34 @@ Reordering must be persisted through dedicated APIs.
 * Deleting a course cascades to its sections and lessons. Videos are
   independent assets and are never deleted by the course module.
 
+## Teacher Workflow Notes (Phase 5 follow-up)
+
+The review lifecycle is an explicit service-owned state machine:
+
+```text
+draft ──owner submit──▶ pending_review ──admin approve──▶ approved
+  ▲                            │
+  │                            └──admin reject (reason)──▶ rejected
+  └──────── owner edits ◀────────────────────────────────────┘
+```
+
+* Submission is owner-only; admins cannot submit on a teacher's behalf.
+* Approval/rejection is admin-only and only valid from `pending_review`.
+* `approved` means "review approved", not published. Publishing
+  (`approved` → `published`) and archiving are later phases.
+* Content edits are allowed only in `draft` or `rejected`. A submitted or
+  approved course is frozen so the reviewed version cannot change underneath
+  the reviewer.
+* A rejected course is editable and resubmittable. Resubmission clears the old
+  rejection reason, reviewer and review timestamp, then records a new
+  `submittedAt`.
+* Status, reviewer identity, review timestamps and rejection reasons are
+  server-owned; clients cannot set them through course/lesson payloads.
+* Transitions use a compare-and-set update (`status` must still match), so
+  concurrent review decisions cannot both succeed.
+* Admins get a read-only moderation queue and detail view under
+  `/api/admin/courses`; all review mutations require CSRF.
+
 The full HTTP contract is documented in [`docs/course-builder.md`](docs/course-builder.md).
 
 ---

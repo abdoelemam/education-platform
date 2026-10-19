@@ -1,4 +1,8 @@
 export { courseRoutes, createCourseRouter } from './course.routes.js';
+export {
+  adminCourseRoutes,
+  createAdminCourseRouter,
+} from './admin-course.routes.js';
 export { courseController, CourseController } from './course.controller.js';
 export { courseService, CourseService } from './course.service.js';
 export {

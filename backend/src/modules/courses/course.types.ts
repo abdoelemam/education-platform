@@ -1,15 +1,19 @@
 import type { Document, Types } from 'mongoose';
 
 /**
- * Course lifecycle. The Course Builder only ever creates `draft` courses;
- * transitions are owned by the Teacher Workflow / moderation phases and are
- * deliberately not implemented here.
+ * Course lifecycle.
+ *
+ * The Course Builder creates `draft` courses. The Teacher Workflow owns the
+ * review transitions (`draft`/`rejected` → `pending_review` → `approved` or
+ * `rejected`). Publishing (`approved` → `published`) and archiving are later
+ * phases and are not reachable yet.
  */
 export const COURSE_STATUSES = [
   'draft',
   'pending_review',
-  'published',
+  'approved',
   'rejected',
+  'published',
   'archived',
 ] as const;
 export type CourseStatus = (typeof COURSE_STATUSES)[number];
@@ -33,6 +37,13 @@ export interface ICourse {
   slug: string;
   description?: string;
   status: CourseStatus;
+  /** Set whenever the owner submits the current version for review. */
+  submittedAt?: Date;
+  /** Set by the admin decision that reviewed the current submission. */
+  reviewedAt?: Date;
+  reviewedBy?: Types.ObjectId;
+  /** Present only while the course is rejected; cleared on resubmission. */
+  rejectionReason?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -131,6 +142,14 @@ export interface PublicCourse {
   slug: string;
   description?: string;
   status: CourseStatus;
+  /** ISO timestamp of the current review submission, when one exists. */
+  submittedAt?: string;
+  /** ISO timestamp of the admin review decision, when one exists. */
+  reviewedAt?: string;
+  /** Admin user id that made the current review decision. */
+  reviewedBy?: string;
+  /** Reason supplied by the admin for the current rejection. */
+  rejectionReason?: string;
   createdAt: string;
   updatedAt: string;
 }
