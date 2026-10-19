@@ -83,7 +83,7 @@ for the full contract and provider configuration.
 - `GET /api/teacher/courses` — List the caller's courses (paginated)
 - `GET /api/teacher/courses/:courseId` — Get a course with its sections and lessons
 - `PATCH /api/teacher/courses/:courseId` — Update course metadata
-- `DELETE /api/teacher/courses/:courseId` — Delete a course and cascade its content
+- `DELETE /api/teacher/courses/:courseId` — Delete a draft/rejected course and cascade its content
 - `POST /api/teacher/courses/:courseId/sections` — Add a section
 - `PATCH /api/teacher/courses/:courseId/sections/:sectionId` — Edit a section
 - `DELETE /api/teacher/courses/:courseId/sections/:sectionId` — Delete a section and its lessons
@@ -92,8 +92,25 @@ for the full contract and provider configuration.
 - `PATCH /api/teacher/courses/:courseId/sections/:sectionId/lessons/:lessonId` — Edit a lesson
 - `DELETE /api/teacher/courses/:courseId/sections/:sectionId/lessons/:lessonId` — Delete a lesson
 - `PUT /api/teacher/courses/:courseId/sections/:sectionId/lessons/reorder` — Reorder lessons
+- `POST /api/teacher/courses/:courseId/submit` — Submit a draft/rejected course for review
 
 State-changing routes require the `X-CSRF-Token` header. Video lessons reference
 an existing video by id and never duplicate the video pipeline. See
 [`../docs/course-builder.md`](../docs/course-builder.md) for the full contract.
+
+### Course moderation (admins)
+
+- `GET /api/admin/courses?status=&page=&limit=` — Moderation queue (defaults to `pending_review`)
+- `GET /api/admin/courses/:courseId` — Full course content for review
+- `POST /api/admin/courses/:courseId/approve` — Approve a pending submission
+- `POST /api/admin/courses/:courseId/reject` — Reject a pending submission with `{ "reason": "…" }`
+
+Only the course owner may submit a course; only admins may approve or reject.
+Approval is a review outcome; publishing remains a later phase. Content edits
+claim an exclusive per-course lease, and every course/section/lesson write
+carries a token plus a MongoDB-server-time expiry fence. A stalled request whose
+lease expired or was replaced gets `409 COURSE_EDIT_IN_PROGRESS` instead of
+committing; creates are staged until a fenced authorization/commit succeeds,
+and stale recovery discards rows staged or created during the takeover.
+Pending/approved courses cannot be deleted (`409 COURSE_NOT_DELETABLE`).
 

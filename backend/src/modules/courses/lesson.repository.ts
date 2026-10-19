@@ -1,4 +1,9 @@
 import { Types } from 'mongoose';
+import {
+  activeEditFenceFilter,
+  COMMITTED_CONTENT_FILTER,
+  type CourseEditFence,
+} from './course.fence.js';
 import { LessonModel } from './lesson.model.js';
 import type { LessonDocument, LessonType } from './course.types.js';
 
@@ -35,7 +40,14 @@ export interface OrderEntry {
 }
 
 export class LessonRepository {
-  async create(data: CreateLessonData): Promise<LessonDocument> {
+  /**
+   * Insert a hidden staged lesson. It becomes visible only after
+   * `commitCreated` succeeds under the same live lease.
+   */
+  async create(
+    data: CreateLessonData,
+    fence: CourseEditFence,
+  ): Promise<LessonDocument> {
     const lesson = new LessonModel({
       courseId: new Types.ObjectId(data.courseId),
       sectionId: new Types.ObjectId(data.sectionId),
@@ -47,13 +59,34 @@ export class LessonRepository {
       content: data.content,
       documentUrl: data.documentUrl,
       documentName: data.documentName,
+      editToken: fence.token,
+      editLeaseExpiresAt: fence.expiresAt,
+      committed: false,
     });
 
     return lesson.save();
   }
 
+  async commitCreated(
+    id: string,
+    fence: CourseEditFence,
+  ): Promise<LessonDocument | null> {
+    return LessonModel.findOneAndUpdate(
+      {
+        _id: id,
+        committed: false,
+        ...activeEditFenceFilter(fence),
+      },
+      { $set: { committed: true } },
+      { new: true },
+    ).exec();
+  }
+
   async findById(id: string): Promise<LessonDocument | null> {
-    return LessonModel.findById(id).exec();
+    return LessonModel.findOne({
+      _id: id,
+      ...COMMITTED_CONTENT_FILTER,
+    }).exec();
   }
 
   /**
@@ -65,21 +98,37 @@ export class LessonRepository {
     sectionId: string,
     lessonId: string,
   ): Promise<LessonDocument | null> {
-    return LessonModel.findOne({ _id: lessonId, sectionId, courseId }).exec();
+    return LessonModel.findOne({
+      _id: lessonId,
+      sectionId,
+      courseId,
+      ...COMMITTED_CONTENT_FILTER,
+    }).exec();
   }
 
   async listByCourse(courseId: string): Promise<LessonDocument[]> {
-    return LessonModel.find({ courseId }).sort({ order: 1, createdAt: 1 }).exec();
+    return LessonModel.find({
+      courseId,
+      ...COMMITTED_CONTENT_FILTER,
+    })
+      .sort({ order: 1, createdAt: 1 })
+      .exec();
   }
 
   async listBySection(sectionId: string): Promise<LessonDocument[]> {
-    return LessonModel.find({ sectionId })
+    return LessonModel.find({
+      sectionId,
+      ...COMMITTED_CONTENT_FILTER,
+    })
       .sort({ order: 1, createdAt: 1 })
       .exec();
   }
 
   async maxOrder(sectionId: string): Promise<number> {
-    const last = await LessonModel.findOne({ sectionId })
+    const last = await LessonModel.findOne({
+      sectionId,
+      ...COMMITTED_CONTENT_FILTER,
+    })
       .sort({ order: -1 })
       .select('order')
       .exec();
@@ -90,7 +139,8 @@ export class LessonRepository {
   async updateById(
     id: string,
     update: LessonUpdate,
-    unset: string[] = [],
+    unset: string[],
+    fence: CourseEditFence,
   ): Promise<LessonDocument | null> {
     const set: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(update)) {
@@ -107,13 +157,31 @@ export class LessonRepository {
       updateDoc.$unset = Object.fromEntries(unset.map((key) => [key, 1]));
     }
 
-    return LessonModel.findByIdAndUpdate(id, updateDoc, { new: true }).exec();
+    return LessonModel.findOneAndUpdate(
+      {
+        _id: id,
+        ...COMMITTED_CONTENT_FILTER,
+        ...activeEditFenceFilter(fence),
+      },
+      updateDoc,
+      { new: true },
+    ).exec();
   }
 
-  async deleteById(id: string): Promise<void> {
-    await LessonModel.findByIdAndDelete(id).exec();
+  async deleteById(id: string, fence: CourseEditFence): Promise<boolean> {
+    const deleted = await LessonModel.findOneAndDelete({
+      _id: id,
+      ...COMMITTED_CONTENT_FILTER,
+      ...activeEditFenceFilter(fence),
+    }).exec();
+
+    return deleted !== null;
   }
 
+  /**
+   * Unfenced cascade cleanup, used only after the parent course/section delete
+   * has already been authorized under a live lease.
+   */
   async deleteBySection(sectionId: string): Promise<void> {
     await LessonModel.deleteMany({ sectionId }).exec();
   }
@@ -122,22 +190,101 @@ export class LessonRepository {
     await LessonModel.deleteMany({ courseId }).exec();
   }
 
+  async deleteStagedByCourse(courseId: string): Promise<void> {
+    await LessonModel.deleteMany({
+      courseId,
+      committed: false,
+    }).exec();
+  }
+
+  /** All lesson ids, including staged rows. Used to fence a stale takeover. */
+  async listIdsByCourse(courseId: string): Promise<string[]> {
+    const lessons = await LessonModel.find({ courseId }).select('_id').exec();
+    return lessons.map((lesson) => lesson._id.toString());
+  }
+
+  async listStagedIdsByCourse(courseId: string): Promise<string[]> {
+    const lessons = await LessonModel.find({
+      courseId,
+      committed: false,
+    })
+      .select('_id')
+      .exec();
+    return lessons.map((lesson) => lesson._id.toString());
+  }
+
   /**
-   * Persist explicit ordering. Only the `order` field is touched.
+   * Remove rows that appeared during a stale takeover. `keepIds` is the set of
+   * rows that existed at the takeover snapshot; `stagedIds` is the set that was
+   * staged at that snapshot, even if an old holder flipped it to committed
+   * before cleanup ran. Everything else in the course is abandoned.
    */
-  async updateOrders(sectionId: string, entries: OrderEntry[]): Promise<void> {
+  async removeStaleForTakeover(
+    courseId: string,
+    keepIds: string[],
+    stagedIds: string[],
+  ): Promise<void> {
+    await LessonModel.deleteMany({
+      courseId,
+      $or: [
+        {
+          _id: {
+            $nin: keepIds.map((id) => new Types.ObjectId(id)),
+          },
+        },
+        {
+          _id: {
+            $in: stagedIds.map((id) => new Types.ObjectId(id)),
+          },
+        },
+        { committed: false },
+      ],
+    }).exec();
+  }
+
+  /**
+   * Move every lesson's fence to a newly acquired lease. A stale holder's
+   * token/expiry can no longer match any document.
+   */
+  async refreshLease(
+    courseId: string,
+    token: string,
+    expiresAt: Date,
+  ): Promise<void> {
+    await LessonModel.updateMany(
+      { courseId },
+      { $set: { editToken: token, editLeaseExpiresAt: expiresAt } },
+    ).exec();
+  }
+
+  /**
+   * Persist explicit ordering. Every document update carries the fence; if any
+   * entry no longer matches, the caller reports a stale-lease conflict.
+   */
+  async updateOrders(
+    sectionId: string,
+    entries: OrderEntry[],
+    fence: CourseEditFence,
+  ): Promise<boolean> {
     if (entries.length === 0) {
-      return;
+      return true;
     }
 
-    await LessonModel.bulkWrite(
+    const result = await LessonModel.bulkWrite(
       entries.map((entry) => ({
         updateOne: {
-          filter: { _id: new Types.ObjectId(entry.id), sectionId },
+          filter: {
+            _id: new Types.ObjectId(entry.id),
+            sectionId,
+            ...COMMITTED_CONTENT_FILTER,
+            ...activeEditFenceFilter(fence),
+          },
           update: { $set: { order: entry.order } },
         },
       })),
     );
+
+    return result.matchedCount === entries.length;
   }
 }
 

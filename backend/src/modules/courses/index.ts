@@ -1,4 +1,8 @@
 export { courseRoutes, createCourseRouter } from './course.routes.js';
+export {
+  adminCourseRoutes,
+  createAdminCourseRouter,
+} from './admin-course.routes.js';
 export { courseController, CourseController } from './course.controller.js';
 export { courseService, CourseService } from './course.service.js';
 export {
@@ -18,6 +22,7 @@ export { SectionModel } from './section.model.js';
 export { LessonModel } from './lesson.model.js';
 export {
   toPublicCourse,
+  toManagedCourse,
   toPublicSection,
   toPublicLesson,
   toCourseDetail,

@@ -1,3 +1,5 @@
+import type { CourseStatus } from './course.types.js';
+
 /**
  * Stable error codes for the Course Builder module.
  * Mirrors the AUTH_ERRORS / VIDEO_ERRORS convention so clients can branch on
@@ -13,6 +15,10 @@ export const COURSE_ERRORS = {
   LESSON_VIDEO_NOT_FOUND: 'LESSON_VIDEO_NOT_FOUND',
   LESSON_VIDEO_FORBIDDEN: 'LESSON_VIDEO_FORBIDDEN',
   INVALID_REORDER: 'INVALID_REORDER',
+  INVALID_STATUS_TRANSITION: 'INVALID_STATUS_TRANSITION',
+  COURSE_NOT_EDITABLE: 'COURSE_NOT_EDITABLE',
+  COURSE_NOT_DELETABLE: 'COURSE_NOT_DELETABLE',
+  COURSE_EDIT_IN_PROGRESS: 'COURSE_EDIT_IN_PROGRESS',
 } as const;
 
 export type CourseErrorCode = (typeof COURSE_ERRORS)[keyof typeof COURSE_ERRORS];
@@ -37,3 +43,57 @@ export const LESSON_DOCUMENT_URL_MAX = 2048;
  * Protects against pathological title collisions without looping forever.
  */
 export const COURSE_SLUG_MAX_ATTEMPTS = 20;
+
+export const COURSE_REJECTION_REASON_MAX = 1000;
+
+/**
+ * Explicit review state machine. Only these transitions are reachable in the
+ * Teacher Workflow phase:
+ *
+ * - `draft`     → `pending_review` (owner submission)
+ * - `rejected`  → `pending_review` (owner fixes and resubmits)
+ * - `pending_review` → `approved` / `rejected` (admin review)
+ *
+ * Publishing (`approved` → `published`) and archiving are later phases and are
+ * intentionally absent until publishing requirements exist.
+ */
+export const COURSE_STATUS_TRANSITIONS: Record<
+  CourseStatus,
+  readonly CourseStatus[]
+> = {
+  draft: ['pending_review'],
+  pending_review: ['approved', 'rejected'],
+  approved: [],
+  rejected: ['pending_review'],
+  published: [],
+  archived: [],
+};
+
+/**
+ * Statuses in which the owner may change content. Editing is frozen once a
+ * course is submitted so an admin reviews exactly the version that was sent;
+ * a rejected course becomes editable again for the next submission.
+ */
+export const COURSE_EDITABLE_STATUSES: readonly CourseStatus[] = [
+  'draft',
+  'rejected',
+];
+
+/**
+ * Only untouched drafts and rejected submissions may be deleted. A course that
+ * is under review or has been approved must be preserved: deleting it would
+ * silently withdraw a submission or remove reviewed content. Pending courses
+ * must be rejected by an admin before cleanup; an explicit withdraw flow is a
+ * future feature.
+ */
+export const COURSE_DELETABLE_STATUSES: readonly CourseStatus[] = [
+  'draft',
+  'rejected',
+];
+
+/**
+ * A content-edit lease older than this is treated as abandoned (for example,
+ * after a process crash) and may be cleared by a later request. Normal content
+ * writes finish far below this threshold.
+ */
+export const COURSE_EDIT_LOCK_TTL_MS = 5 * 60 * 1000;

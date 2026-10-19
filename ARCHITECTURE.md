@@ -329,6 +329,55 @@ Reordering must be persisted through dedicated APIs.
 * Deleting a course cascades to its sections and lessons. Videos are
   independent assets and are never deleted by the course module.
 
+## Teacher Workflow Notes (Phase 5 follow-up)
+
+The review lifecycle is an explicit service-owned state machine:
+
+```text
+draft ──owner submit──▶ pending_review ──admin approve──▶ approved
+  ▲                            │
+  │                            └──admin reject (reason)──▶ rejected
+  └──────── owner edits ◀────────────────────────────────────┘
+```
+
+* Submission is owner-only; admins cannot submit on a teacher's behalf.
+* Approval/rejection is admin-only and only valid from `pending_review`.
+* `approved` means "review approved", not published. Publishing
+  (`approved` → `published`) and archiving are later phases.
+* Content edits are allowed only in `draft` or `rejected`. A submitted or
+  approved course is frozen so the reviewed version cannot change underneath
+  the reviewer.
+* Every content mutation claims an exclusive per-course edit lease in MongoDB
+  before writing and releases it afterwards. Acquisition stamps the token and
+  database-time expiry onto every existing section/lesson. Every course,
+  section and lesson write filter then requires the matching token and an
+  unexpired lease (`$$NOW`), so a request that resumes after expiry/recovery
+  cannot commit. Creates are staged as hidden rows and activated only after a
+  fenced course-authorization write and a fenced commit; stale recovery
+  snapshots existing rows and removes anything staged or created during the
+  takeover. Submission only transitions while the lease is free, so an edit
+  that began just before submission cannot land after the review snapshot is
+  taken. A five-minute lease is recoverable after a crash, and a
+  per-acquisition token prevents an old request from releasing a newer holder's
+  lease.
+* A rejected course is editable and resubmittable. Resubmission clears the old
+  rejection reason, reviewer and review timestamp, then records a new
+  `submittedAt`.
+* Status, reviewer identity, review timestamps and rejection reasons are
+  server-owned; clients cannot set them through course/lesson payloads. Review
+  metadata is mapped only into owner/admin responses.
+* Transitions use a compare-and-set update (`status` must still match). Both
+  submission and review decisions pin the `submittedAt` value the caller loaded,
+  so a stale submit or review request cannot act on a newer review cycle.
+* A course can be deleted only in `draft` or `rejected`; pending and approved
+  courses return `COURSE_NOT_DELETABLE` rather than silently withdrawing a
+  submission or deleting reviewed content. Deletion also takes the edit lease.
+  The parent is deleted under the fence before content cleanup, so a cleanup
+  failure can leave unreachable orphan sections/lessons but never visible
+  partial course content. Transactions or resumable cleanup remain follow-ups.
+* Admins get a read-only moderation queue and detail view under
+  `/api/admin/courses`; all review mutations require CSRF.
+
 The full HTTP contract is documented in [`docs/course-builder.md`](docs/course-builder.md).
 
 ---

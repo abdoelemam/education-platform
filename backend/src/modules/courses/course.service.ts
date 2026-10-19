@@ -1,15 +1,23 @@
 import { randomBytes } from 'node:crypto';
+import { Types } from 'mongoose';
 import { AppError } from '../../errors/index.js';
+import { AUTH_ERRORS } from '../auth/auth.constants.js';
 import type { AuthUser } from '../users/user.types.js';
 import {
   videoRepository,
   type VideoRepository,
 } from '../videos/video.repository.js';
 import {
+  COURSE_DELETABLE_STATUSES,
+  COURSE_EDITABLE_STATUSES,
+  COURSE_EDIT_LOCK_TTL_MS,
   COURSE_ERRORS,
   COURSE_SLUG_MAX,
   COURSE_SLUG_MAX_ATTEMPTS,
+  COURSE_STATUS_TRANSITIONS,
+  type CourseErrorCode,
 } from './course.constants.js';
+import type { CourseEditFence } from './course.fence.js';
 import {
   courseRepository,
   type CourseRepository,
@@ -25,13 +33,14 @@ import {
   type LessonRepository,
   type LessonUpdate,
 } from './lesson.repository.js';
-import { toCourseDetail, toPublicCourse } from './course.mapper.js';
+import { toCourseDetail, toManagedCourse } from './course.mapper.js';
 import type {
   CourseDetail,
   CourseDocument,
+  CourseStatus,
   LessonDocument,
   LessonType,
-  PublicCourse,
+  ManagedCourse,
   SectionDocument,
 } from './course.types.js';
 import type {
@@ -46,7 +55,11 @@ import type {
 const SLUG_BASE_MAX = COURSE_SLUG_MAX - 20;
 
 export interface PaginatedCourses {
-  items: PublicCourse[];
+  /**
+   * Owner/admin course-management items. A future public catalog must use the
+   * review-free `PublicCourse` mapper instead.
+   */
+  items: ManagedCourse[];
   page: number;
   limit: number;
   total: number;
@@ -58,6 +71,18 @@ interface LessonPayload {
   content?: string;
   documentUrl?: string;
   documentName?: string;
+}
+
+/**
+ * IDs of content rows that existed when a stale takeover began. Rows outside
+ * `...Ids` appeared during recovery, and rows in `staged...Ids` had not been
+ * committed yet; both are discarded before the new lease starts.
+ */
+interface ContentSnapshot {
+  sectionIds: string[];
+  stagedSectionIds: string[];
+  lessonIds: string[];
+  stagedLessonIds: string[];
 }
 
 /**
@@ -181,7 +206,7 @@ export class CourseService {
     });
 
     return {
-      items: items.map(toPublicCourse),
+      items: items.map(toManagedCourse),
       page: params.page,
       limit: params.limit,
       total,
@@ -202,49 +227,218 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateCourseInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const update: CourseUpdate = {};
+        const unset: string[] = [];
 
-    const update: CourseUpdate = {};
-    const unset: string[] = [];
+        if (params.input.title !== undefined) {
+          update.title = params.input.title;
+          // The slug is a stable identifier and is intentionally not regenerated.
+        }
 
-    if (params.input.title !== undefined) {
-      update.title = params.input.title;
-      // The slug is a stable identifier and is intentionally not regenerated.
-    }
+        if (params.input.description !== undefined) {
+          if (params.input.description === '') {
+            unset.push('description');
+          } else {
+            update.description = params.input.description;
+          }
+        }
 
-    if (params.input.description !== undefined) {
-      if (params.input.description === '') {
-        unset.push('description');
-      } else {
-        update.description = params.input.description;
-      }
-    }
+        const updated = await this.courseRepo.updateById(
+          course._id.toString(),
+          update,
+          unset,
+          fence,
+        );
 
-    const updated = await this.courseRepo.updateById(
+        if (!updated) {
+          // The course was deleted or the lease expired/was replaced between
+          // request start and this write.
+          throw this.editInProgressError();
+        }
+
+        return this.buildDetail(updated);
+      },
+    );
+  }
+
+  /**
+   * Delete a draft or rejected course and cascade to its content.
+   *
+   * Courses under review or already approved are intentionally not deletable:
+   * deletion would silently withdraw a submission or remove reviewed content.
+   * An admin must reject a pending course before the owner can clean it up; an
+   * explicit withdrawal flow is a future feature.
+   */
+  async deleteCourse(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<void> {
+    await this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_DELETABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_DELETABLE,
+      'deleted',
+      async (course, fence) => {
+        const courseId = course._id.toString();
+
+        // The fenced course delete is the authorization commit. Only after it
+        // succeeds do we clean up the now-unreachable content, even if the
+        // lease expires while the cascade is still running.
+        const deleted = await this.courseRepo.deleteById(courseId, fence);
+        if (!deleted) {
+          throw this.editInProgressError();
+        }
+
+        // Cascade to content. Videos are independent assets that may be reused
+        // by other lessons, so they are never deleted here. This cleanup is
+        // intentionally parent-first and not transactional: if it fails after
+        // the course is gone, the remaining rows are unreachable orphans rather
+        // than visible partial content. See docs/course-builder.md.
+        await this.lessonRepo.deleteByCourse(courseId);
+        await this.sectionRepo.deleteByCourse(courseId);
+      },
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Teacher Workflow (submission + admin review)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Owner submits a `draft` or `rejected` course for admin review.
+   *
+   * Only the owner may submit: an admin cannot submit on a teacher's behalf,
+   * because submission is the owner's declaration that the content is ready.
+   */
+  async submitCourse(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<CourseDetail> {
+    const course = await this.requireCourseOwner(
+      params.courseId,
+      params.requester,
+    );
+    this.assertTransition(course.status, 'pending_review');
+
+    // A new submission replaces the previous review outcome. The transition is
+    // conditional on the edit lease being free: if a content write claimed the
+    // lease just before this request, submission fails rather than freezing a
+    // version that is still being written.
+    const updated = await this.transitionToPendingReview(course);
+    return this.buildDetail(updated);
+  }
+
+  /**
+   * Admin moderation queue. Defaults to `pending_review` at the route layer;
+   * any status can be requested for history views.
+   */
+  async listCoursesForReview(params: {
+    requester: AuthUser;
+    status: CourseStatus;
+    page: number;
+    limit: number;
+  }): Promise<PaginatedCourses> {
+    this.assertAdmin(params.requester);
+
+    const skip = (params.page - 1) * params.limit;
+    const { items, total } = await this.courseRepo.listByStatus({
+      status: params.status,
+      skip,
+      limit: params.limit,
+    });
+
+    return {
+      items: items.map(toManagedCourse),
+      page: params.page,
+      limit: params.limit,
+      total,
+      totalPages: params.limit > 0 ? Math.ceil(total / params.limit) : 0,
+    };
+  }
+
+  /**
+   * Full course content for a reviewing admin, regardless of owner.
+   */
+  async getCourseForReview(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<CourseDetail> {
+    this.assertAdmin(params.requester);
+    const course = await this.requireCourse(params.courseId);
+    return this.buildDetail(course);
+  }
+
+  /**
+   * Admin approves a `pending_review` submission. Approval is a review
+   * outcome, not publication: `approved` → `published` belongs to a later
+   * phase.
+   */
+  async approveCourse(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<CourseDetail> {
+    this.assertAdmin(params.requester);
+    const course = await this.requireCourse(params.courseId);
+    this.assertTransition(course.status, 'approved');
+
+    const updated = await this.courseRepo.transitionStatus(
       course._id.toString(),
-      update,
-      unset,
+      [course.status],
+      {
+        status: 'approved',
+        reviewedAt: new Date(),
+        reviewedBy: new Types.ObjectId(params.requester.id),
+      },
+      ['rejectionReason'],
+      this.submissionGuard(course),
     );
 
     if (!updated) {
-      throw new AppError(404, COURSE_ERRORS.COURSE_NOT_FOUND, 'Course not found');
+      throw this.concurrentTransitionError();
     }
 
     return this.buildDetail(updated);
   }
 
-  async deleteCourse(params: {
+  /**
+   * Admin rejects a `pending_review` submission. The reason is required and is
+   * returned to the owner; it is cleared when the owner resubmits.
+   */
+  async rejectCourse(params: {
     courseId: string;
     requester: AuthUser;
-  }): Promise<void> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const courseId = course._id.toString();
+    reason: string;
+  }): Promise<CourseDetail> {
+    this.assertAdmin(params.requester);
+    const course = await this.requireCourse(params.courseId);
+    this.assertTransition(course.status, 'rejected');
 
-    // Cascade to content. Videos are independent assets that may be reused by
-    // other lessons, so they are never deleted here.
-    await this.lessonRepo.deleteByCourse(courseId);
-    await this.sectionRepo.deleteByCourse(courseId);
-    await this.courseRepo.deleteById(courseId);
+    const updated = await this.courseRepo.transitionStatus(
+      course._id.toString(),
+      [course.status],
+      {
+        status: 'rejected',
+        reviewedAt: new Date(),
+        reviewedBy: new Types.ObjectId(params.requester.id),
+        rejectionReason: params.reason,
+      },
+      [],
+      this.submissionGuard(course),
+    );
+
+    if (!updated) {
+      throw this.concurrentTransitionError();
+    }
+
+    return this.buildDetail(updated);
   }
 
   // -------------------------------------------------------------------------
@@ -256,19 +450,43 @@ export class CourseService {
     requester: AuthUser;
     input: CreateSectionInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const courseId = course._id.toString();
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const courseId = course._id.toString();
+        const order = (await this.sectionRepo.maxOrder(courseId)) + 1;
 
-    const order = (await this.sectionRepo.maxOrder(courseId)) + 1;
+        const created = await this.sectionRepo.create(
+          {
+            courseId,
+            title: params.input.title,
+            description: params.input.description,
+            order,
+          },
+          fence,
+        );
+        const authorized = await this.courseRepo.beginContentCommit(
+          courseId,
+          fence,
+        );
+        if (!authorized) {
+          throw this.editInProgressError();
+        }
+        const committed = await this.sectionRepo.commitCreated(
+          created._id.toString(),
+          fence,
+        );
+        if (!committed) {
+          throw this.editInProgressError();
+        }
 
-    await this.sectionRepo.create({
-      courseId,
-      title: params.input.title,
-      description: params.input.description,
-      order,
-    });
-
-    return this.buildDetail(course);
+        return this.buildDetail(course);
+      },
+    );
   }
 
   async updateSection(params: {
@@ -277,30 +495,46 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateSectionInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+
+        const update: SectionUpdate = {};
+        const unset: string[] = [];
+
+        if (params.input.title !== undefined) {
+          update.title = params.input.title;
+        }
+
+        if (params.input.description !== undefined) {
+          if (params.input.description === '') {
+            unset.push('description');
+          } else {
+            update.description = params.input.description;
+          }
+        }
+
+        const updated = await this.sectionRepo.updateById(
+          section._id.toString(),
+          update,
+          unset,
+          fence,
+        );
+        if (!updated) {
+          throw this.editInProgressError();
+        }
+
+        return this.buildDetail(course);
+      },
     );
-
-    const update: SectionUpdate = {};
-    const unset: string[] = [];
-
-    if (params.input.title !== undefined) {
-      update.title = params.input.title;
-    }
-
-    if (params.input.description !== undefined) {
-      if (params.input.description === '') {
-        unset.push('description');
-      } else {
-        update.description = params.input.description;
-      }
-    }
-
-    await this.sectionRepo.updateById(section._id.toString(), update, unset);
-
-    return this.buildDetail(course);
   }
 
   async deleteSection(params: {
@@ -308,17 +542,35 @@ export class CourseService {
     sectionId: string;
     requester: AuthUser;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+
+        // The fenced section delete is the authorization commit. Lesson
+        // cleanup follows only if it succeeds, even if the lease expires
+        // during the cascade.
+        const deleted = await this.sectionRepo.deleteById(
+          section._id.toString(),
+          fence,
+        );
+        if (!deleted) {
+          throw this.editInProgressError();
+        }
+
+        // Lessons belong to the section; deleting it cascades to them.
+        await this.lessonRepo.deleteBySection(section._id.toString());
+
+        return this.buildDetail(course);
+      },
     );
-
-    // Lessons belong to the section; deleting it cascades to them.
-    await this.lessonRepo.deleteBySection(section._id.toString());
-    await this.sectionRepo.deleteById(section._id.toString());
-
-    return this.buildDetail(course);
   }
 
   async reorderSections(params: {
@@ -326,21 +578,32 @@ export class CourseService {
     requester: AuthUser;
     sectionIds: string[];
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const courseId = course._id.toString();
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const courseId = course._id.toString();
+        const sections = await this.sectionRepo.listByCourse(courseId);
+        assertSameIdSet(
+          sections.map((section) => section._id.toString()),
+          params.sectionIds,
+        );
 
-    const sections = await this.sectionRepo.listByCourse(courseId);
-    assertSameIdSet(
-      sections.map((section) => section._id.toString()),
-      params.sectionIds,
+        const reordered = await this.sectionRepo.updateOrders(
+          courseId,
+          params.sectionIds.map((id, index) => ({ id, order: index + 1 })),
+          fence,
+        );
+        if (!reordered) {
+          throw this.editInProgressError();
+        }
+
+        return this.buildDetail(course);
+      },
     );
-
-    await this.sectionRepo.updateOrders(
-      courseId,
-      params.sectionIds.map((id, index) => ({ id, order: index + 1 })),
-    );
-
-    return this.buildDetail(course);
   }
 
   // -------------------------------------------------------------------------
@@ -353,26 +616,52 @@ export class CourseService {
     requester: AuthUser;
     input: CreateLessonInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+
+        const payload = await this.resolveCreatePayload(course, params.input);
+        const order =
+          (await this.lessonRepo.maxOrder(section._id.toString())) + 1;
+
+        const created = await this.lessonRepo.create(
+          {
+            courseId: course._id.toString(),
+            sectionId: section._id.toString(),
+            title: params.input.title,
+            description: params.input.description,
+            type: params.input.type,
+            order,
+            ...payload,
+          },
+          fence,
+        );
+        const authorized = await this.courseRepo.beginContentCommit(
+          course._id.toString(),
+          fence,
+        );
+        if (!authorized) {
+          throw this.editInProgressError();
+        }
+        const committed = await this.lessonRepo.commitCreated(
+          created._id.toString(),
+          fence,
+        );
+        if (!committed) {
+          throw this.editInProgressError();
+        }
+
+        return this.buildDetail(course);
+      },
     );
-
-    const payload = await this.resolveCreatePayload(course, params.input);
-    const order = (await this.lessonRepo.maxOrder(section._id.toString())) + 1;
-
-    await this.lessonRepo.create({
-      courseId: course._id.toString(),
-      sectionId: section._id.toString(),
-      title: params.input.title,
-      description: params.input.description,
-      type: params.input.type,
-      order,
-      ...payload,
-    });
-
-    return this.buildDetail(course);
   }
 
   async updateLesson(params: {
@@ -382,105 +671,118 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateLessonInput;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+        const lesson = await this.requireLesson(
+          course._id.toString(),
+          section._id.toString(),
+          params.lessonId,
+        );
+
+        const update: LessonUpdate = {};
+        const unset: string[] = [];
+
+        if (params.input.title !== undefined) {
+          update.title = params.input.title;
+        }
+
+        if (params.input.description !== undefined) {
+          if (params.input.description === '') {
+            unset.push('description');
+          } else {
+            update.description = params.input.description;
+          }
+        }
+
+        const effectiveType: LessonType = params.input.type ?? lesson.type;
+
+        if (effectiveType === 'quiz') {
+          throw new AppError(
+            400,
+            COURSE_ERRORS.LESSON_TYPE_UNSUPPORTED,
+            'Quiz lessons are not supported yet',
+          );
+        }
+
+        if (
+          params.input.type !== undefined &&
+          params.input.type !== lesson.type
+        ) {
+          update.type = params.input.type;
+        }
+
+        // Type-specific payloads must match the effective type. This rejects
+        // conflicting updates such as sending `videoId` to a text lesson.
+        if (params.input.videoId !== undefined && effectiveType !== 'video') {
+          throw this.invalidPayload('videoId is only valid for video lessons');
+        }
+        if (params.input.content !== undefined && effectiveType !== 'text') {
+          throw this.invalidPayload('content is only valid for text lessons');
+        }
+        if (
+          (params.input.documentUrl !== undefined ||
+            params.input.documentName !== undefined) &&
+          effectiveType !== 'document'
+        ) {
+          throw this.invalidPayload(
+            'Document fields are only valid for document lessons',
+          );
+        }
+
+        if (effectiveType === 'video') {
+          if (params.input.videoId !== undefined) {
+            update.videoId = await this.resolveLessonVideo(
+              course,
+              params.input.videoId,
+            );
+          } else if (lesson.type !== 'video') {
+            throw this.missingPayload('A video lesson requires a videoId');
+          }
+          unset.push('content', 'documentUrl', 'documentName');
+        } else if (effectiveType === 'text') {
+          if (params.input.content !== undefined) {
+            update.content = params.input.content;
+          } else if (lesson.type !== 'text') {
+            throw this.missingPayload('A text lesson requires content');
+          }
+          unset.push('videoId', 'documentUrl', 'documentName');
+        } else {
+          if (params.input.documentUrl !== undefined) {
+            update.documentUrl = params.input.documentUrl;
+          } else if (lesson.type !== 'document') {
+            throw this.missingPayload(
+              'A document lesson requires a documentUrl',
+            );
+          }
+          if (params.input.documentName !== undefined) {
+            update.documentName = params.input.documentName;
+          }
+          unset.push('videoId', 'content');
+        }
+
+        const updated = await this.lessonRepo.updateById(
+          lesson._id.toString(),
+          update,
+          unset,
+          fence,
+        );
+
+        if (!updated) {
+          throw this.editInProgressError();
+        }
+
+        return this.buildDetail(course);
+      },
     );
-    const lesson = await this.requireLesson(
-      course._id.toString(),
-      section._id.toString(),
-      params.lessonId,
-    );
-
-    const update: LessonUpdate = {};
-    const unset: string[] = [];
-
-    if (params.input.title !== undefined) {
-      update.title = params.input.title;
-    }
-
-    if (params.input.description !== undefined) {
-      if (params.input.description === '') {
-        unset.push('description');
-      } else {
-        update.description = params.input.description;
-      }
-    }
-
-    const effectiveType: LessonType = params.input.type ?? lesson.type;
-
-    if (effectiveType === 'quiz') {
-      throw new AppError(
-        400,
-        COURSE_ERRORS.LESSON_TYPE_UNSUPPORTED,
-        'Quiz lessons are not supported yet',
-      );
-    }
-
-    if (params.input.type !== undefined && params.input.type !== lesson.type) {
-      update.type = params.input.type;
-    }
-
-    // Type-specific payloads must match the effective type. This rejects
-    // conflicting updates such as sending `videoId` to a text lesson.
-    if (params.input.videoId !== undefined && effectiveType !== 'video') {
-      throw this.invalidPayload('videoId is only valid for video lessons');
-    }
-    if (params.input.content !== undefined && effectiveType !== 'text') {
-      throw this.invalidPayload('content is only valid for text lessons');
-    }
-    if (
-      (params.input.documentUrl !== undefined ||
-        params.input.documentName !== undefined) &&
-      effectiveType !== 'document'
-    ) {
-      throw this.invalidPayload(
-        'Document fields are only valid for document lessons',
-      );
-    }
-
-    if (effectiveType === 'video') {
-      if (params.input.videoId !== undefined) {
-        update.videoId = await this.resolveLessonVideo(course, params.input.videoId);
-      } else if (lesson.type !== 'video') {
-        throw this.missingPayload('A video lesson requires a videoId');
-      }
-      unset.push('content', 'documentUrl', 'documentName');
-    } else if (effectiveType === 'text') {
-      if (params.input.content !== undefined) {
-        update.content = params.input.content;
-      } else if (lesson.type !== 'text') {
-        throw this.missingPayload('A text lesson requires content');
-      }
-      unset.push('videoId', 'documentUrl', 'documentName');
-    } else {
-      if (params.input.documentUrl !== undefined) {
-        update.documentUrl = params.input.documentUrl;
-      } else if (lesson.type !== 'document') {
-        throw this.missingPayload('A document lesson requires a documentUrl');
-      }
-      if (params.input.documentName !== undefined) {
-        update.documentName = params.input.documentName;
-      }
-      unset.push('videoId', 'content');
-    }
-
-    const updated = await this.lessonRepo.updateById(
-      lesson._id.toString(),
-      update,
-      unset,
-    );
-
-    if (!updated) {
-      throw new AppError(
-        404,
-        COURSE_ERRORS.LESSON_NOT_FOUND,
-        'Lesson not found',
-      );
-    }
-
-    return this.buildDetail(course);
   }
 
   async deleteLesson(params: {
@@ -489,20 +791,34 @@ export class CourseService {
     lessonId: string;
     requester: AuthUser;
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
-    const lesson = await this.requireLesson(
-      course._id.toString(),
-      section._id.toString(),
-      params.lessonId,
-    );
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
+        const lesson = await this.requireLesson(
+          course._id.toString(),
+          section._id.toString(),
+          params.lessonId,
+        );
 
-    await this.lessonRepo.deleteById(lesson._id.toString());
+        const deleted = await this.lessonRepo.deleteById(
+          lesson._id.toString(),
+          fence,
+        );
+        if (!deleted) {
+          throw this.editInProgressError();
+        }
 
-    return this.buildDetail(course);
+        return this.buildDetail(course);
+      },
+    );
   }
 
   async reorderLessons(params: {
@@ -511,24 +827,38 @@ export class CourseService {
     requester: AuthUser;
     lessonIds: string[];
   }): Promise<CourseDetail> {
-    const course = await this.requireOwnedCourse(params.courseId, params.requester);
-    const section = await this.requireSection(
-      course._id.toString(),
-      params.sectionId,
-    );
+    return this.withCourseMutationLock(
+      params.courseId,
+      params.requester,
+      COURSE_EDITABLE_STATUSES,
+      COURSE_ERRORS.COURSE_NOT_EDITABLE,
+      'edited',
+      async (course, fence) => {
+        const section = await this.requireSection(
+          course._id.toString(),
+          params.sectionId,
+        );
 
-    const lessons = await this.lessonRepo.listBySection(section._id.toString());
-    assertSameIdSet(
-      lessons.map((lesson) => lesson._id.toString()),
-      params.lessonIds,
-    );
+        const lessons = await this.lessonRepo.listBySection(
+          section._id.toString(),
+        );
+        assertSameIdSet(
+          lessons.map((lesson) => lesson._id.toString()),
+          params.lessonIds,
+        );
 
-    await this.lessonRepo.updateOrders(
-      section._id.toString(),
-      params.lessonIds.map((id, index) => ({ id, order: index + 1 })),
-    );
+        const reordered = await this.lessonRepo.updateOrders(
+          section._id.toString(),
+          params.lessonIds.map((id, index) => ({ id, order: index + 1 })),
+          fence,
+        );
+        if (!reordered) {
+          throw this.editInProgressError();
+        }
 
-    return this.buildDetail(course);
+        return this.buildDetail(course);
+      },
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -545,15 +875,21 @@ export class CourseService {
     return toCourseDetail(course, sections, lessons);
   }
 
-  private async requireOwnedCourse(
-    courseId: string,
-    requester: AuthUser,
-  ): Promise<CourseDocument> {
+  private async requireCourse(courseId: string): Promise<CourseDocument> {
     const course = await this.courseRepo.findById(courseId);
 
     if (!course) {
       throw new AppError(404, COURSE_ERRORS.COURSE_NOT_FOUND, 'Course not found');
     }
+
+    return course;
+  }
+
+  private async requireOwnedCourse(
+    courseId: string,
+    requester: AuthUser,
+  ): Promise<CourseDocument> {
+    const course = await this.requireCourse(courseId);
 
     if (requester.role !== 'admin' && course.ownerId.toString() !== requester.id) {
       throw new AppError(
@@ -564,6 +900,374 @@ export class CourseService {
     }
 
     return course;
+  }
+
+  /**
+   * Serialize a content mutation with submission/review.
+   *
+   * Ownership and the status rule are checked first for precise errors; the
+   * database lease is then claimed atomically. Submission requires the lease to
+   * be free, so an edit that started just before submission either completes
+   * before the submission or prevents it with COURSE_EDIT_IN_PROGRESS.
+   */
+  private async withCourseMutationLock<T>(
+    courseId: string,
+    requester: AuthUser,
+    allowedStatuses: readonly CourseStatus[],
+    statusErrorCode: CourseErrorCode,
+    action: 'edited' | 'deleted',
+    operation: (course: CourseDocument, fence: CourseEditFence) => Promise<T>,
+  ): Promise<T> {
+    const course = await this.requireOwnedCourse(courseId, requester);
+    this.assertStatusAllowed(course, allowedStatuses, statusErrorCode, action);
+
+    const locked = await this.acquireContentLock(
+      courseId,
+      requester,
+      allowedStatuses,
+      statusErrorCode,
+      action,
+    );
+    const fence = this.requireEditFence(locked);
+
+    try {
+      return await operation(locked, fence);
+    } finally {
+      await this.courseRepo.releaseEditLock(
+        locked._id.toString(),
+        fence.token,
+      );
+    }
+  }
+
+  private async acquireContentLock(
+    courseId: string,
+    requester: AuthUser,
+    allowedStatuses: readonly CourseStatus[],
+    statusErrorCode: CourseErrorCode,
+    action: 'edited' | 'deleted',
+  ): Promise<CourseDocument> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await this.requireOwnedCourse(courseId, requester);
+      this.assertStatusAllowed(
+        current,
+        allowedStatuses,
+        statusErrorCode,
+        action,
+      );
+
+      if (!current.editLocked) {
+        const locked = await this.claimContentLock(courseId, allowedStatuses);
+        if (locked) {
+          return locked;
+        }
+        // Another request acquired the lease between the read and the claim.
+        continue;
+      }
+
+      if (!this.isEditLockStale(current)) {
+        throw this.editInProgressError();
+      }
+
+      // Snapshot what existed before recovery. A stale holder that is still
+      // running can create rows during the takeover; anything outside this
+      // snapshot is abandoned, and rows staged at snapshot time are discarded
+      // even if the old holder flips them to committed before cleanup runs.
+      const snapshot = await this.captureContentSnapshot(courseId);
+
+      const cleared = await this.courseRepo.clearStaleEditLock(
+        courseId,
+        allowedStatuses,
+        this.editLockCutoff(),
+      );
+      if (!cleared) {
+        // Another request refreshed or released the lease; re-evaluate.
+        continue;
+      }
+
+      const locked = await this.claimContentLock(
+        courseId,
+        allowedStatuses,
+        snapshot,
+      );
+      if (locked) {
+        return locked;
+      }
+    }
+
+    throw this.editInProgressError();
+  }
+
+  private async claimContentLock(
+    courseId: string,
+    allowedStatuses: readonly CourseStatus[],
+    snapshot?: ContentSnapshot,
+  ): Promise<CourseDocument | null> {
+    const locked = await this.courseRepo.acquireEditLock(
+      courseId,
+      allowedStatuses,
+    );
+    if (!locked) {
+      return null;
+    }
+
+    try {
+      await this.initializeContentFence(locked, snapshot);
+    } catch (error) {
+      if (locked.editLockToken) {
+        await this.courseRepo.releaseEditLock(courseId, locked.editLockToken);
+      }
+      throw error;
+    }
+
+    return locked;
+  }
+
+  private async captureContentSnapshot(
+    courseId: string,
+  ): Promise<ContentSnapshot> {
+    const sectionIds = await this.sectionRepo.listIdsByCourse(courseId);
+    const lessonIds = await this.lessonRepo.listIdsByCourse(courseId);
+    const [stagedSectionIds, stagedLessonIds] = await Promise.all([
+      this.sectionRepo.listStagedIdsByCourse(courseId),
+      this.lessonRepo.listStagedIdsByCourse(courseId),
+    ]);
+
+    return {
+      sectionIds,
+      stagedSectionIds,
+      lessonIds,
+      stagedLessonIds,
+    };
+  }
+
+  /**
+   * Move the content collections onto a newly acquired lease. Writes are only
+   * allowed after every existing content document has the new token and expiry,
+   * and abandoned/recovered creates have been removed.
+   */
+  private async initializeContentFence(
+    course: CourseDocument,
+    snapshot?: ContentSnapshot,
+  ): Promise<void> {
+    const fence = this.requireEditFence(course);
+    const courseId = course._id.toString();
+
+    if (snapshot) {
+      await this.sectionRepo.removeStaleForTakeover(
+        courseId,
+        snapshot.sectionIds,
+        snapshot.stagedSectionIds,
+      );
+      await this.lessonRepo.removeStaleForTakeover(
+        courseId,
+        snapshot.lessonIds,
+        snapshot.stagedLessonIds,
+      );
+    } else {
+      await this.sectionRepo.deleteStagedByCourse(courseId);
+      await this.lessonRepo.deleteStagedByCourse(courseId);
+    }
+
+    await this.sectionRepo.refreshLease(courseId, fence.token, fence.expiresAt);
+    await this.lessonRepo.refreshLease(courseId, fence.token, fence.expiresAt);
+  }
+
+  private requireEditFence(course: CourseDocument): CourseEditFence {
+    if (!course.editLockToken || !course.editLeaseExpiresAt) {
+      throw this.editInProgressError();
+    }
+
+    return {
+      token: course.editLockToken,
+      expiresAt: course.editLeaseExpiresAt,
+    };
+  }
+
+  /**
+   * Move a draft or rejected course to `pending_review`, but only while no
+   * content edit is in flight. A concurrent submission or status change is
+   * reported as a conflict rather than retried blindly, which prevents a stale
+   * submit request from resubmitting a version the owner has not seen.
+   */
+  private async transitionToPendingReview(
+    course: CourseDocument,
+  ): Promise<CourseDocument> {
+    const courseId = course._id.toString();
+    const fromStatus = course.status;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const updated = await this.courseRepo.transitionStatusIfIdle(
+        courseId,
+        [fromStatus],
+        {
+          status: 'pending_review',
+          submittedAt: this.nextSubmissionTime(course),
+        },
+        ['reviewedAt', 'reviewedBy', 'rejectionReason'],
+        this.submissionGuard(course),
+      );
+
+      if (updated) {
+        return updated;
+      }
+
+      const current = await this.requireCourse(courseId);
+
+      if (current.status !== fromStatus) {
+        throw this.concurrentTransitionError();
+      }
+
+      if (!current.editLocked) {
+        // The lease may simply have been released by the competing edit
+        // between the failed transition and this read. Only treat the request
+        // as stale if the submission identity changed; otherwise retry the
+        // transition so a normal edit/submit race does not turn into a bogus
+        // INVALID_STATUS_TRANSITION error.
+        if (this.submissionIdentityChanged(course, current)) {
+          throw this.concurrentTransitionError();
+        }
+        continue;
+      }
+
+      if (!this.isEditLockStale(current)) {
+        throw this.editInProgressError();
+      }
+
+      const cleared = await this.courseRepo.clearStaleEditLock(
+        courseId,
+        [fromStatus],
+        this.editLockCutoff(),
+      );
+      if (!cleared) {
+        // Another request changed the lease; re-evaluate on the next pass.
+        continue;
+      }
+    }
+
+    throw this.editInProgressError();
+  }
+
+  /**
+   * Pin a review decision to the submission the admin actually loaded. Without
+   * this, an approve/reject request that read submission S1 could win the CAS
+   * after the owner was rejected and resubmitted S2, silently reviewing content
+   * the admin never saw.
+   */
+  private submissionGuard(course: CourseDocument): Record<string, unknown> {
+    return course.submittedAt
+      ? { submittedAt: course.submittedAt }
+      : { submittedAt: { $exists: false } };
+  }
+
+  /**
+   * Compare the submission a request loaded with the one currently stored.
+   * `submittedAt` is strictly increasing per course, so a difference means a
+   * newer submission won the race.
+   */
+  private submissionIdentityChanged(
+    loaded: CourseDocument,
+    current: CourseDocument,
+  ): boolean {
+    return loaded.submittedAt?.getTime() !== current.submittedAt?.getTime();
+  }
+
+  /**
+   * Keep submission timestamps strictly increasing per course. This makes
+   * `submittedAt` a reliable submission identity even if two submissions occur
+   * within the same clock millisecond.
+   */
+  private nextSubmissionTime(course: CourseDocument): Date {
+    const previous = course.submittedAt?.getTime() ?? 0;
+    return new Date(Math.max(Date.now(), previous + 1));
+  }
+
+  private isEditLockStale(course: CourseDocument): boolean {
+    if (!course.editLocked) {
+      return false;
+    }
+
+    if (course.editLeaseExpiresAt) {
+      return course.editLeaseExpiresAt.getTime() <= Date.now();
+    }
+
+    // Legacy leases acquired before `editLeaseExpiresAt` existed.
+    if (!course.editLockedAt) {
+      return true;
+    }
+    return Date.now() - course.editLockedAt.getTime() > COURSE_EDIT_LOCK_TTL_MS;
+  }
+
+  private editLockCutoff(): Date {
+    return new Date(Date.now() - COURSE_EDIT_LOCK_TTL_MS);
+  }
+
+  private editInProgressError(): AppError {
+    return new AppError(
+      409,
+      COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+      'A content edit is in progress; reload and retry',
+    );
+  }
+
+  /**
+   * Submission is strictly an owner action; the admin ownership bypass does
+   * not apply here.
+   */
+  private async requireCourseOwner(
+    courseId: string,
+    requester: AuthUser,
+  ): Promise<CourseDocument> {
+    const course = await this.requireCourse(courseId);
+
+    if (course.ownerId.toString() !== requester.id) {
+      throw new AppError(
+        403,
+        COURSE_ERRORS.COURSE_FORBIDDEN,
+        'Only the course owner can submit it for review',
+      );
+    }
+
+    return course;
+  }
+
+  private assertAdmin(requester: AuthUser): void {
+    if (requester.role !== 'admin') {
+      throw new AppError(403, AUTH_ERRORS.FORBIDDEN, 'Admin access required');
+    }
+  }
+
+  private assertTransition(from: CourseStatus, to: CourseStatus): void {
+    if (!COURSE_STATUS_TRANSITIONS[from].includes(to)) {
+      throw new AppError(
+        409,
+        COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+        `A course in "${from}" status cannot be transitioned to "${to}"`,
+      );
+    }
+  }
+
+  private assertStatusAllowed(
+    course: CourseDocument,
+    allowedStatuses: readonly CourseStatus[],
+    errorCode: CourseErrorCode,
+    action: 'edited' | 'deleted',
+  ): void {
+    if (!allowedStatuses.includes(course.status)) {
+      throw new AppError(
+        409,
+        errorCode,
+        `A course in "${course.status}" status cannot be ${action}`,
+      );
+    }
+  }
+
+  private concurrentTransitionError(): AppError {
+    return new AppError(
+      409,
+      COURSE_ERRORS.INVALID_STATUS_TRANSITION,
+      'The course status changed while processing this request; reload and retry',
+    );
   }
 
   private async requireSection(

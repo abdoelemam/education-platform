@@ -10,6 +10,8 @@ import type {
   CreateSectionInput,
   LessonParam,
   ListCoursesQuery,
+  ListReviewCoursesQuery,
+  RejectCourseInput,
   ReorderLessonsInput,
   ReorderSectionsInput,
   SectionParam,
@@ -85,6 +87,84 @@ export class CourseController {
 
     await this.svc.deleteCourse({ courseId, requester: user });
     sendSuccess(res, { message: 'Course deleted successfully' });
+  };
+
+  /**
+   * POST /api/teacher/courses/:courseId/submit
+   */
+  submitForReview = async (req: Request, res: Response): Promise<void> => {
+    const user = this.requireUser(req);
+    const { courseId } = req.params as unknown as CourseIdParam;
+
+    const course = await this.svc.submitCourse({ courseId, requester: user });
+    sendSuccess(res, { course });
+  };
+
+  // ---------------------------------------------------------------------------
+  // Admin moderation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * GET /api/admin/courses
+   */
+  listForReview = async (req: Request, res: Response): Promise<void> => {
+    const user = this.requireUser(req);
+    const query = req.query as unknown as ListReviewCoursesQuery;
+
+    const result = await this.svc.listCoursesForReview({
+      requester: user,
+      status: query.status,
+      page: query.page,
+      limit: query.limit,
+    });
+
+    sendPaginated(res, result.items, {
+      page: result.page,
+      limit: result.limit,
+      total: result.total,
+      totalPages: result.totalPages,
+    });
+  };
+
+  /**
+   * GET /api/admin/courses/:courseId
+   */
+  getForReview = async (req: Request, res: Response): Promise<void> => {
+    const user = this.requireUser(req);
+    const { courseId } = req.params as unknown as CourseIdParam;
+
+    const course = await this.svc.getCourseForReview({
+      courseId,
+      requester: user,
+    });
+    sendSuccess(res, { course });
+  };
+
+  /**
+   * POST /api/admin/courses/:courseId/approve
+   */
+  approve = async (req: Request, res: Response): Promise<void> => {
+    const user = this.requireUser(req);
+    const { courseId } = req.params as unknown as CourseIdParam;
+
+    const course = await this.svc.approveCourse({ courseId, requester: user });
+    sendSuccess(res, { course });
+  };
+
+  /**
+   * POST /api/admin/courses/:courseId/reject
+   */
+  reject = async (req: Request, res: Response): Promise<void> => {
+    const user = this.requireUser(req);
+    const { courseId } = req.params as unknown as CourseIdParam;
+    const { reason } = req.body as RejectCourseInput;
+
+    const course = await this.svc.rejectCourse({
+      courseId,
+      requester: user,
+      reason,
+    });
+    sendSuccess(res, { course });
   };
 
   /**

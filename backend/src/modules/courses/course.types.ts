@@ -1,15 +1,19 @@
 import type { Document, Types } from 'mongoose';
 
 /**
- * Course lifecycle. The Course Builder only ever creates `draft` courses;
- * transitions are owned by the Teacher Workflow / moderation phases and are
- * deliberately not implemented here.
+ * Course lifecycle.
+ *
+ * The Course Builder creates `draft` courses. The Teacher Workflow owns the
+ * review transitions (`draft`/`rejected` → `pending_review` → `approved` or
+ * `rejected`). Publishing (`approved` → `published`) and archiving are later
+ * phases and are not reachable yet.
  */
 export const COURSE_STATUSES = [
   'draft',
   'pending_review',
-  'published',
+  'approved',
   'rejected',
+  'published',
   'archived',
 ] as const;
 export type CourseStatus = (typeof COURSE_STATUSES)[number];
@@ -33,6 +37,27 @@ export interface ICourse {
   slug: string;
   description?: string;
   status: CourseStatus;
+  /** Set whenever the owner submits the current version for review. */
+  submittedAt?: Date;
+  /** Set by the admin decision that reviewed the current submission. */
+  reviewedAt?: Date;
+  reviewedBy?: Types.ObjectId;
+  /** Present only while the course is rejected; cleared on resubmission. */
+  rejectionReason?: string;
+  /**
+   * Internal content-edit lease. A request that changes course content claims
+   * this boolean before writing and releases it afterwards. Submission needs an
+   * unlocked course, so a write that started just before submission cannot land
+   * after the review snapshot is taken. Never accepted from clients and never
+   * serialized in API responses.
+   */
+  editLocked: boolean;
+  /** When the current edit lease was claimed; used to recover abandoned locks. */
+  editLockedAt?: Date;
+  /** Opaque token identifying the current lease holder. */
+  editLockToken?: string;
+  /** Database-time expiry of the current edit lease. */
+  editLeaseExpiresAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -52,6 +77,11 @@ export interface ISection {
   description?: string;
   /** 1-based position within the course. Sparse values are allowed. */
   order: number;
+  /** Internal edit-lease fence; never serialized or client-controlled. */
+  editToken?: string;
+  editLeaseExpiresAt?: Date;
+  /** False while a create is staged; missing/true means visible. */
+  committed?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -83,6 +113,11 @@ export interface ILesson {
   content?: string;
   documentUrl?: string;
   documentName?: string;
+  /** Internal edit-lease fence; never serialized or client-controlled. */
+  editToken?: string;
+  editLeaseExpiresAt?: Date;
+  /** False while a create is staged; missing/true means visible. */
+  committed?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -122,7 +157,11 @@ export interface PublicSection {
 }
 
 /**
- * Sanitized course representation (metadata only).
+ * Audience-neutral course metadata.
+ *
+ * This is the mapper used for any future public/catalog response. It must not
+ * contain review internals (`submittedAt`, `reviewedAt`, `reviewedBy`,
+ * `rejectionReason`) or edit-lock fields.
  */
 export interface PublicCourse {
   id: string;
@@ -136,9 +175,26 @@ export interface PublicCourse {
 }
 
 /**
+ * Authorized course-management representation.
+ *
+ * Review metadata is part of the teacher/admin workflow and is only returned by
+ * owner or admin endpoints. It is never accepted as input.
+ */
+export interface ManagedCourse extends PublicCourse {
+  /** ISO timestamp of the current review submission, when one exists. */
+  submittedAt?: string;
+  /** ISO timestamp of the admin review decision, when one exists. */
+  reviewedAt?: string;
+  /** Admin user id that made the current review decision. */
+  reviewedBy?: string;
+  /** Reason supplied by the admin for the current rejection. */
+  rejectionReason?: string;
+}
+
+/**
  * Full course representation used by the Course Builder: metadata plus the
  * ordered section/lesson structure.
  */
-export interface CourseDetail extends PublicCourse {
+export interface CourseDetail extends ManagedCourse {
   sections: PublicSection[];
 }
