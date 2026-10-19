@@ -203,7 +203,7 @@ Approval is a review result, not publication. Content edits and deletion use an
 exclusive per-course lease; every write carries a token and database-time expiry
 fence, and creates are staged until a fenced commit. Pending/approved courses
 cannot be deleted. Stale submit/review requests are pinned to the submission
-they loaded. Runtime checks are covered by 40 integration tests in
+they loaded. Runtime checks are covered by 43 integration tests in
 `backend/tests/teacher-workflow.test.ts`.
 
 ---

@@ -372,6 +372,9 @@ draft ──owner submit──▶ pending_review ──admin approve──▶ ap
 * A course can be deleted only in `draft` or `rejected`; pending and approved
   courses return `COURSE_NOT_DELETABLE` rather than silently withdrawing a
   submission or deleting reviewed content. Deletion also takes the edit lease.
+  The parent is deleted under the fence before content cleanup, so a cleanup
+  failure can leave unreachable orphan sections/lessons but never visible
+  partial course content. Transactions or resumable cleanup remain follow-ups.
 * Admins get a read-only moderation queue and detail view under
   `/api/admin/courses`; all review mutations require CSRF.
 

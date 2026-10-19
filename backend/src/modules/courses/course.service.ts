@@ -298,7 +298,10 @@ export class CourseService {
         }
 
         // Cascade to content. Videos are independent assets that may be reused
-        // by other lessons, so they are never deleted here.
+        // by other lessons, so they are never deleted here. This cleanup is
+        // intentionally parent-first and not transactional: if it fails after
+        // the course is gone, the remaining rows are unreachable orphans rather
+        // than visible partial content. See docs/course-builder.md.
         await this.lessonRepo.deleteByCourse(courseId);
         await this.sectionRepo.deleteByCourse(courseId);
       },
@@ -1116,10 +1119,15 @@ export class CourseService {
       }
 
       if (!current.editLocked) {
-        // The status changed and changed back, or another request won the
-        // transition. Do not silently resubmit a version the owner has not
-        // seen; make the client reload.
-        throw this.concurrentTransitionError();
+        // The lease may simply have been released by the competing edit
+        // between the failed transition and this read. Only treat the request
+        // as stale if the submission identity changed; otherwise retry the
+        // transition so a normal edit/submit race does not turn into a bogus
+        // INVALID_STATUS_TRANSITION error.
+        if (this.submissionIdentityChanged(course, current)) {
+          throw this.concurrentTransitionError();
+        }
+        continue;
       }
 
       if (!this.isEditLockStale(current)) {
@@ -1150,6 +1158,18 @@ export class CourseService {
     return course.submittedAt
       ? { submittedAt: course.submittedAt }
       : { submittedAt: { $exists: false } };
+  }
+
+  /**
+   * Compare the submission a request loaded with the one currently stored.
+   * `submittedAt` is strictly increasing per course, so a difference means a
+   * newer submission won the race.
+   */
+  private submissionIdentityChanged(
+    loaded: CourseDocument,
+    current: CourseDocument,
+  ): boolean {
+    return loaded.submittedAt?.getTime() !== current.submittedAt?.getTime();
   }
 
   /**

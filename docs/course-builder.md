@@ -375,20 +375,28 @@ future public catalog use.
   authentication/authorization, ownership isolation, slug generation, metadata
   updates, section/lesson CRUD, validation, ordering persistence, video
   ownership rules, type switching and cascading deletes.
-- `backend/tests/teacher-workflow.test.ts` (40 integration tests) covers
+- `backend/tests/teacher-workflow.test.ts` (43 integration tests) covers
   submission, non-owner/admin submission attempts, admin queue/detail, approve
   and reject transitions, rejection reason validation, non-admin moderation
   attempts, server-owned field tampering, edit locking and rejected-course
   editing/resubmission. It also covers concurrent approve/reject/submit
   decisions, stale submit/review requests against newer review cycles,
-  edit-lease races and recovery, deletion policy and review-metadata exposure.
+  edit-lease races and recovery, submission retry after a competing edit
+  releases, deletion policy, fenced-delete failure and retry, a delete/submit
+  race and review-metadata exposure.
   Deterministic stall tests cover a recovered lease, a new holder, and the old
   course/section update or create attempting to finish, including a submission
   winning the lease race. A fence matrix verifies that every course, section
   and lesson update, delete, reorder and create commit is rejected for a stale
   holder.
 
-The full backend suite currently has 156 passing tests.
+These are integration tests against a local MongoDB test database
+(`education-platform-test` on loopback), not mocked repositories. Concurrency
+coverage combines real parallel HTTP requests with deterministic stall wrappers
+that delegate to the real Mongoose repositories. The suite runs against a
+standalone MongoDB server, so multi-document transactions are not exercised.
+
+The full backend suite currently has 159 passing tests.
 
 ## Known limitations / follow-ups
 
@@ -411,16 +419,22 @@ The full backend suite currently has 156 passing tests.
   than allowed to commit. All write filters use MongoDB server time for the
   expiry check, but lease acquisition and stale detection still use the
   application clock, so large cross-instance clock skew remains a limitation.
-- A stale create that inserts after the new holder's cleanup can leave an
-  invisible `committed: false` row. It is never returned by reads and is removed
-  by the next lease acquisition.
 - Reordering updates each section/lesson with its own fenced write and is not a
   transaction. If a lease expires mid-bulk, the remaining writes fail and the
   caller receives `409`; writes that completed before expiry may leave a partial
   order. The next successful reorder repairs it.
-- Cascade deletes are sequential rather than transactional. If a mid-delete
-  database error occurs, retrying the same delete removes any remaining
-  sections/lessons. The parent course/section delete is fenced; the cascade
-  cleanup runs only after that parent delete has committed.
+- Cascade deletes are sequential rather than transactional. The parent
+  course/section is deleted under the fence first, then the remaining content is
+  removed. If cleanup fails or the process crashes after the parent delete, the
+  remaining sections/lessons are unreachable through the API but stay in
+  MongoDB; retrying `DELETE` returns `404` because the parent is already gone,
+  so an operational cleanup is required. This is an orphan-storage risk rather
+  than visible partial course content, and a transactional or resumable cleanup
+  is a follow-up.
+- A stale create that inserts after the new holder's cleanup, or after the
+  parent course/section was deleted, can leave an invisible `committed: false`
+  row. It is never returned by reads. For an existing course, the next lease
+  acquisition removes it; for a deleted parent there is no later acquisition,
+  so it remains an orphan until manual cleanup.
 - Course publishing, categories, pricing and the remaining Course Management
   metadata belong to later phases and are intentionally absent.

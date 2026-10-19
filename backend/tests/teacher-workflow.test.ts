@@ -984,6 +984,60 @@ describe('Teacher Workflow Integration Tests', () => {
     expect(submitted).not.toHaveProperty('editLockedAt');
   });
 
+  it('retries submission when the competing edit releases before the retry read', async () => {
+    const teacher = await registerApprovedTeacher('lease-submit-release@test.com');
+    const course = await createCourse(teacher);
+    const repo = new CourseRepository();
+
+    const locked = await repo.acquireEditLock(
+      course.id,
+      COURSE_EDITABLE_STATUSES,
+    );
+    expect(locked?.editLockToken).toBeDefined();
+
+    let findCalls = 0;
+    class ReleasingCourseRepository extends CourseRepository {
+      override async findById(
+        ...args: Parameters<CourseRepository['findById']>
+      ) {
+        findCalls += 1;
+
+        // The first read loads the course while the other edit holds the lease.
+        // By the second read that edit has finished and released the lease
+        // without changing the course status or submission identity.
+        if (findCalls === 2) {
+          await this.releaseEditLock(args[0], locked!.editLockToken!);
+        }
+
+        return super.findById(...args);
+      }
+    }
+
+    const service = new CourseService(
+      new ReleasingCourseRepository(),
+      sectionRepository,
+      lessonRepository,
+      videoRepository,
+    );
+    const owner: AuthUser = {
+      id: teacher.userId,
+      email: 'lease-submit-release@test.com',
+      role: 'teacher',
+      teacherStatus: 'approved',
+      isActive: true,
+    };
+
+    const submitted = await service.submitCourse({
+      courseId: course.id,
+      requester: owner,
+    });
+
+    expect(submitted.status).toBe('pending_review');
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.status).toBe('pending_review');
+    expect(stored?.editLocked).toBe(false);
+  });
+
   it('serializes content edits with the per-course lease', async () => {
     const teacher = await registerApprovedTeacher('lease-edit@test.com');
     const course = await createCourse(teacher, 'Original Title');
@@ -1799,8 +1853,15 @@ describe('Teacher Workflow Integration Tests', () => {
 
     // Simulate a submit request that read the first rejection but reaches the
     // service after the owner has already resubmitted and been rejected again.
+    // Only the first read is stale; the retry re-read sees the current
+    // submission like the real repository would.
     const staleRepo = new CourseRepository();
-    staleRepo.findById = async () => staleRejected;
+    const liveFindById = CourseRepository.prototype.findById.bind(staleRepo);
+    let findCalls = 0;
+    staleRepo.findById = async (id: string) => {
+      findCalls += 1;
+      return findCalls === 1 ? staleRejected : liveFindById(id);
+    };
     const service = new CourseService(
       staleRepo,
       sectionRepository,
@@ -1893,6 +1954,100 @@ describe('Teacher Workflow Integration Tests', () => {
     expect(await CourseModel.findById(course.id).exec()).toBeNull();
     expect(await SectionModel.countDocuments({ courseId: course.id })).toBe(0);
     expect(await LessonModel.countDocuments({ courseId: course.id })).toBe(0);
+  });
+
+  it('does not cascade content when the fenced course delete loses its lease', async () => {
+    const teacher = await registerApprovedTeacher('delete-fenced-failure@test.com');
+    const course = await createCourse(teacher);
+    const withSection = await addSection(teacher, course.id);
+    const sectionId = withSection.sections[0].id;
+    await addTextLesson(teacher, course.id, sectionId);
+
+    let failNextDelete = true;
+    class FailingCourseRepository extends CourseRepository {
+      override async deleteById(
+        ...args: Parameters<CourseRepository['deleteById']>
+      ) {
+        if (failNextDelete) {
+          failNextDelete = false;
+          return false;
+        }
+        return super.deleteById(...args);
+      }
+    }
+
+    const service = new CourseService(
+      new FailingCourseRepository(),
+      sectionRepository,
+      lessonRepository,
+      videoRepository,
+    );
+    const owner: AuthUser = {
+      id: teacher.userId,
+      email: 'delete-fenced-failure@test.com',
+      role: 'teacher',
+      teacherStatus: 'approved',
+      isActive: true,
+    };
+
+    await expect(
+      service.deleteCourse({ courseId: course.id, requester: owner }),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      code: COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    });
+
+    // The failed fenced authorization must not start the cascade, and the
+    // lease must be released so a retry can perform the deletion.
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.editLocked).toBe(false);
+    expect(await SectionModel.countDocuments({ courseId: course.id })).toBe(1);
+    expect(await LessonModel.countDocuments({ courseId: course.id })).toBe(1);
+
+    await service.deleteCourse({ courseId: course.id, requester: owner });
+    expect(await CourseModel.findById(course.id).exec()).toBeNull();
+    expect(await SectionModel.countDocuments({ courseId: course.id })).toBe(0);
+    expect(await LessonModel.countDocuments({ courseId: course.id })).toBe(0);
+  });
+
+  it('keeps a course consistent when deletion and submission race', async () => {
+    const teacher = await registerApprovedTeacher('delete-submit-race@test.com');
+    const course = await createCourse(teacher);
+    const withSection = await addSection(teacher, course.id);
+    const sectionId = withSection.sections[0].id;
+    await addTextLesson(teacher, course.id, sectionId);
+
+    const [deleted, submitted] = await Promise.all([
+      request(app)
+        .delete(`/api/teacher/courses/${course.id}`)
+        .set('Cookie', teacher.cookies)
+        .set('X-CSRF-Token', teacher.csrf),
+      submit(teacher, course.id),
+    ]);
+
+    const stored = await CourseModel.findById(course.id).exec();
+    const sectionCount = await SectionModel.countDocuments({
+      courseId: course.id,
+    });
+    const lessonCount = await LessonModel.countDocuments({
+      courseId: course.id,
+    });
+
+    if (stored) {
+      // Submission won: the course is under review and the content is intact.
+      expect(stored.status).toBe('pending_review');
+      expect(deleted.status).toBe(409);
+      expect(deleted.body.error.code).toBe(COURSE_ERRORS.COURSE_NOT_DELETABLE);
+      expect(submitted.status).toBe(200);
+      expect(sectionCount).toBe(1);
+      expect(lessonCount).toBe(1);
+    } else {
+      // Deletion won: the course and all of its content are gone.
+      expect(deleted.status).toBe(200);
+      expect([404, 409]).toContain(submitted.status);
+      expect(sectionCount).toBe(0);
+      expect(lessonCount).toBe(0);
+    }
   });
 
   it('does not delete while a content edit is in progress', async () => {
