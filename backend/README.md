@@ -107,7 +107,10 @@ an existing video by id and never duplicate the video pipeline. See
 
 Only the course owner may submit a course; only admins may approve or reject.
 Approval is a review outcome; publishing remains a later phase. Content edits
-claim an exclusive per-course lease, so a write that starts just before
-submission cannot land after review. Pending/approved courses cannot be deleted
-(`409 COURSE_NOT_DELETABLE`).
+claim an exclusive per-course lease, and every course/section/lesson write
+carries a token plus a MongoDB-server-time expiry fence. A stalled request whose
+lease expired or was replaced gets `409 COURSE_EDIT_IN_PROGRESS` instead of
+committing; creates are staged until a fenced authorization/commit succeeds,
+and stale recovery discards rows staged or created during the takeover.
+Pending/approved courses cannot be deleted (`409 COURSE_NOT_DELETABLE`).
 

@@ -1,5 +1,10 @@
 import { randomBytes } from 'node:crypto';
 import { Types, type FilterQuery } from 'mongoose';
+import { COURSE_EDIT_LOCK_TTL_MS } from './course.constants.js';
+import {
+  activeCourseEditFenceFilter,
+  type CourseEditFence,
+} from './course.fence.js';
 import { CourseModel } from './course.model.js';
 import type { CourseDocument, CourseStatus, ICourse } from './course.types.js';
 
@@ -21,6 +26,7 @@ export type CourseUpdate = Partial<
     | 'editLocked'
     | 'editLockedAt'
     | 'editLockToken'
+    | 'editLeaseExpiresAt'
   >
 >;
 
@@ -136,9 +142,14 @@ export class CourseRepository {
     id: string,
     update: CourseUpdate,
     unset: string[] = [],
+    fence?: CourseEditFence,
   ): Promise<CourseDocument | null> {
-    return CourseModel.findByIdAndUpdate(
-      id,
+    const filter = fence
+      ? { _id: id, ...activeCourseEditFenceFilter(fence) }
+      : { _id: id };
+
+    return CourseModel.findOneAndUpdate(
+      filter,
       buildUpdateDocument(update, unset),
       { new: true },
     ).exec();
@@ -206,6 +217,8 @@ export class CourseRepository {
     editableStatuses: readonly CourseStatus[],
   ): Promise<CourseDocument | null> {
     const token = randomBytes(16).toString('hex');
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + COURSE_EDIT_LOCK_TTL_MS);
 
     return CourseModel.findOneAndUpdate(
       {
@@ -216,8 +229,9 @@ export class CourseRepository {
       {
         $set: {
           editLocked: true,
-          editLockedAt: new Date(),
+          editLockedAt: now,
           editLockToken: token,
+          editLeaseExpiresAt: expiresAt,
         },
       },
       { new: true },
@@ -234,14 +248,19 @@ export class CourseRepository {
       { _id: id, editLocked: true, editLockToken: token },
       {
         $set: { editLocked: false },
-        $unset: { editLockedAt: 1, editLockToken: 1 },
+        $unset: {
+          editLockedAt: 1,
+          editLockToken: 1,
+          editLeaseExpiresAt: 1,
+        },
       },
     ).exec();
   }
 
   /**
-   * Clear an edit lease older than `olderThan`. Compare-and-set prevents a
-   * concurrent live edit from losing its fresh lease.
+   * Clear an expired edit lease. Compare-and-set prevents a concurrent live
+   * edit from losing its fresh lease. The legacy `editLockedAt` branch keeps
+   * leases created before `editLeaseExpiresAt` was introduced recoverable.
    */
   async clearStaleEditLock(
     id: string,
@@ -254,21 +273,65 @@ export class CourseRepository {
         status: { $in: [...editableStatuses] },
         editLocked: true,
         $or: [
-          { editLockedAt: { $lt: olderThan } },
-          { editLockedAt: { $exists: false } },
+          {
+            editLeaseExpiresAt: { $exists: true },
+            $expr: { $lte: ['$editLeaseExpiresAt', '$$NOW'] },
+          },
+          {
+            editLeaseExpiresAt: { $exists: false },
+            editLockedAt: { $lt: olderThan },
+          },
+          {
+            editLeaseExpiresAt: { $exists: false },
+            editLockedAt: { $exists: false },
+          },
         ],
       },
       {
         $set: { editLocked: false },
-        $unset: { editLockedAt: 1, editLockToken: 1 },
+        $unset: {
+          editLockedAt: 1,
+          editLockToken: 1,
+          editLeaseExpiresAt: 1,
+        },
       },
     ).exec();
 
     return result.modifiedCount > 0;
   }
 
-  async deleteById(id: string): Promise<void> {
-    await CourseModel.findByIdAndDelete(id).exec();
+  /**
+   * Atomically verify that `fence` is still the course's live lease. Used as
+   * the authorization point before a staged content create is committed, so a
+   * request whose lease was replaced cannot activate a newly inserted row.
+   */
+  async beginContentCommit(
+    id: string,
+    fence: CourseEditFence,
+  ): Promise<boolean> {
+    const result = await CourseModel.updateOne(
+      { _id: id, ...activeCourseEditFenceFilter(fence) },
+      { $set: { editLeaseExpiresAt: fence.expiresAt } },
+      { timestamps: false },
+    ).exec();
+
+    return result.matchedCount > 0;
+  }
+
+  /**
+   * Delete the course only while `fence` is still the active edit lease.
+   * Returns false when the lease expired, was replaced, or the course is gone.
+   */
+  async deleteById(
+    id: string,
+    fence?: CourseEditFence,
+  ): Promise<boolean> {
+    const filter = fence
+      ? { _id: id, ...activeCourseEditFenceFilter(fence) }
+      : { _id: id };
+
+    const deleted = await CourseModel.findOneAndDelete(filter).exec();
+    return deleted !== null;
   }
 }
 

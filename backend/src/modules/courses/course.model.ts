@@ -78,6 +78,11 @@ const courseSchema = new Schema<CourseDocument>(
       type: String,
       default: undefined,
     },
+    /** Database-time lease expiry checked by every content write filter. */
+    editLeaseExpiresAt: {
+      type: Date,
+      default: undefined,
+    },
   },
   {
     timestamps: true,

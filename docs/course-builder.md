@@ -26,8 +26,10 @@ Decisions:
   lesson id from another course is treated as missing (`404`).
 - **Server-owned fields.** `ownerId`, `slug`, `status`, `order`, `submittedAt`,
   `reviewedAt`, `reviewedBy`, `rejectionReason` and the internal `editLocked` /
-  `editLockedAt` / `editLockToken` lease are never accepted from the client. Unknown body fields
-  are stripped by Zod.
+  `editLockedAt` / `editLockToken` / `editLeaseExpiresAt` lease are never
+  accepted from the client. Section/lesson `editToken`, `editLeaseExpiresAt`
+  and `committed` staging fields are also internal. Unknown body fields are
+  stripped by Zod.
 - **Review state machine.** The Teacher Workflow owns the only reachable
   transitions: `draft`/`rejected` → `pending_review` (owner) and
   `pending_review` → `approved`/`rejected` (admin). Editing is frozen while a
@@ -37,12 +39,19 @@ Decisions:
   its stored status and reviewed submission (`submittedAt`) are still the ones
   the reviewer loaded, so two concurrent reviewers (or an old review request
   racing a rejection/resubmission) cannot both win.
-- **Exclusive content-edit lease.** Every content mutation claims a per-course
-  database lease before writing and releases it in a `finally` block.
-  Submission only transitions while that lease is free. Whichever request wins
-  the lease/status race, a content write cannot land after the review snapshot
-  is taken. A lease older than five minutes is treated as abandoned and can be
-  recovered, so a process crash does not block the course forever.
+- **Exclusive content-edit lease with a database-enforced fence.** Every course,
+  section and lesson mutation claims a per-course database lease before
+  writing and releases it in a `finally` block. Acquiring the lease stamps the
+  lease token and expiry onto every existing section and lesson. Every update,
+  delete, reorder and create commit then includes the token and a
+  MongoDB-server-time (`$$NOW`) expiry check in its write filter, so a stale
+  request cannot write after its lease expired or was replaced. Creates are
+  inserted as hidden staged rows and become visible only after a fenced
+  course-authorization write and a fenced commit. Submission only transitions
+  while that lease is free. Whichever request wins the lease/status race, a
+  content write cannot land after the review snapshot is taken. A lease older
+  than five minutes is treated as abandoned and can be recovered, so a process
+  crash does not block the course forever.
 
 ## Lifecycle
 
@@ -83,7 +92,18 @@ is a future feature.
   wins first, the edit gets `409 COURSE_NOT_EDITABLE`. A content write therefore
   cannot land after the course is submitted.
 - A lease older than five minutes is considered abandoned (for example, after a
-  crashed process) and is cleared by the next edit or submission.
+  crashed process) and is cleared by the next edit or submission. Lease
+  ownership is rechecked in the database at each write, not only when the
+  request starts: the write must match the current token and an unexpired
+  MongoDB-server-time lease. A stalled request that resumes after recovery
+  therefore gets `409 COURSE_EDIT_IN_PROGRESS` instead of committing.
+- Creates are staged with `committed: false`. The service first performs a
+  fenced authorization write on the course, then commits the staged row with
+  the same fence. A stale creator can leave only an invisible staged row, which
+  the next lease acquisition cleans up. When recovering a stale lease, the new
+  holder snapshots the rows that existed and discards rows created during
+  recovery, including a staged row that the old holder flips to committed just
+  before cleanup.
 - A rejected course can be edited freely and then resubmitted. Resubmission
   clears `rejectionReason`, `reviewedAt` and `reviewedBy`, and replaces
   `submittedAt` with the new submission time.
@@ -122,7 +142,7 @@ cannot submit a teacher's course on their behalf.
 | `submittedAt` | Set on each owner submission |
 | `reviewedAt`, `reviewedBy` | Set by the admin decision for the current submission |
 | `rejectionReason` | Present only on `rejected`; cleared on resubmission |
-| `editLocked`, `editLockedAt`, `editLockToken` | Internal content-edit lease; never serialized or client-controlled |
+| `editLocked`, `editLockedAt`, `editLockToken`, `editLeaseExpiresAt` | Internal content-edit lease; never serialized or client-controlled |
 | `createdAt`, `updatedAt` | Timestamps |
 
 Indexes: `{ ownerId: 1, createdAt: -1 }`, unique `{ slug: 1 }`,
@@ -136,6 +156,8 @@ Indexes: `{ ownerId: 1, createdAt: -1 }`, unique `{ slug: 1 }`,
 | `title` | Required, 1–200 chars |
 | `description` | Optional, up to 2000 chars |
 | `order` | 1-based position in the course |
+| `editToken`, `editLeaseExpiresAt` | Internal write fence, updated on lease acquisition |
+| `committed` | Internal staging flag for creates; missing/true means visible |
 
 Index: `{ courseId: 1, order: 1 }`.
 
@@ -151,6 +173,8 @@ Index: `{ courseId: 1, order: 1 }`.
 | `videoId` | Video lessons: reference to a Video owned by the course owner |
 | `content` | Text lessons: body, up to 20000 chars |
 | `documentUrl`, `documentName` | Document lessons: external http(s) reference |
+| `editToken`, `editLeaseExpiresAt` | Internal write fence, updated on lease acquisition |
+| `committed` | Internal staging flag for creates; missing/true means visible |
 
 Indexes: `{ sectionId: 1, order: 1 }`, `{ courseId: 1 }`.
 
@@ -351,15 +375,20 @@ future public catalog use.
   authentication/authorization, ownership isolation, slug generation, metadata
   updates, section/lesson CRUD, validation, ordering persistence, video
   ownership rules, type switching and cascading deletes.
-- `backend/tests/teacher-workflow.test.ts` (35 integration tests) covers
+- `backend/tests/teacher-workflow.test.ts` (40 integration tests) covers
   submission, non-owner/admin submission attempts, admin queue/detail, approve
   and reject transitions, rejection reason validation, non-admin moderation
   attempts, server-owned field tampering, edit locking and rejected-course
   editing/resubmission. It also covers concurrent approve/reject/submit
   decisions, stale submit/review requests against newer review cycles,
   edit-lease races and recovery, deletion policy and review-metadata exposure.
+  Deterministic stall tests cover a recovered lease, a new holder, and the old
+  course/section update or create attempting to finish, including a submission
+  winning the lease race. A fence matrix verifies that every course, section
+  and lesson update, delete, reorder and create commit is rejected for a stale
+  holder.
 
-The full backend suite currently has 151 passing tests.
+The full backend suite currently has 156 passing tests.
 
 ## Known limitations / follow-ups
 
@@ -378,11 +407,20 @@ The full backend suite currently has 151 passing tests.
   first until an explicit withdrawal flow exists.
 - Content edit leases are recovered after five minutes so a crashed process
   cannot block a course forever. This assumes a legitimate content write
-  finishes well within that window; a pathological write that stalls longer
-  could theoretically land after a stale lease is cleared. Review decisions are
-  pinned to the submission timestamp and are compare-and-set.
+  finishes well within that window; a write that exceeds it is rejected rather
+  than allowed to commit. All write filters use MongoDB server time for the
+  expiry check, but lease acquisition and stale detection still use the
+  application clock, so large cross-instance clock skew remains a limitation.
+- A stale create that inserts after the new holder's cleanup can leave an
+  invisible `committed: false` row. It is never returned by reads and is removed
+  by the next lease acquisition.
+- Reordering updates each section/lesson with its own fenced write and is not a
+  transaction. If a lease expires mid-bulk, the remaining writes fail and the
+  caller receives `409`; writes that completed before expiry may leave a partial
+  order. The next successful reorder repairs it.
 - Cascade deletes are sequential rather than transactional. If a mid-delete
   database error occurs, retrying the same delete removes any remaining
-  sections/lessons.
+  sections/lessons. The parent course/section delete is fenced; the cascade
+  cleanup runs only after that parent delete has committed.
 - Course publishing, categories, pricing and the remaining Course Management
   metadata belong to later phases and are intentionally absent.

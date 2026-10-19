@@ -56,6 +56,8 @@ export interface ICourse {
   editLockedAt?: Date;
   /** Opaque token identifying the current lease holder. */
   editLockToken?: string;
+  /** Database-time expiry of the current edit lease. */
+  editLeaseExpiresAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -75,6 +77,11 @@ export interface ISection {
   description?: string;
   /** 1-based position within the course. Sparse values are allowed. */
   order: number;
+  /** Internal edit-lease fence; never serialized or client-controlled. */
+  editToken?: string;
+  editLeaseExpiresAt?: Date;
+  /** False while a create is staged; missing/true means visible. */
+  committed?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -106,6 +113,11 @@ export interface ILesson {
   content?: string;
   documentUrl?: string;
   documentName?: string;
+  /** Internal edit-lease fence; never serialized or client-controlled. */
+  editToken?: string;
+  editLeaseExpiresAt?: Date;
+  /** False while a create is staged; missing/true means visible. */
+  committed?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }

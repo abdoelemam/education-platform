@@ -20,7 +20,10 @@ import {
   toManagedCourse,
   toPublicCourse,
 } from '../src/modules/courses/course.mapper.js';
-import { sectionRepository } from '../src/modules/courses/section.repository.js';
+import {
+  sectionRepository,
+  SectionRepository,
+} from '../src/modules/courses/section.repository.js';
 import { lessonRepository } from '../src/modules/courses/lesson.repository.js';
 import { videoRepository } from '../src/modules/videos/video.repository.js';
 import type { AuthUser } from '../src/modules/users/user.types.js';
@@ -303,6 +306,68 @@ describe('Teacher Workflow Integration Tests', () => {
     const res = await submit(teacher, course.id);
     expect(res.status).toBe(200);
     return res.body.data.course as CourseDto;
+  }
+
+  function deferred() {
+    let resolve!: () => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<void>((promiseResolve, promiseReject) => {
+      resolve = promiseResolve;
+      reject = promiseReject;
+    });
+
+    return { promise, resolve, reject };
+  }
+
+  /**
+   * Acquire a lease the way the service does: claim the course lock, then move
+   * every existing content document onto the same token/expiry.
+   */
+  async function acquireTestFence(courseId: string) {
+    const repo = new CourseRepository();
+    const locked = await repo.acquireEditLock(
+      courseId,
+      COURSE_EDITABLE_STATUSES,
+    );
+    expect(locked).not.toBeNull();
+
+    const token = locked!.editLockToken!;
+    const expiresAt = locked!.editLeaseExpiresAt!;
+    await sectionRepository.refreshLease(courseId, token, expiresAt);
+    await lessonRepository.refreshLease(courseId, token, expiresAt);
+
+    return {
+      repo,
+      locked: locked!,
+      fence: { token, expiresAt },
+    };
+  }
+
+  /**
+   * Simulate wall-clock expiry for both the course lease and the denormalized
+   * content fences. New writes use MongoDB time, so they fail immediately.
+   */
+  async function expireTestFence(courseId: string): Promise<void> {
+    const past = new Date(Date.now() - 1000);
+    await CourseModel.updateOne(
+      { _id: courseId },
+      {
+        $set: {
+          editLockedAt: new Date(
+            Date.now() - COURSE_EDIT_LOCK_TTL_MS - 1000,
+          ),
+          editLeaseExpiresAt: past,
+        },
+      },
+    ).exec();
+    await SectionModel.updateMany(
+      { courseId },
+      { $set: { editLeaseExpiresAt: past } },
+    ).exec();
+    await LessonModel.updateMany(
+      { courseId },
+      { $set: { editLeaseExpiresAt: past } },
+    ).exec();
   }
 
   // ---------------------------------------------------------------------------
@@ -868,6 +933,7 @@ describe('Teacher Workflow Integration Tests', () => {
         editLocked: true,
         editLockedAt: new Date().toISOString(),
         editLockToken: 'forged-token',
+        editLeaseExpiresAt: new Date(0).toISOString(),
       });
 
     expect(res.status).toBe(200);
@@ -883,6 +949,7 @@ describe('Teacher Workflow Integration Tests', () => {
     expect(updated).not.toHaveProperty('editLocked');
     expect(updated).not.toHaveProperty('editLockedAt');
     expect(updated).not.toHaveProperty('editLockToken');
+    expect(updated).not.toHaveProperty('editLeaseExpiresAt');
   });
 
   // ---------------------------------------------------------------------------
@@ -996,6 +1063,7 @@ describe('Teacher Workflow Integration Tests', () => {
           editLockedAt: new Date(
             Date.now() - COURSE_EDIT_LOCK_TTL_MS - 1000,
           ),
+          editLeaseExpiresAt: new Date(Date.now() - 1000),
         },
       },
     ).exec();
@@ -1025,6 +1093,551 @@ describe('Teacher Workflow Integration Tests', () => {
     const unlocked = await CourseModel.findById(course.id).exec();
     expect(unlocked?.editLocked).toBe(false);
     expect(unlocked?.editLockToken).toBeUndefined();
+  });
+
+  it('rejects a stalled stale course update after another holder takes over', async () => {
+    const teacher = await registerApprovedTeacher('stale-write-course@test.com');
+    const course = await createCourse(teacher, 'Before the race');
+
+    const reachedWrite = deferred();
+    const finishWrite = deferred();
+    class StallingCourseRepository extends CourseRepository {
+      override async updateById(
+        ...args: Parameters<CourseRepository['updateById']>
+      ) {
+        reachedWrite.resolve();
+        await finishWrite.promise;
+        return super.updateById(...args);
+      }
+    }
+
+    const service = new CourseService(
+      new StallingCourseRepository(),
+      sectionRepository,
+      lessonRepository,
+      videoRepository,
+    );
+    const owner: AuthUser = {
+      id: teacher.userId,
+      email: 'stale-write-course@test.com',
+      role: 'teacher',
+      teacherStatus: 'approved',
+      isActive: true,
+    };
+
+    const staleWrite = service.updateCourse({
+      courseId: course.id,
+      requester: owner,
+      input: { title: 'Stale title' },
+    });
+    const staleResult = staleWrite.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+
+    // The request has acquired the lease and is stalled at the write boundary.
+    await reachedWrite.promise;
+    await expireTestFence(course.id);
+
+    const freshWrite = await request(app)
+      .patch(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Fresh title' });
+    expect(freshWrite.status).toBe(200);
+    expect(freshWrite.body.data.course.title).toBe('Fresh title');
+
+    finishWrite.resolve();
+    const settled = await staleResult;
+    expect(settled.error).toMatchObject({
+      statusCode: 409,
+      code: COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    });
+
+    expect((await CourseModel.findById(course.id).exec())?.title).toBe(
+      'Fresh title',
+    );
+  });
+
+  it('rejects a stalled edit after submission recovers its lease', async () => {
+    const teacher = await registerApprovedTeacher('stale-write-submit@test.com');
+    const course = await createCourse(teacher, 'Submitted before stale write');
+
+    const reachedWrite = deferred();
+    const finishWrite = deferred();
+    class StallingCourseRepository extends CourseRepository {
+      override async updateById(
+        ...args: Parameters<CourseRepository['updateById']>
+      ) {
+        reachedWrite.resolve();
+        await finishWrite.promise;
+        return super.updateById(...args);
+      }
+    }
+
+    const service = new CourseService(
+      new StallingCourseRepository(),
+      sectionRepository,
+      lessonRepository,
+      videoRepository,
+    );
+    const owner: AuthUser = {
+      id: teacher.userId,
+      email: 'stale-write-submit@test.com',
+      role: 'teacher',
+      teacherStatus: 'approved',
+      isActive: true,
+    };
+
+    const staleWrite = service.updateCourse({
+      courseId: course.id,
+      requester: owner,
+      input: { title: 'Stale after submission' },
+    });
+    const staleResult = staleWrite.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+
+    await reachedWrite.promise;
+    await expireTestFence(course.id);
+
+    const submitted = await submit(teacher, course.id);
+    expect(submitted.status).toBe(200);
+    expect(submitted.body.data.course.status).toBe('pending_review');
+
+    finishWrite.resolve();
+    const settled = await staleResult;
+    expect(settled.error).toMatchObject({
+      statusCode: 409,
+      code: COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    });
+
+    const stored = await CourseModel.findById(course.id).exec();
+    expect(stored?.status).toBe('pending_review');
+    expect(stored?.title).toBe('Submitted before stale write');
+  });
+
+  it('rejects a stalled stale section update after another holder takes over', async () => {
+    const teacher = await registerApprovedTeacher('stale-write-section@test.com');
+    const course = await createCourse(teacher, 'Content race');
+    const withSection = await addSection(teacher, course.id, 'Original section');
+    const sectionId = withSection.sections[0].id;
+
+    const reachedWrite = deferred();
+    const finishWrite = deferred();
+    class StallingSectionRepository extends SectionRepository {
+      override async updateById(
+        ...args: Parameters<SectionRepository['updateById']>
+      ) {
+        reachedWrite.resolve();
+        await finishWrite.promise;
+        return super.updateById(...args);
+      }
+    }
+
+    const service = new CourseService(
+      new CourseRepository(),
+      new StallingSectionRepository(),
+      lessonRepository,
+      videoRepository,
+    );
+    const owner: AuthUser = {
+      id: teacher.userId,
+      email: 'stale-write-section@test.com',
+      role: 'teacher',
+      teacherStatus: 'approved',
+      isActive: true,
+    };
+
+    const staleWrite = service.updateSection({
+      courseId: course.id,
+      sectionId,
+      requester: owner,
+      input: { title: 'Stale section title' },
+    });
+    const staleResult = staleWrite.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+
+    await reachedWrite.promise;
+    await expireTestFence(course.id);
+
+    const freshWrite = await request(app)
+      .patch(`/api/teacher/courses/${course.id}/sections/${sectionId}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Fresh section title' });
+    expect(freshWrite.status).toBe(200);
+
+    finishWrite.resolve();
+    const settled = await staleResult;
+    expect(settled.error).toMatchObject({
+      statusCode: 409,
+      code: COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    });
+
+    const stored = await SectionModel.findById(sectionId).exec();
+    expect(stored?.title).toBe('Fresh section title');
+  });
+
+  it('rejects a stalled stale section create after lease recovery', async () => {
+    const teacher = await registerApprovedTeacher('stale-create-section@test.com');
+    const course = await createCourse(teacher, 'Create race');
+
+    const reachedCreate = deferred();
+    const finishCreate = deferred();
+    class StallingSectionRepository extends SectionRepository {
+      override async create(
+        ...args: Parameters<SectionRepository['create']>
+      ) {
+        reachedCreate.resolve();
+        await finishCreate.promise;
+        return super.create(...args);
+      }
+    }
+
+    const service = new CourseService(
+      new CourseRepository(),
+      new StallingSectionRepository(),
+      lessonRepository,
+      videoRepository,
+    );
+    const owner: AuthUser = {
+      id: teacher.userId,
+      email: 'stale-create-section@test.com',
+      role: 'teacher',
+      teacherStatus: 'approved',
+      isActive: true,
+    };
+
+    const staleCreate = service.addSection({
+      courseId: course.id,
+      requester: owner,
+      input: { title: 'Stale section' },
+    });
+    const staleResult = staleCreate.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+
+    await reachedCreate.promise;
+    await expireTestFence(course.id);
+
+    const freshCreate = await request(app)
+      .post(`/api/teacher/courses/${course.id}/sections`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Fresh section' });
+    expect(freshCreate.status).toBe(201);
+
+    finishCreate.resolve();
+    const settled = await staleResult;
+    expect(settled.error).toMatchObject({
+      statusCode: 409,
+      code: COURSE_ERRORS.COURSE_EDIT_IN_PROGRESS,
+    });
+
+    const visible = await sectionRepository.listByCourse(course.id);
+    expect(visible.map((section) => section.title)).toEqual(['Fresh section']);
+    expect(
+      await SectionModel.countDocuments({
+        courseId: course.id,
+        committed: false,
+      }),
+    ).toBeGreaterThan(0);
+  });
+
+  it('fences every course, section, and lesson write after lease recovery', async () => {
+    const teacher = await registerApprovedTeacher('fence-matrix@test.com');
+    let course = await createCourse(teacher, 'Fence matrix');
+    course = await addSection(teacher, course.id, 'Section A');
+    course = await addSection(teacher, course.id, 'Section B');
+    const sectionA = course.sections[0];
+    const sectionB = course.sections[1];
+    course = await addTextLesson(
+      teacher,
+      course.id,
+      sectionA.id,
+      'Lesson A',
+    );
+    course = await addTextLesson(
+      teacher,
+      course.id,
+      sectionA.id,
+      'Lesson B',
+    );
+    const lessons = course.sections[0].lessons;
+    const lessonA = lessons[0];
+    const lessonB = lessons[1];
+
+    const original = await acquireTestFence(course.id);
+    const staleFence = original.fence;
+
+    // Stage creates before takeover; these become the old holder's "finish
+    // after recovery" attempts.
+    const stalePreTakeoverSection = await sectionRepository.create(
+      {
+        courseId: course.id,
+        title: 'Staged before takeover',
+        order: 98,
+      },
+      staleFence,
+    );
+    const stalePreTakeoverLesson = await lessonRepository.create(
+      {
+        courseId: course.id,
+        sectionId: sectionA.id,
+        title: 'Staged lesson before takeover',
+        type: 'text',
+        content: 'Stale body',
+        order: 98,
+      },
+      staleFence,
+    );
+
+    await expireTestFence(course.id);
+
+    // Expiry alone is enough to reject a write, before any takeover.
+    expect(
+      await original.repo.updateById(
+        course.id,
+        { title: 'Expired course title' },
+        [],
+        staleFence,
+      ),
+    ).toBeNull();
+    expect(
+      await sectionRepository.updateById(
+        sectionA.id,
+        { title: 'Expired section title' },
+        [],
+        staleFence,
+      ),
+    ).toBeNull();
+    expect(
+      await lessonRepository.updateById(
+        lessonA.id,
+        { title: 'Expired lesson title' },
+        [],
+        staleFence,
+      ),
+    ).toBeNull();
+
+    // Let the real service perform stale recovery and take over. Its snapshot
+    // cleanup must remove rows that were staged before the takeover.
+    const takeover = await request(app)
+      .patch(`/api/teacher/courses/${course.id}`)
+      .set('Cookie', teacher.cookies)
+      .set('X-CSRF-Token', teacher.csrf)
+      .send({ title: 'Fence matrix' });
+    expect(takeover.status).toBe(200);
+    expect(
+      await SectionModel.findById(stalePreTakeoverSection._id).exec(),
+    ).toBeNull();
+    expect(
+      await LessonModel.findById(stalePreTakeoverLesson._id).exec(),
+    ).toBeNull();
+
+    const fresh = await acquireTestFence(course.id);
+    expect(fresh.fence.token).not.toBe(staleFence.token);
+
+    // Old holders cannot update, delete, reorder, or commit creates.
+    expect(
+      await fresh.repo.updateById(
+        course.id,
+        { title: 'Stale course title' },
+        [],
+        staleFence,
+      ),
+    ).toBeNull();
+    expect(await fresh.repo.deleteById(course.id, staleFence)).toBe(false);
+
+    expect(
+      await sectionRepository.updateById(
+        sectionA.id,
+        { title: 'Stale section title' },
+        [],
+        staleFence,
+      ),
+    ).toBeNull();
+    expect(await sectionRepository.deleteById(sectionA.id, staleFence)).toBe(
+      false,
+    );
+    expect(
+      await sectionRepository.updateOrders(
+        course.id,
+        [{ id: sectionA.id, order: 2 }],
+        staleFence,
+      ),
+    ).toBe(false);
+
+    // A staged row created before takeover was refreshed onto the new token,
+    // so the old holder cannot commit it.
+    expect(
+      await sectionRepository.commitCreated(
+        stalePreTakeoverSection._id.toString(),
+        staleFence,
+      ),
+    ).toBeNull();
+    expect(
+      await lessonRepository.commitCreated(
+        stalePreTakeoverLesson._id.toString(),
+        staleFence,
+      ),
+    ).toBeNull();
+
+    // A create that starts after takeover cannot pass the course-level
+    // authorization point, even though it can still insert an invisible
+    // staged row with its old token/expiry.
+    const staleSection = await sectionRepository.create(
+      {
+        courseId: course.id,
+        title: 'Stale staged section',
+        order: 99,
+      },
+      staleFence,
+    );
+    expect(await fresh.repo.beginContentCommit(course.id, staleFence)).toBe(
+      false,
+    );
+    expect(
+      (await sectionRepository.listByCourse(course.id)).some(
+        (section) => section._id.toString() === staleSection._id.toString(),
+      ),
+    ).toBe(false);
+
+    expect(
+      await lessonRepository.updateById(
+        lessonA.id,
+        { title: 'Stale lesson title' },
+        [],
+        staleFence,
+      ),
+    ).toBeNull();
+    expect(await lessonRepository.deleteById(lessonA.id, staleFence)).toBe(
+      false,
+    );
+    expect(
+      await lessonRepository.updateOrders(
+        sectionA.id,
+        [{ id: lessonA.id, order: 2 }],
+        staleFence,
+      ),
+    ).toBe(false);
+
+    const staleLesson = await lessonRepository.create(
+      {
+        courseId: course.id,
+        sectionId: sectionA.id,
+        title: 'Stale staged lesson',
+        type: 'text',
+        content: 'Stale body',
+        order: 99,
+      },
+      staleFence,
+    );
+    expect(await fresh.repo.beginContentCommit(course.id, staleFence)).toBe(
+      false,
+    );
+    expect(
+      (await lessonRepository.listBySection(sectionA.id)).some(
+        (lesson) => lesson._id.toString() === staleLesson._id.toString(),
+      ),
+    ).toBe(false);
+
+    // Nothing visible changed while the old holder was attempting to finish.
+    expect((await CourseModel.findById(course.id).exec())?.title).toBe(
+      'Fence matrix',
+    );
+    expect((await SectionModel.findById(sectionA.id).exec())?.title).toBe(
+      'Section A',
+    );
+    expect((await LessonModel.findById(lessonA.id).exec())?.title).toBe(
+      'Lesson A',
+    );
+
+    // A live fence can perform the same writes.
+    expect(
+      await fresh.repo.updateById(
+        course.id,
+        { title: 'Fresh course title' },
+        [],
+        fresh.fence,
+      ),
+    ).not.toBeNull();
+    expect(
+      await sectionRepository.updateById(
+        sectionA.id,
+        { title: 'Fresh section title' },
+        [],
+        fresh.fence,
+      ),
+    ).not.toBeNull();
+    expect(
+      await lessonRepository.updateById(
+        lessonA.id,
+        { title: 'Fresh lesson title' },
+        [],
+        fresh.fence,
+      ),
+    ).not.toBeNull();
+    expect(
+      await sectionRepository.updateOrders(
+        course.id,
+        [
+          { id: sectionB.id, order: 1 },
+          { id: sectionA.id, order: 2 },
+        ],
+        fresh.fence,
+      ),
+    ).toBe(true);
+    expect(
+      await lessonRepository.updateOrders(
+        sectionA.id,
+        [
+          { id: lessonB.id, order: 1 },
+          { id: lessonA.id, order: 2 },
+        ],
+        fresh.fence,
+      ),
+    ).toBe(true);
+
+    const freshSection = await sectionRepository.create(
+      {
+        courseId: course.id,
+        title: 'Fresh section',
+        order: 3,
+      },
+      fresh.fence,
+    );
+    expect(
+      await sectionRepository.commitCreated(
+        freshSection._id.toString(),
+        fresh.fence,
+      ),
+    ).not.toBeNull();
+
+    const freshLesson = await lessonRepository.create(
+      {
+        courseId: course.id,
+        sectionId: sectionA.id,
+        title: 'Fresh lesson',
+        type: 'text',
+        content: 'Fresh body',
+        order: 3,
+      },
+      fresh.fence,
+    );
+    expect(
+      await lessonRepository.commitCreated(
+        freshLesson._id.toString(),
+        fresh.fence,
+      ),
+    ).not.toBeNull();
+
+    expect(await fresh.repo.deleteById(course.id, fresh.fence)).toBe(true);
   });
 
   it('serializes concurrent submissions', async () => {

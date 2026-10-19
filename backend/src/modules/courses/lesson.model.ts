@@ -63,6 +63,14 @@ const lessonSchema = new Schema<LessonDocument>(
       default: undefined,
       maxlength: [200, 'Document name cannot exceed 200 characters'],
     },
+    /**
+     * Edit-lease fence. Every write must match the current token and a
+     * database-time-unexpired lease. Staged creates are invisible until their
+     * fenced commit succeeds.
+     */
+    editToken: { type: String, default: undefined },
+    editLeaseExpiresAt: { type: Date, default: undefined },
+    committed: { type: Boolean, default: true },
   },
   {
     timestamps: true,

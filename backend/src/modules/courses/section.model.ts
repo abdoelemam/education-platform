@@ -28,6 +28,14 @@ const sectionSchema = new Schema<SectionDocument>(
       required: true,
       min: [1, 'Order must be at least 1'],
     },
+    /**
+     * Edit-lease fence. Every write must match the current token and a
+     * database-time-unexpired lease. Staged creates are invisible until their
+     * fenced commit succeeds.
+     */
+    editToken: { type: String, default: undefined },
+    editLeaseExpiresAt: { type: Date, default: undefined },
+    committed: { type: Boolean, default: true },
   },
   {
     timestamps: true,

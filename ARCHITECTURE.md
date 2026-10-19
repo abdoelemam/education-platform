@@ -348,11 +348,18 @@ draft ──owner submit──▶ pending_review ──admin approve──▶ ap
   approved course is frozen so the reviewed version cannot change underneath
   the reviewer.
 * Every content mutation claims an exclusive per-course edit lease in MongoDB
-  before writing and releases it afterwards. Submission only transitions while
-  the lease is free, so an edit that began just before submission cannot land
-  after the review snapshot is taken. A five-minute lease is recoverable after a
-  crash, and a per-acquisition token prevents an old request from releasing a
-  newer holder's lease.
+  before writing and releases it afterwards. Acquisition stamps the token and
+  database-time expiry onto every existing section/lesson. Every course,
+  section and lesson write filter then requires the matching token and an
+  unexpired lease (`$$NOW`), so a request that resumes after expiry/recovery
+  cannot commit. Creates are staged as hidden rows and activated only after a
+  fenced course-authorization write and a fenced commit; stale recovery
+  snapshots existing rows and removes anything staged or created during the
+  takeover. Submission only transitions while the lease is free, so an edit
+  that began just before submission cannot land after the review snapshot is
+  taken. A five-minute lease is recoverable after a crash, and a
+  per-acquisition token prevents an old request from releasing a newer holder's
+  lease.
 * A rejected course is editable and resubmittable. Resubmission clears the old
   rejection reason, reviewer and review timestamp, then records a new
   `submittedAt`.
