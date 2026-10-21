@@ -19,6 +19,7 @@ export const COURSE_ERRORS = {
   COURSE_NOT_EDITABLE: 'COURSE_NOT_EDITABLE',
   COURSE_NOT_DELETABLE: 'COURSE_NOT_DELETABLE',
   COURSE_EDIT_IN_PROGRESS: 'COURSE_EDIT_IN_PROGRESS',
+  COURSE_NOT_PUBLISHABLE: 'COURSE_NOT_PUBLISHABLE',
 } as const;
 
 export type CourseErrorCode = (typeof COURSE_ERRORS)[keyof typeof COURSE_ERRORS];
@@ -29,6 +30,14 @@ export const COURSE_PAGE_MAX_LIMIT = 100;
 export const COURSE_TITLE_MAX = 200;
 export const COURSE_DESCRIPTION_MAX = 5000;
 export const COURSE_SLUG_MAX = 80;
+export const COURSE_THUMBNAIL_URL_MAX = 2048;
+export const COURSE_LANGUAGE_MAX = 11;
+export const COURSE_LEARNING_OUTCOME_MAX = 200;
+export const COURSE_LEARNING_OUTCOMES_MAX_COUNT = 20;
+export const COURSE_REQUIREMENT_MAX = 200;
+export const COURSE_REQUIREMENTS_MAX_COUNT = 20;
+/** Upper bound for an integer price in the currency's minor unit. */
+export const COURSE_PRICE_MINOR_MAX = 999_999_999;
 
 export const SECTION_TITLE_MAX = 200;
 export const SECTION_DESCRIPTION_MAX = 2000;
@@ -47,15 +56,14 @@ export const COURSE_SLUG_MAX_ATTEMPTS = 20;
 export const COURSE_REJECTION_REASON_MAX = 1000;
 
 /**
- * Explicit review state machine. Only these transitions are reachable in the
- * Teacher Workflow phase:
+ * Explicit lifecycle state machine.
  *
  * - `draft`     → `pending_review` (owner submission)
  * - `rejected`  → `pending_review` (owner fixes and resubmits)
  * - `pending_review` → `approved` / `rejected` (admin review)
+ * - `approved`  → `published` (owner publishing, after completeness validation)
  *
- * Publishing (`approved` → `published`) and archiving are later phases and are
- * intentionally absent until publishing requirements exist.
+ * Archiving remains a later phase.
  */
 export const COURSE_STATUS_TRANSITIONS: Record<
   CourseStatus,
@@ -63,11 +71,38 @@ export const COURSE_STATUS_TRANSITIONS: Record<
 > = {
   draft: ['pending_review'],
   pending_review: ['approved', 'rejected'],
-  approved: [],
+  approved: ['published'],
   rejected: ['pending_review'],
   published: [],
   archived: [],
 };
+
+/**
+ * Machine-readable reasons a course cannot be published. Returned in
+ * `error.details.reasons` so clients can point the teacher at the missing
+ * requirements without parsing prose.
+ */
+export const COURSE_PUBLISH_ISSUES = {
+  DESCRIPTION_REQUIRED: 'DESCRIPTION_REQUIRED',
+  THUMBNAIL_REQUIRED: 'THUMBNAIL_REQUIRED',
+  THUMBNAIL_INVALID: 'THUMBNAIL_INVALID',
+  LEVEL_REQUIRED: 'LEVEL_REQUIRED',
+  LEVEL_INVALID: 'LEVEL_INVALID',
+  LANGUAGE_REQUIRED: 'LANGUAGE_REQUIRED',
+  LANGUAGE_INVALID: 'LANGUAGE_INVALID',
+  LEARNING_OUTCOMES_REQUIRED: 'LEARNING_OUTCOMES_REQUIRED',
+  PRICE_REQUIRED: 'PRICE_REQUIRED',
+  PRICE_INVALID: 'PRICE_INVALID',
+  CURRENCY_REQUIRED: 'CURRENCY_REQUIRED',
+  CURRENCY_INVALID: 'CURRENCY_INVALID',
+  SECTIONS_REQUIRED: 'SECTIONS_REQUIRED',
+  SECTION_WITHOUT_LESSONS: 'SECTION_WITHOUT_LESSONS',
+  LESSON_PAYLOAD_INVALID: 'LESSON_PAYLOAD_INVALID',
+  VIDEO_NOT_READY: 'VIDEO_NOT_READY',
+} as const;
+
+export type CoursePublishIssue =
+  (typeof COURSE_PUBLISH_ISSUES)[keyof typeof COURSE_PUBLISH_ISSUES];
 
 /**
  * Statuses in which the owner may change content. Editing is frozen once a

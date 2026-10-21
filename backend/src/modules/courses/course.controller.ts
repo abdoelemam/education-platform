@@ -11,6 +11,8 @@ import type {
   LessonParam,
   ListCoursesQuery,
   ListReviewCoursesQuery,
+  PublicCatalogQuery,
+  PublicCourseSlugParam,
   RejectCourseInput,
   ReorderLessonsInput,
   ReorderSectionsInput,
@@ -97,6 +99,50 @@ export class CourseController {
     const { courseId } = req.params as unknown as CourseIdParam;
 
     const course = await this.svc.submitCourse({ courseId, requester: user });
+    sendSuccess(res, { course });
+  };
+
+  /**
+   * POST /api/teacher/courses/:courseId/publish
+   */
+  publish = async (req: Request, res: Response): Promise<void> => {
+    const user = this.requireUser(req);
+    const { courseId } = req.params as unknown as CourseIdParam;
+
+    const course = await this.svc.publishCourse({ courseId, requester: user });
+    sendSuccess(res, { course });
+  };
+
+  // ---------------------------------------------------------------------------
+  // Public catalog
+  // ---------------------------------------------------------------------------
+
+  /**
+   * GET /api/courses
+   */
+  listPublished = async (req: Request, res: Response): Promise<void> => {
+    const query = req.query as unknown as PublicCatalogQuery;
+
+    const result = await this.svc.listPublishedCourses({
+      page: query.page,
+      limit: query.limit,
+    });
+
+    sendPaginated(res, result.items, {
+      page: result.page,
+      limit: result.limit,
+      total: result.total,
+      totalPages: result.totalPages,
+    });
+  };
+
+  /**
+   * GET /api/courses/:slug
+   */
+  getPublished = async (req: Request, res: Response): Promise<void> => {
+    const { slug } = req.params as unknown as PublicCourseSlugParam;
+
+    const course = await this.svc.getPublishedCourseBySlug(slug);
     sendSuccess(res, { course });
   };
 

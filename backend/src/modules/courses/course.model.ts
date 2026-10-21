@@ -1,5 +1,9 @@
 import mongoose, { Schema } from 'mongoose';
-import { COURSE_STATUSES, type CourseDocument } from './course.types.js';
+import {
+  COURSE_LEVELS,
+  COURSE_STATUSES,
+  type CourseDocument,
+} from './course.types.js';
 
 /**
  * Course metadata model.
@@ -62,6 +66,56 @@ const courseSchema = new Schema<CourseDocument>(
       maxlength: [1000, 'Rejection reason cannot exceed 1000 characters'],
       default: undefined,
     },
+    thumbnailUrl: {
+      type: String,
+      trim: true,
+      maxlength: [2048, 'Thumbnail URL cannot exceed 2048 characters'],
+      default: undefined,
+    },
+    level: {
+      type: String,
+      enum: {
+        values: COURSE_LEVELS,
+        message: 'Invalid course level: {VALUE}',
+      },
+      default: undefined,
+    },
+    language: {
+      type: String,
+      trim: true,
+      maxlength: [11, 'Language cannot exceed 11 characters'],
+      default: undefined,
+    },
+    learningOutcomes: {
+      type: [String],
+      default: undefined,
+    },
+    requirements: {
+      type: [String],
+      default: undefined,
+    },
+    /** Integer minor units (for example cents). 0 means free. */
+    priceMinor: {
+      type: Number,
+      min: [0, 'Price cannot be negative'],
+      validate: {
+        validator: (value: number) => Number.isInteger(value),
+        message: 'Price must be an integer amount in minor units',
+      },
+      default: undefined,
+    },
+    currency: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      maxlength: [3, 'Currency must be an ISO 4217 code'],
+      default: undefined,
+    },
+    /** Set only by the publish transition; never accepted from clients. */
+    publishedAt: {
+      type: Date,
+      default: undefined,
+    },
     /**
      * Internal edit lease. Not client-controlled and never mapped to API
      * responses. Submission refuses to run while this is true.
@@ -94,5 +148,8 @@ courseSchema.index({ ownerId: 1, createdAt: -1 });
 
 // Admin moderation queue: courses filtered by review status, newest first.
 courseSchema.index({ status: 1, createdAt: -1 });
+
+// Public catalog: published courses only, newest publication first.
+courseSchema.index({ status: 1, publishedAt: -1 });
 
 export const CourseModel = mongoose.model<CourseDocument>('Course', courseSchema);

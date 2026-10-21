@@ -1,4 +1,8 @@
 import type {
+  CatalogCourse,
+  CatalogCourseDetail,
+  CatalogInstructor,
+  CatalogSection,
   CourseDetail,
   CourseDocument,
   ICourse,
@@ -25,6 +29,14 @@ export function toPublicCourse(course: CourseLike): PublicCourse {
     slug: course.slug,
     description: course.description,
     status: course.status,
+    thumbnailUrl: course.thumbnailUrl,
+    level: course.level,
+    language: course.language,
+    learningOutcomes: course.learningOutcomes,
+    requirements: course.requirements,
+    priceMinor: course.priceMinor,
+    currency: course.currency,
+    publishedAt: course.publishedAt?.toISOString(),
     createdAt: course.createdAt.toISOString(),
     updatedAt: course.updatedAt.toISOString(),
   };
@@ -104,6 +116,86 @@ export function toCourseDetail(
     ...toManagedCourse(course),
     sections: sections.map((section) =>
       toPublicSection(section, lessonsBySection.get(section._id.toString()) ?? []),
+    ),
+  };
+}
+
+/**
+ * Map a published course to its public catalog card.
+ *
+ * The mapper deliberately omits `ownerId`, review metadata, edit-lease
+ * internals and any lesson payload. Instructor data is limited to the display
+ * name and avatar.
+ */
+export function toCatalogCourse(
+  course: CourseLike,
+  instructor: CatalogInstructor,
+): CatalogCourse {
+  const priceMinor = course.priceMinor ?? 0;
+
+  return {
+    id: String(course._id),
+    title: course.title,
+    slug: course.slug,
+    description: course.description,
+    thumbnailUrl: course.thumbnailUrl,
+    level: course.level,
+    language: course.language,
+    priceMinor,
+    currency: course.currency,
+    isFree: priceMinor === 0,
+    publishedAt: (course.publishedAt ?? course.createdAt).toISOString(),
+    instructor,
+  };
+}
+
+/**
+ * Map a published course and its curriculum outline for the public detail page.
+ * Lesson content, video ids and document URLs are never included.
+ */
+export function toCatalogCourseDetail(
+  course: CourseLike,
+  instructor: CatalogInstructor,
+  sections: SectionDocument[],
+  lessons: LessonDocument[],
+): CatalogCourseDetail {
+  const lessonsBySection = new Map<string, LessonDocument[]>();
+
+  for (const lesson of lessons) {
+    const key = lesson.sectionId.toString();
+    const bucket = lessonsBySection.get(key);
+    if (bucket) {
+      bucket.push(lesson);
+    } else {
+      lessonsBySection.set(key, [lesson]);
+    }
+  }
+
+  const curriculum: CatalogSection[] = sections.map((section) => {
+    const sectionLessons = lessonsBySection.get(section._id.toString()) ?? [];
+    return {
+      id: section._id.toString(),
+      title: section.title,
+      order: section.order,
+      lessonCount: sectionLessons.length,
+      lessons: sectionLessons.map((lesson) => ({
+        id: lesson._id.toString(),
+        title: lesson.title,
+        type: lesson.type,
+        order: lesson.order,
+      })),
+    };
+  });
+
+  return {
+    ...toCatalogCourse(course, instructor),
+    learningOutcomes: course.learningOutcomes ?? [],
+    requirements: course.requirements ?? [],
+    curriculum,
+    totalSections: curriculum.length,
+    totalLessons: curriculum.reduce(
+      (total, section) => total + section.lessonCount,
+      0,
     ),
   };
 }

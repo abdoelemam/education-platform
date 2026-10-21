@@ -88,6 +88,14 @@ export function createCourseRouter(service: CourseService = courseService): Rout
     asyncHandler(controller.submitForReview),
   );
 
+  // Owner publishes a course that an admin already approved.
+  router.post(
+    '/:courseId/publish',
+    verifyCsrfToken,
+    validate({ params: courseIdParamSchema }),
+    asyncHandler(controller.publish),
+  );
+
   // -------------------------------------------------------------------------
   // Sections
   // -------------------------------------------------------------------------

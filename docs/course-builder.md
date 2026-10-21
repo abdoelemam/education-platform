@@ -30,11 +30,13 @@ Decisions:
   accepted from the client. Section/lesson `editToken`, `editLeaseExpiresAt`
   and `committed` staging fields are also internal. Unknown body fields are
   stripped by Zod.
-- **Review state machine.** The Teacher Workflow owns the only reachable
-  transitions: `draft`/`rejected` → `pending_review` (owner) and
-  `pending_review` → `approved`/`rejected` (admin). Editing is frozen while a
-  course is `pending_review` or `approved`, so an admin reviews exactly the
-  version that was submitted.
+- **Review state machine.** The Teacher Workflow owns the review transitions
+  (`draft`/`rejected` → `pending_review` and `pending_review` →
+  `approved`/`rejected`); the owner publishes an approved course
+  (`approved` → `published`) after server-side completeness validation.
+  Editing is frozen while a course is `pending_review`, `approved` or
+  `published`, so an admin reviews exactly the version that was submitted and a
+  published course cannot change underneath students.
 - **Compare-and-set transitions.** Review transitions update the course only if
   its stored status and reviewed submission (`submittedAt`) are still the ones
   the reviewer loaded, so two concurrent reviewers (or an old review request
@@ -57,22 +59,25 @@ Decisions:
 
 ```text
 draft ──submit (owner)──▶ pending_review ──approve (admin)──▶ approved
-                                 │
+                                 │                              │
                                  └──reject (admin + reason)──▶ rejected
-
-rejected ──edit + submit (owner)──▶ pending_review
+                                                                  ▲
+rejected ──edit + submit (owner)──▶ pending_review                │
+                                                                  │
+approved ──publish (owner)──▶ published                           │
 ```
 
 | From | To | Actor | Notes |
 | --- | --- | --- | --- |
 | `draft` | `pending_review` | Course owner | Sets `submittedAt`; clears any previous review |
 | `rejected` | `pending_review` | Course owner | Same; the old rejection reason is cleared |
-| `pending_review` | `approved` | Admin | Sets `reviewedAt` / `reviewedBy`; publishing is a later phase |
+| `pending_review` | `approved` | Admin | Sets `reviewedAt` / `reviewedBy` |
 | `pending_review` | `rejected` | Admin | Sets `reviewedAt` / `reviewedBy` and the required `rejectionReason` |
+| `approved` | `published` | Course owner | Validates completeness, sets `publishedAt` |
 
-`approved`, `published` and `archived` are terminal for this phase. In
-particular, an `approved` course cannot be edited or resubmitted; a future
-publishing/edit-and-resubmit flow will define that path.
+`published` (and `archived`) are terminal for this phase. An `approved` course
+cannot be edited or resubmitted; the owner can publish it or leave it approved.
+A published course cannot be edited, deleted, unpublished or archived yet.
 
 A course may be deleted only while it is a `draft` or `rejected`. Courses under
 review or already approved cannot be deleted (including by an admin), because
@@ -110,8 +115,9 @@ is a future feature.
 - Submission is pinned to the `submittedAt` value the owner loaded, and review
   decisions are pinned to the `submittedAt` value the admin loaded. A stale
   submit or review request cannot act on a newer review cycle.
-- Submission does not require content completeness; publication validation is a
-  later phase.
+- Submission does not require content completeness; the new publishing endpoint
+  validates completeness before allowing publication. See
+  [`course-publishing.md`](course-publishing.md).
 
 ## Authentication and CSRF
 
@@ -142,6 +148,14 @@ cannot submit a teacher's course on their behalf.
 | `submittedAt` | Set on each owner submission |
 | `reviewedAt`, `reviewedBy` | Set by the admin decision for the current submission |
 | `rejectionReason` | Present only on `rejected`; cleared on resubmission |
+| `thumbnailUrl` | External HTTP(S) image URL; required to publish |
+| `level` | `beginner` \| `intermediate` \| `advanced` \| `all_levels`; required to publish |
+| `language` | Language tag such as `ar` or `en-US`; required to publish |
+| `learningOutcomes` | Up to 20 strings; at least one required to publish |
+| `requirements` | Up to 20 strings; optional |
+| `priceMinor` | Integer minor units (0 = free); required to publish, no defaults |
+| `currency` | ISO 4217 code; required together with `priceMinor` |
+| `publishedAt` | Server-owned; set only by the publish transition |
 | `editLocked`, `editLockedAt`, `editLockToken`, `editLeaseExpiresAt` | Internal content-edit lease; never serialized or client-controlled |
 | `createdAt`, `updatedAt` | Timestamps |
 
@@ -227,6 +241,7 @@ Errors:
 | `PATCH` | `/api/teacher/courses/:courseId` | Update `title` / `description` |
 | `DELETE` | `/api/teacher/courses/:courseId` | Delete the course and cascade its content |
 | `POST` | `/api/teacher/courses/:courseId/submit` | Owner submits a draft/rejected course for review |
+| `POST` | `/api/teacher/courses/:courseId/publish` | Owner publishes an approved, complete course |
 
 Create body:
 
@@ -353,6 +368,7 @@ future public catalog use.
 | `COURSE_NOT_EDITABLE` | 409 | Content was edited while the course is under review or approved |
 | `COURSE_NOT_DELETABLE` | 409 | A pending/approved/published/archived course cannot be deleted |
 | `COURSE_EDIT_IN_PROGRESS` | 409 | Another content edit holds the per-course lease; reload and retry |
+| `COURSE_NOT_PUBLISHABLE` | 422 | The approved course is missing publishing requirements; `details.reasons` lists them |
 | `VALIDATION_ERROR` | 422 | Request body/params/query failed Zod validation |
 
 ## Deletion semantics
@@ -390,13 +406,21 @@ future public catalog use.
   and lesson update, delete, reorder and create commit is rejected for a stale
   holder.
 
+- `backend/tests/course-publishing.test.ts` (27 integration tests) covers
+  owner-only publishing, admin/other-teacher denial, state-machine rejection,
+  metadata validation and clearing, completeness reasons (including staged rows
+  and legacy invalid lessons), video readiness and ownership, concurrent
+  publishes, active/stale edit leases, the approval-before-publish ordering,
+  and the public catalog (published-only filtering, pagination, instructor
+  summary, free pricing and protected-content exclusion).
+
 These are integration tests against a local MongoDB test database
 (`education-platform-test` on loopback), not mocked repositories. Concurrency
 coverage combines real parallel HTTP requests with deterministic stall wrappers
 that delegate to the real Mongoose repositories. The suite runs against a
 standalone MongoDB server, so multi-document transactions are not exercised.
 
-The full backend suite currently has 159 passing tests.
+The full backend suite currently has 186 passing tests.
 
 ## Known limitations / follow-ups
 
@@ -408,10 +432,10 @@ The full backend suite currently has 159 passing tests.
 - Deleting a video that a lesson references does not clear the lesson's
   `videoId`. Playback resolution will surface a missing video until a follow-up
   adds cross-module cleanup.
-- Publishing (`approved` → `published`), archiving, submission withdrawal and a
-  post-approval edit/re-review flow are later phases and are intentionally
-  absent. Submission also does not validate content completeness; publishing
-  requirements will. A pending course cannot be deleted; it must be rejected
+- Publishing is implemented for `approved` → `published`; archiving,
+  unpublishing and a post-publication edit/re-review flow are later phases.
+  Submission still does not validate content completeness; publishing does.
+  A pending course cannot be deleted; it must be rejected
   first until an explicit withdrawal flow exists.
 - Content edit leases are recovered after five minutes so a crashed process
   cannot block a course forever. This assumes a legitimate content write
@@ -436,5 +460,9 @@ The full backend suite currently has 159 passing tests.
   row. It is never returned by reads. For an existing course, the next lease
   acquisition removes it; for a deleted parent there is no later acquisition,
   so it remains an orphan until manual cleanup.
-- Course publishing, categories, pricing and the remaining Course Management
-  metadata belong to later phases and are intentionally absent.
+- Categories, thumbnail upload, course preview, archive/unpublish and
+  post-publication editing remain separate phases. Publishing and the public
+  catalog are implemented in
+  [`course-publishing.md`](course-publishing.md); categories are not required to
+  publish. Pricing is stored for future checkout but no payment, coupon or
+  enrollment logic exists yet.

@@ -135,6 +135,31 @@ export class CourseRepository {
   }
 
   /**
+   * Public catalog listing: published courses only, newest publication first.
+   */
+  async listPublished(params: {
+    skip: number;
+    limit: number;
+  }): Promise<ListCoursesResult> {
+    const filter = { status: 'published' as const };
+
+    const [items, total] = await Promise.all([
+      CourseModel.find(filter)
+        .sort({ publishedAt: -1, createdAt: -1 })
+        .skip(params.skip)
+        .limit(params.limit)
+        .exec(),
+      CourseModel.countDocuments(filter).exec(),
+    ]);
+
+    return { items, total };
+  }
+
+  async findPublishedBySlug(slug: string): Promise<CourseDocument | null> {
+    return CourseModel.findOne({ slug, status: 'published' }).exec();
+  }
+
+  /**
    * Update course metadata. `undefined` values are stripped; use `unset` to
    * explicitly clear a field.
    */

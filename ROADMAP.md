@@ -113,25 +113,26 @@ Tasks:
 * [x] Course drafts
 * [x] Course status
 * [x] Course slug
-* [ ] Thumbnail
+* [ ] Thumbnail upload (external `thumbnailUrl` metadata is implemented)
 * [ ] Category
-* [ ] Pricing
-* [ ] Level
-* [ ] Language
-* [ ] Learning outcomes
-* [ ] Requirements
+* [x] Pricing (`priceMinor` + `currency` metadata; no payments yet)
+* [x] Level
+* [x] Language
+* [x] Learning outcomes
+* [x] Requirements
 * [ ] Course preview
 * [x] Course submission
-* [ ] Course publishing
+* [x] Course publishing
 * [x] Admin moderation
 
 Notes: the Course Builder delivered the Course model, creation/editing of course
 metadata, draft status and a server-generated unique slug. The Teacher Workflow
 phase added the review lifecycle (`draft`/`rejected` → `pending_review` →
-`approved`/`rejected`), owner-only submission and admin-only moderation.
-Publishing (`approved` → `published`) and the remaining metadata (thumbnail,
-category, pricing, level, language, outcomes, requirements) stay deferred as
-agreed.
+`approved`/`rejected`), owner-only submission and admin-only moderation. The
+Course Publishing phase added owner-only publishing (`approved` → `published`)
+with server-side completeness validation, and a public catalog limited to
+published courses. Thumbnail upload, category and course preview remain
+deferred; `thumbnailUrl` is an external HTTP(S) reference.
 
 ---
 
@@ -242,6 +243,34 @@ Server-verified processing status   ✅
 Playback gated until provider ready ✅
 27 integration + 9 provider tests  ✅
 ```
+
+---
+
+# Course Publishing & Public Catalog
+
+Status: Backend complete (public catalog minimum; UI deferred with the frontend)
+
+Tasks:
+
+* [x] Publishing metadata (thumbnail URL, level, language, outcomes, requirements, price/currency)
+* [x] Server-side completeness validation
+* [x] Owner-only `approved` → `published` transition
+* [x] Edit-lease and concurrent-transition protection
+* [x] Published-only public catalog
+* [x] Public course detail by slug
+* [x] Instructor summary (name/avatar only)
+* [x] Protected lesson content excluded from public responses
+* [ ] Category requirement (deferred until Phase 3)
+* [ ] Thumbnail upload provider
+* [ ] Search/filter/sort in the catalog
+* [ ] Archive / unpublish / post-publication edit flow
+
+Notes: publishing is a separate owner action after admin approval. Validation
+reads committed content only and reports machine-readable reasons. The public
+catalog exposes metadata and a curriculum outline but never lesson bodies, video
+ids, document URLs or playback references. Pricing is stored for future checkout;
+no payments, coupons or enrollment logic exists in this phase. Covered by 27
+integration tests in `backend/tests/course-publishing.test.ts`.
 
 ---
 
@@ -551,6 +580,8 @@ Video System
 Course Builder
    ↓
 Teacher Workflow
+   ↓
+Course Publishing + Public Catalog
 ```
 
 Categories and the remaining Course Management work stay defined in this
@@ -563,7 +594,7 @@ roadmap and continue after the agreed sequence.
 Current phase:
 
 ```text
-Phase 5 — Course Builder + Teacher Workflow (backends complete; frontends deferred)
+Course Publishing + Public Catalog (backend complete; UI deferred)
 ```
 
 Completed:
@@ -575,36 +606,26 @@ Phase 2 — Authentication & Users
 Phase 6 — Video System foundational backend
 Phase 5 — Course Builder backend
 Teacher Workflow — course submission, review and approval backend
+Course Publishing — approval-to-publication backend + public catalog minimum
 ```
 
 Immediate next tasks:
 
 ```text
-1. Course Builder + moderation frontend (once the frontend app is initialized)
-2. Course publishing (approved → published)
+1. Categories (Phase 3) and the remaining Course Management items
+   (thumbnail upload, course preview)
+2. Enrollment (Phase 7), then Course Player (Phase 8) and Progress (Phase 9)
+3. Course Builder + moderation + publishing frontend (once the frontend app is initialized)
 ```
 
 The remaining Video System items (resumable uploads, upload UI, upload progress,
 retry handling, lesson preview) depend on the frontend and course lessons and
 are deferred until those exist.
 
-Next sequence:
-
-```text
-Video System (foundational backend complete)
-→ Course Builder (backend complete)
-→ Teacher Workflow (backend complete)
-```
-
 Deferred until after that sequence:
 
 ```text
-Categories
-→ Course Management (remaining)
-→ Enrollment
-→ Course Player
-→ Progress
-→ Quiz
+Quiz
 → Reviews
 → Payments
 → Certificates

@@ -18,6 +18,20 @@ export class UserRepository {
   }
 
   /**
+   * Load the public catalog's instructor fields in one query. Email, role,
+   * password hash and teacher-private data are never selected.
+   */
+  async findPublicByIds(ids: string[]): Promise<UserDocument[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    return UserModel.find({ _id: { $in: ids } })
+      .select('name avatar')
+      .exec();
+  }
+
+  /**
    * Find a user by normalized email.
    * If includePassword is true, explicitly selects passwordHash for authentication check.
    */
