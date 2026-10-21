@@ -5,8 +5,9 @@ import type { Document, Types } from 'mongoose';
  *
  * The Course Builder creates `draft` courses. The Teacher Workflow owns the
  * review transitions (`draft`/`rejected` → `pending_review` → `approved` or
- * `rejected`). Publishing (`approved` → `published`) and archiving are later
- * phases and are not reachable yet.
+ * `rejected`). The owner publishes an approved course (`approved` →
+ * `published`) after server-side completeness validation. Archiving is not
+ * reachable yet.
  */
 export const COURSE_STATUSES = [
   'draft',
@@ -28,6 +29,17 @@ export const LESSON_TYPES = ['video', 'text', 'document', 'quiz'] as const;
 export type LessonType = (typeof LESSON_TYPES)[number];
 
 /**
+ * Course difficulty. Optional while a course is a draft; required to publish.
+ */
+export const COURSE_LEVELS = [
+  'beginner',
+  'intermediate',
+  'advanced',
+  'all_levels',
+] as const;
+export type CourseLevel = (typeof COURSE_LEVELS)[number];
+
+/**
  * Core Course entity. A course is the ownership boundary for its content.
  */
 export interface ICourse {
@@ -44,6 +56,21 @@ export interface ICourse {
   reviewedBy?: Types.ObjectId;
   /** Present only while the course is rejected; cleared on resubmission. */
   rejectionReason?: string;
+  /**
+   * Marketing/description metadata. All fields are optional while the course is
+   * a draft and validated for completeness when the owner publishes it.
+   * `priceMinor` is an integer amount in the currency's minor unit (for example
+   * cents); 0 means a free course. `currency` is an ISO 4217 code.
+   */
+  thumbnailUrl?: string;
+  level?: CourseLevel;
+  language?: string;
+  learningOutcomes?: string[];
+  requirements?: string[];
+  priceMinor?: number;
+  currency?: string;
+  /** Server-owned timestamp of the publish transition. */
+  publishedAt?: Date;
   /**
    * Internal content-edit lease. A request that changes course content claims
    * this boolean before writing and releases it afterwards. Submission needs an
@@ -170,6 +197,14 @@ export interface PublicCourse {
   slug: string;
   description?: string;
   status: CourseStatus;
+  thumbnailUrl?: string;
+  level?: CourseLevel;
+  language?: string;
+  learningOutcomes?: string[];
+  requirements?: string[];
+  priceMinor?: number;
+  currency?: string;
+  publishedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -197,4 +232,60 @@ export interface ManagedCourse extends PublicCourse {
  */
 export interface CourseDetail extends ManagedCourse {
   sections: PublicSection[];
+}
+
+/**
+ * Instructor summary exposed by the public catalog. Deliberately limited to
+ * display name and avatar: no email, role or teacher-private data.
+ */
+export interface CatalogInstructor {
+  name: string;
+  avatar?: string;
+}
+
+/**
+ * Public catalog card. Only published courses are mapped to this shape, and it
+ * never contains review metadata, edit-lease internals or lesson payloads.
+ */
+export interface CatalogCourse {
+  id: string;
+  title: string;
+  slug: string;
+  description?: string;
+  thumbnailUrl?: string;
+  level?: CourseLevel;
+  language?: string;
+  priceMinor: number;
+  currency?: string;
+  isFree: boolean;
+  publishedAt: string;
+  instructor: CatalogInstructor;
+}
+
+/**
+ * Public curriculum outline. Lesson bodies, video references and document URLs
+ * are intentionally absent: protected content requires an enrollment check that
+ * belongs to the Enrollment/Course Player phases.
+ */
+export interface CatalogLesson {
+  id: string;
+  title: string;
+  type: LessonType;
+  order: number;
+}
+
+export interface CatalogSection {
+  id: string;
+  title: string;
+  order: number;
+  lessonCount: number;
+  lessons: CatalogLesson[];
+}
+
+export interface CatalogCourseDetail extends CatalogCourse {
+  learningOutcomes: string[];
+  requirements: string[];
+  curriculum: CatalogSection[];
+  totalSections: number;
+  totalLessons: number;
 }

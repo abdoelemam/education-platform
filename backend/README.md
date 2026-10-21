@@ -93,10 +93,13 @@ for the full contract and provider configuration.
 - `DELETE /api/teacher/courses/:courseId/sections/:sectionId/lessons/:lessonId` — Delete a lesson
 - `PUT /api/teacher/courses/:courseId/sections/:sectionId/lessons/reorder` — Reorder lessons
 - `POST /api/teacher/courses/:courseId/submit` — Submit a draft/rejected course for review
+- `POST /api/teacher/courses/:courseId/publish` — Publish an approved, complete course
 
 State-changing routes require the `X-CSRF-Token` header. Video lessons reference
 an existing video by id and never duplicate the video pipeline. See
-[`../docs/course-builder.md`](../docs/course-builder.md) for the full contract.
+[`../docs/course-builder.md`](../docs/course-builder.md) for the full contract;
+publishing and the public catalog are documented in
+[`../docs/course-publishing.md`](../docs/course-publishing.md).
 
 ### Course moderation (admins)
 
@@ -105,12 +108,22 @@ an existing video by id and never duplicate the video pipeline. See
 - `POST /api/admin/courses/:courseId/approve` — Approve a pending submission
 - `POST /api/admin/courses/:courseId/reject` — Reject a pending submission with `{ "reason": "…" }`
 
-Only the course owner may submit a course; only admins may approve or reject.
-Approval is a review outcome; publishing remains a later phase. Content edits
+Only the course owner may submit or publish a course; only admins may approve or
+reject. Approval is a review outcome; owners publish separately after server-side
+completeness validation. Content edits
 claim an exclusive per-course lease, and every course/section/lesson write
 carries a token plus a MongoDB-server-time expiry fence. A stalled request whose
 lease expired or was replaced gets `409 COURSE_EDIT_IN_PROGRESS` instead of
 committing; creates are staged until a fenced authorization/commit succeeds,
 and stale recovery discards rows staged or created during the takeover.
-Pending/approved courses cannot be deleted (`409 COURSE_NOT_DELETABLE`).
+Pending/approved/published courses cannot be deleted (`409 COURSE_NOT_DELETABLE`).
+
+### Public catalog
+
+- `GET /api/courses?page=&limit=` — Published courses only, newest first
+- `GET /api/courses/:slug` — Published course metadata and curriculum outline
+
+The public responses never include lesson bodies, video ids, document URLs,
+review metadata or owner identifiers. Instructor data is limited to name and
+avatar. Non-published slugs return `404`.
 

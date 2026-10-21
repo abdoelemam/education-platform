@@ -4,6 +4,10 @@ import { AppError } from '../../errors/index.js';
 import { AUTH_ERRORS } from '../auth/auth.constants.js';
 import type { AuthUser } from '../users/user.types.js';
 import {
+  userRepository,
+  type UserRepository,
+} from '../users/user.repository.js';
+import {
   videoRepository,
   type VideoRepository,
 } from '../videos/video.repository.js';
@@ -33,8 +37,20 @@ import {
   type LessonRepository,
   type LessonUpdate,
 } from './lesson.repository.js';
-import { toCourseDetail, toManagedCourse } from './course.mapper.js';
+import {
+  toCatalogCourse,
+  toCatalogCourseDetail,
+  toCourseDetail,
+  toManagedCourse,
+} from './course.mapper.js';
+import {
+  collectPublishIssues,
+  type PublishVideoState,
+} from './course.publish-rules.js';
 import type {
+  CatalogCourse,
+  CatalogCourseDetail,
+  CatalogInstructor,
   CourseDetail,
   CourseDocument,
   CourseStatus,
@@ -54,12 +70,26 @@ import type {
 /** Maximum length of the base slug before a uniqueness suffix is appended. */
 const SLUG_BASE_MAX = COURSE_SLUG_MAX - 20;
 
+/**
+ * Fallback instructor card when the owning user record is no longer present.
+ * Publishing requires an owner, but historical catalog rows should still render.
+ */
+const UNKNOWN_INSTRUCTOR: CatalogInstructor = { name: 'Unknown instructor' };
+
 export interface PaginatedCourses {
   /**
-   * Owner/admin course-management items. A future public catalog must use the
-   * review-free `PublicCourse` mapper instead.
+   * Owner/admin course-management items. The public catalog uses the separate
+   * `CatalogCourse` mapper, which excludes review and ownership internals.
    */
   items: ManagedCourse[];
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface PaginatedCatalog {
+  items: CatalogCourse[];
   page: number;
   limit: number;
   total: number;
@@ -148,6 +178,7 @@ export class CourseService {
     private readonly sectionRepo: SectionRepository = sectionRepository,
     private readonly lessonRepo: LessonRepository = lessonRepository,
     private readonly videoRepo: VideoRepository = videoRepository,
+    private readonly userRepo: UserRepository = userRepository,
   ) {}
 
   // -------------------------------------------------------------------------
@@ -247,6 +278,48 @@ export class CourseService {
             unset.push('description');
           } else {
             update.description = params.input.description;
+          }
+        }
+
+        if (params.input.thumbnailUrl !== undefined) {
+          if (params.input.thumbnailUrl === null) {
+            unset.push('thumbnailUrl');
+          } else {
+            update.thumbnailUrl = params.input.thumbnailUrl;
+          }
+        }
+
+        if (params.input.level !== undefined) {
+          if (params.input.level === null) {
+            unset.push('level');
+          } else {
+            update.level = params.input.level;
+          }
+        }
+
+        if (params.input.language !== undefined) {
+          if (params.input.language === null) {
+            unset.push('language');
+          } else {
+            update.language = params.input.language;
+          }
+        }
+
+        if (params.input.learningOutcomes !== undefined) {
+          update.learningOutcomes = params.input.learningOutcomes;
+        }
+
+        if (params.input.requirements !== undefined) {
+          update.requirements = params.input.requirements;
+        }
+
+        if (params.input.priceMinor !== undefined) {
+          if (params.input.priceMinor === null) {
+            unset.push('priceMinor', 'currency');
+          } else {
+            update.priceMinor = params.input.priceMinor;
+            // Zod guarantees both fields are present together.
+            update.currency = params.input.currency ?? undefined;
           }
         }
 
@@ -378,8 +451,8 @@ export class CourseService {
 
   /**
    * Admin approves a `pending_review` submission. Approval is a review
-   * outcome, not publication: `approved` → `published` belongs to a later
-   * phase.
+   * outcome, not publication: the owner must publish separately (`approved` →
+   * `published`).
    */
   async approveCourse(params: {
     courseId: string;
@@ -439,6 +512,110 @@ export class CourseService {
     }
 
     return this.buildDetail(updated);
+  }
+
+  // -------------------------------------------------------------------------
+  // Publishing + public catalog
+  // -------------------------------------------------------------------------
+
+  /**
+   * Owner publishes an approved course.
+   *
+   * Approval is a review outcome; publication is a separate owner decision.
+   * Publishing validates completeness against committed content only, requires
+   * the content-edit lease to be free, and transitions with a compare-and-set so
+   * a stale request cannot publish a later or already-published state.
+   */
+  async publishCourse(params: {
+    courseId: string;
+    requester: AuthUser;
+  }): Promise<CourseDetail> {
+    const course = await this.requireCourseOwner(params.courseId, params.requester);
+    this.assertTransition(course.status, 'published');
+
+    if (course.editLocked && !this.isEditLockStale(course)) {
+      throw this.editInProgressError();
+    }
+
+    const courseId = course._id.toString();
+    const [sections, lessons] = await Promise.all([
+      this.sectionRepo.listByCourse(courseId),
+      this.lessonRepo.listByCourse(courseId),
+    ]);
+    const videos = await this.loadPublishVideoStates(lessons);
+
+    const issues = collectPublishIssues({
+      course,
+      sections,
+      lessons,
+      videos,
+    });
+
+    if (issues.length > 0) {
+      throw new AppError(
+        422,
+        COURSE_ERRORS.COURSE_NOT_PUBLISHABLE,
+        'The course does not meet the publishing requirements',
+        { reasons: issues },
+      );
+    }
+
+    const published = await this.transitionToPublished(course);
+
+    return this.buildDetail(published);
+  }
+
+  /**
+   * Public catalog: published courses only, newest publication first.
+   */
+  async listPublishedCourses(params: {
+    page: number;
+    limit: number;
+  }): Promise<PaginatedCatalog> {
+    const skip = (params.page - 1) * params.limit;
+    const { items, total } = await this.courseRepo.listPublished({
+      skip,
+      limit: params.limit,
+    });
+    const instructors = await this.loadInstructors(items);
+
+    return {
+      items: items.map((course) =>
+        toCatalogCourse(
+          course,
+          instructors.get(course.ownerId.toString()) ?? UNKNOWN_INSTRUCTOR,
+        ),
+      ),
+      page: params.page,
+      limit: params.limit,
+      total,
+      totalPages: params.limit > 0 ? Math.ceil(total / params.limit) : 0,
+    };
+  }
+
+  /**
+   * Public course detail by slug. Non-published courses are reported as not
+   * found so their existence is not leaked.
+   */
+  async getPublishedCourseBySlug(slug: string): Promise<CatalogCourseDetail> {
+    const course = await this.courseRepo.findPublishedBySlug(slug);
+    if (!course) {
+      throw new AppError(404, COURSE_ERRORS.COURSE_NOT_FOUND, 'Course not found');
+    }
+
+    const courseId = course._id.toString();
+    const [sections, lessons, instructors] = await Promise.all([
+      this.sectionRepo.listByCourse(courseId),
+      this.lessonRepo.listByCourse(courseId),
+      this.loadInstructors([course]),
+    ]);
+
+    return toCatalogCourseDetail(
+      course,
+      instructors.get(course.ownerId.toString()) ?? UNKNOWN_INSTRUCTOR,
+      sections,
+      lessons,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -1085,6 +1262,119 @@ export class CourseService {
   }
 
   /**
+   * Move an approved course to `published` with a compare-and-set that also
+   * requires the content-edit lease to be free. Stale leases are recovered the
+   * same way as submission, so a crash cannot block publishing forever.
+   */
+  private async transitionToPublished(
+    course: CourseDocument,
+  ): Promise<CourseDocument> {
+    const courseId = course._id.toString();
+    const fromStatus = course.status;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const updated = await this.courseRepo.transitionStatusIfIdle(
+        courseId,
+        [fromStatus],
+        {
+          status: 'published',
+          publishedAt: new Date(),
+        },
+        [],
+        this.submissionGuard(course),
+      );
+
+      if (updated) {
+        return updated;
+      }
+
+      const current = await this.requireCourse(courseId);
+
+      if (
+        current.status !== fromStatus ||
+        this.submissionIdentityChanged(course, current)
+      ) {
+        throw this.concurrentTransitionError();
+      }
+
+      if (!current.editLocked) {
+        continue;
+      }
+
+      if (!this.isEditLockStale(current)) {
+        throw this.editInProgressError();
+      }
+
+      const cleared = await this.courseRepo.clearStaleEditLock(
+        courseId,
+        [fromStatus],
+        this.editLockCutoff(),
+      );
+      if (!cleared) {
+        continue;
+      }
+    }
+
+    throw this.editInProgressError();
+  }
+
+  /**
+   * Resolve every video referenced by the course. Missing or foreign videos are
+   * left out of the map so the readiness rules report VIDEO_NOT_READY.
+   */
+  private async loadPublishVideoStates(
+    lessons: LessonDocument[],
+  ): Promise<Map<string, PublishVideoState>> {
+    const videoIds = [
+      ...new Set(
+        lessons
+          .filter((lesson) => lesson.type === 'video' && lesson.videoId)
+          .map((lesson) => lesson.videoId!.toString()),
+      ),
+    ];
+
+    const states = new Map<string, PublishVideoState>();
+    const videos = await Promise.all(
+      videoIds.map((videoId) => this.videoRepo.findById(videoId)),
+    );
+
+    for (const video of videos) {
+      if (!video) {
+        continue;
+      }
+      states.set(video._id.toString(), {
+        ownerId: video.ownerId.toString(),
+        processingStatus: video.processingStatus,
+        playbackUrl: video.playbackUrl,
+      });
+    }
+
+    return states;
+  }
+
+  /**
+   * Load only display-safe instructor fields for catalog rows.
+   */
+  private async loadInstructors(
+    courses: CourseDocument[],
+  ): Promise<Map<string, CatalogInstructor>> {
+    const ownerIds = [
+      ...new Set(courses.map((course) => course.ownerId.toString())),
+    ];
+    if (ownerIds.length === 0) {
+      return new Map();
+    }
+
+    const users = await this.userRepo.findPublicByIds(ownerIds);
+    return new Map(
+      users.map((user) => [
+        user._id.toString(),
+        { name: user.name, avatar: user.avatar },
+      ]),
+    );
+  }
+
+  /**
    * Move a draft or rejected course to `pending_review`, but only while no
    * content edit is in flight. A concurrent submission or status change is
    * reported as a conflict rather than retried blindly, which prevents a stale
@@ -1092,8 +1382,7 @@ export class CourseService {
    */
   private async transitionToPendingReview(
     course: CourseDocument,
-  ): Promise<CourseDocument> {
-    const courseId = course._id.toString();
+  ): Promise<CourseDocument> {    const courseId = course._id.toString();
     const fromStatus = course.status;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1211,8 +1500,8 @@ export class CourseService {
   }
 
   /**
-   * Submission is strictly an owner action; the admin ownership bypass does
-   * not apply here.
+   * Publishing is strictly an owner action; the admin ownership bypass does not
+   * apply here (nor to submission).
    */
   private async requireCourseOwner(
     courseId: string,
@@ -1224,7 +1513,7 @@ export class CourseService {
       throw new AppError(
         403,
         COURSE_ERRORS.COURSE_FORBIDDEN,
-        'Only the course owner can submit it for review',
+        'Only the course owner can perform this action',
       );
     }
 

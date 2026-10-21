@@ -1,9 +1,17 @@
 import { z } from 'zod';
 import {
   COURSE_DESCRIPTION_MAX,
+  COURSE_LANGUAGE_MAX,
+  COURSE_LEARNING_OUTCOME_MAX,
+  COURSE_LEARNING_OUTCOMES_MAX_COUNT,
   COURSE_PAGE_DEFAULT_LIMIT,
   COURSE_PAGE_MAX_LIMIT,
+  COURSE_PRICE_MINOR_MAX,
   COURSE_REJECTION_REASON_MAX,
+  COURSE_REQUIREMENT_MAX,
+  COURSE_REQUIREMENTS_MAX_COUNT,
+  COURSE_SLUG_MAX,
+  COURSE_THUMBNAIL_URL_MAX,
   COURSE_TITLE_MAX,
   LESSON_DESCRIPTION_MAX,
   LESSON_DOCUMENT_URL_MAX,
@@ -12,34 +20,20 @@ import {
   SECTION_DESCRIPTION_MAX,
   SECTION_TITLE_MAX,
 } from './course.constants.js';
-import { COURSE_STATUSES, LESSON_TYPES } from './course.types.js';
+import {
+  COURSE_LEVELS,
+  COURSE_STATUSES,
+  LESSON_TYPES,
+} from './course.types.js';
+import {
+  isValidCurrency,
+  isValidHttpUrl,
+  isValidLanguage,
+} from './course.validators.js';
 
 const OBJECT_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
 const objectId = (label: string) =>
   z.string().regex(OBJECT_ID_PATTERN, `Invalid ${label}`);
-
-/**
- * Accept only absolute http(s) URLs with a usable host.
- *
- * The prefix check requires the canonical `//` form and rejects other schemes.
- * The WHATWG parser then rejects malformed input that a prefix-only check would
- * let through, such as `https://`, invalid hosts or out-of-range ports.
- */
-function isValidHttpUrl(value: string): boolean {
-  if (!/^https?:\/\//i.test(value)) {
-    return false;
-  }
-
-  try {
-    const url = new URL(value);
-    return (
-      (url.protocol === 'http:' || url.protocol === 'https:') &&
-      /[a-z0-9]/i.test(url.hostname)
-    );
-  } catch {
-    return false;
-  }
-}
 
 const title = (max: number) =>
   z
@@ -66,6 +60,63 @@ const documentUrlSchema = z
     message: 'Document URL must be a valid http(s) URL',
   });
 
+const thumbnailUrlSchema = z
+  .string()
+  .trim()
+  .max(
+    COURSE_THUMBNAIL_URL_MAX,
+    `Thumbnail URL cannot exceed ${COURSE_THUMBNAIL_URL_MAX} characters`,
+  )
+  .refine(isValidHttpUrl, {
+    message: 'Thumbnail URL must be a valid http(s) URL',
+  });
+
+const languageSchema = z
+  .string()
+  .trim()
+  .min(2, 'Language must be a language code such as "ar" or "en-US"')
+  .max(COURSE_LANGUAGE_MAX)
+  .refine(isValidLanguage, {
+    message: 'Language must be a language code such as "ar" or "en-US"',
+  });
+
+const levelSchema = z.enum(COURSE_LEVELS);
+
+const outcomeSchema = z
+  .string()
+  .trim()
+  .min(1, 'Learning outcomes cannot be empty')
+  .max(
+    COURSE_LEARNING_OUTCOME_MAX,
+    `A learning outcome cannot exceed ${COURSE_LEARNING_OUTCOME_MAX} characters`,
+  );
+
+const requirementSchema = z
+  .string()
+  .trim()
+  .min(1, 'Requirements cannot be empty')
+  .max(
+    COURSE_REQUIREMENT_MAX,
+    `A requirement cannot exceed ${COURSE_REQUIREMENT_MAX} characters`,
+  );
+
+const priceMinorSchema = z
+  .number()
+  .int('Price must be an integer amount in minor units')
+  .min(0, 'Price cannot be negative')
+  .max(
+    COURSE_PRICE_MINOR_MAX,
+    `Price cannot exceed ${COURSE_PRICE_MINOR_MAX}`,
+  );
+
+const currencySchema = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .refine(isValidCurrency, {
+    message: 'Currency must be a valid ISO 4217 code',
+  });
+
 // ---------------------------------------------------------------------------
 // Course
 // ---------------------------------------------------------------------------
@@ -81,6 +132,52 @@ export const updateCourseSchema = z
   .object({
     title: title(COURSE_TITLE_MAX).optional(),
     description: description(COURSE_DESCRIPTION_MAX),
+    thumbnailUrl: thumbnailUrlSchema.nullable().optional(),
+    level: levelSchema.nullable().optional(),
+    language: languageSchema.nullable().optional(),
+    learningOutcomes: z
+      .array(outcomeSchema)
+      .max(
+        COURSE_LEARNING_OUTCOMES_MAX_COUNT,
+        `A course cannot have more than ${COURSE_LEARNING_OUTCOMES_MAX_COUNT} learning outcomes`,
+      )
+      .optional(),
+    requirements: z
+      .array(requirementSchema)
+      .max(
+        COURSE_REQUIREMENTS_MAX_COUNT,
+        `A course cannot have more than ${COURSE_REQUIREMENTS_MAX_COUNT} requirements`,
+      )
+      .optional(),
+    priceMinor: priceMinorSchema.nullable().optional(),
+    currency: currencySchema.nullable().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const priceProvided = data.priceMinor !== undefined;
+    const currencyProvided = data.currency !== undefined;
+
+    if (priceProvided !== currencyProvided) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [priceProvided ? 'currency' : 'priceMinor'],
+        message: 'priceMinor and currency must be provided together',
+      });
+      return;
+    }
+
+    if (!priceProvided) {
+      return;
+    }
+
+    const priceCleared = data.priceMinor === null;
+    const currencyCleared = data.currency === null;
+    if (priceCleared !== currencyCleared) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [priceCleared ? 'currency' : 'priceMinor'],
+        message: 'priceMinor and currency must be cleared together',
+      });
+    }
   })
   .refine((data) => Object.keys(data).length > 0, {
     message: 'Provide at least one field to update',
@@ -99,6 +196,28 @@ export const listCoursesQuerySchema = z.object({
 });
 
 export type ListCoursesQuery = z.infer<typeof listCoursesQuerySchema>;
+
+/**
+ * Public catalog pagination. Search, filters and sorting belong to the course
+ * discovery phase and intentionally are not accepted yet.
+ */
+export const publicCatalogQuerySchema = listCoursesQuerySchema;
+
+export type PublicCatalogQuery = z.infer<typeof publicCatalogQuerySchema>;
+
+export const publicCourseSlugParamSchema = z.object({
+  slug: z
+    .string()
+    .trim()
+    .min(1, 'Slug is required')
+    .max(COURSE_SLUG_MAX)
+    .regex(
+      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+      'Invalid course slug',
+    ),
+});
+
+export type PublicCourseSlugParam = z.infer<typeof publicCourseSlugParamSchema>;
 
 // ---------------------------------------------------------------------------
 // Teacher Workflow / moderation

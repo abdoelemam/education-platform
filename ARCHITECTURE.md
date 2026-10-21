@@ -342,11 +342,12 @@ draft ──owner submit──▶ pending_review ──admin approve──▶ ap
 
 * Submission is owner-only; admins cannot submit on a teacher's behalf.
 * Approval/rejection is admin-only and only valid from `pending_review`.
-* `approved` means "review approved", not published. Publishing
-  (`approved` → `published`) and archiving are later phases.
-* Content edits are allowed only in `draft` or `rejected`. A submitted or
-  approved course is frozen so the reviewed version cannot change underneath
-  the reviewer.
+* `approved` means "review approved", not published. The owner publishes it
+  separately (`approved` → `published`) after server-side completeness
+  validation.
+* Content edits are allowed only in `draft` or `rejected`. A submitted,
+  approved or published course is frozen so the reviewed version cannot change
+  underneath the reviewer or students.
 * Every content mutation claims an exclusive per-course edit lease in MongoDB
   before writing and releases it afterwards. Acquisition stamps the token and
   database-time expiry onto every existing section/lesson. Every course,
@@ -379,6 +380,40 @@ draft ──owner submit──▶ pending_review ──admin approve──▶ ap
   `/api/admin/courses`; all review mutations require CSRF.
 
 The full HTTP contract is documented in [`docs/course-builder.md`](docs/course-builder.md).
+
+## Publishing and Public Catalog Notes
+
+```text
+approved ──owner publish + completeness validation──▶ published
+                              │
+                              ▼
+                     GET /api/courses
+                     GET /api/courses/:slug
+```
+
+* Publishing is a separate owner action from admin approval. Admins cannot
+  publish on a teacher's behalf.
+* Completeness is validated on the backend against committed sections/lessons
+  only. Missing metadata, empty sections, invalid lesson payloads and videos that
+  are not provider-ready block publication with `422 COURSE_NOT_PUBLISHABLE` and
+  machine-readable `details.reasons`.
+* The transition is a compare-and-set on `approved`, pinned to the reviewed
+  `submittedAt`, and requires the content-edit lease to be free. A stale or
+  abandoned lease is recovered like submission.
+* `published` is terminal in this phase. Archive, unpublish and a
+  post-publication edit/re-review flow remain later phases.
+* The public catalog reads published courses only and exposes metadata plus a
+  curriculum outline. Lesson bodies, video ids, document URLs and playback
+  references are never returned: protected content requires the Enrollment and
+  Course Player authorization boundary.
+* Instructor data in the catalog is limited to display name and avatar.
+* `priceMinor` (integer minor units) and `currency` are publication metadata.
+  Payments, coupons and enrollment are separate phases and no revenue is derived
+  from the current price.
+* Category is not required to publish until the Category phase exists.
+
+The full publishing contract is documented in
+[`docs/course-publishing.md`](docs/course-publishing.md).
 
 ---
 

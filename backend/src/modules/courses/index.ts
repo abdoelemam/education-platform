@@ -3,6 +3,10 @@ export {
   adminCourseRoutes,
   createAdminCourseRouter,
 } from './admin-course.routes.js';
+export {
+  publicCourseRoutes,
+  createPublicCourseRouter,
+} from './public-course.routes.js';
 export { courseController, CourseController } from './course.controller.js';
 export { courseService, CourseService } from './course.service.js';
 export {

@@ -12,7 +12,11 @@ import { healthRoutes } from './modules/health/index.js';
 import { authRoutes } from './modules/auth/index.js';
 import { createVideoRouter } from './modules/videos/index.js';
 import type { VideoService } from './modules/videos/index.js';
-import { createCourseRouter, createAdminCourseRouter } from './modules/courses/index.js';
+import {
+  createCourseRouter,
+  createAdminCourseRouter,
+  createPublicCourseRouter,
+} from './modules/courses/index.js';
 import type { CourseService } from './modules/courses/index.js';
 
 export interface CreateAppOptions {
@@ -68,6 +72,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.use('/api/teacher/videos', createVideoRouter(options.videoService));
   app.use('/api/teacher/courses', createCourseRouter(options.courseService));
   app.use('/api/admin/courses', createAdminCourseRouter(options.courseService));
+  app.use('/api/courses', createPublicCourseRouter(options.courseService));
 
   // Future module routes will be registered here:
   // app.use('/api/auth', authRoutes);
