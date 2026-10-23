@@ -1,7 +1,8 @@
-# Category Backend Foundation
+# Categories
 
-Status: backend complete. Course ↔ category linking, catalog filtering and the
-publishing requirement are a separate phase/PR.
+Status: backend complete, including course ↔ category linking, catalog category
+filtering, the approval/publish-time category requirement, and the admin
+category-only repair path.
 
 ## Purpose
 
@@ -13,9 +14,9 @@ Programming
     └── React
 ```
 
-This phase provides the category graph, admin management and a public active
-tree. It does **not** add `categoryId` to courses, filter the catalog, or make a
-category mandatory at publish time.
+The platform provides the category graph, admin management, a public active tree,
+and an optional `categoryId` reference on courses. A category is validated when a
+course references it and is required when the owner publishes the course.
 
 ## Data Model
 
@@ -32,9 +33,16 @@ category mandatory at publish time.
 | `createdAt` / `updatedAt` | Date | Mongoose timestamps |
 
 Internal-only fields (`committed`, `mutationToken`, `fenceGeneration`,
-`leaseExpiresAt`) implement staged creation and the tree-mutation fence. They are
-never mapped to API responses. Legacy rows with no `committed` field are treated
-as committed.
+`leaseExpiresAt`, `courseRefs`, `protectedCourseRefs`) implement staged creation,
+the tree-mutation fence and course-reference membership. They are never mapped to
+API responses. Legacy rows with no `committed` field are treated as committed.
+
+`courseRefs` contains every course directly assigned to the category.
+`protectedCourseRefs` is the subset belonging to approved/published courses and is
+copied to every ancestor of the assigned category. Reference writes happen before
+the corresponding course write. An atomic category delete filter requires both
+arrays to be empty; a deactivation/move filter requires no protected reference on
+the affected node. These guards are independent of the 30-second lease expiry.
 
 Indexes:
 
@@ -99,6 +107,88 @@ Ordering is `sortOrder` ascending, then `name`, at every level. The tree builder
 is defensive: a missing parent or a cycle inserted directly into the database is
 omitted rather than causing infinite recursion.
 
+## Course ↔ Category Integration
+
+`Course.categoryId` is an optional reference to `Category`. It is absent on
+legacy courses and on drafts created without a category.
+
+| Course operation | Category behavior |
+| --- | --- |
+| Create | Optional. When supplied, the id must reference a committed category. |
+| Update | Optional. A supplied id must reference a committed category; `null` clears it. |
+| Submit for review | No category requirement. |
+| Approve | Required. The category and every ancestor must be committed and active. |
+| Publish | Required. The category and every ancestor must be active. |
+| Admin category repair | Allowed only for `approved` courses that are not yet published; changes only `categoryId`. |
+| Public catalog | Cards and details expose `{ id, name, slug }` for a publicly visible category, otherwise `null`. |
+
+Category existence is validated under the category tree lock when a course
+references it. Activity is not required for a draft: an inactive category may be
+assigned, and approval/publishing fails later if the category or an ancestor is
+inactive. Clearing a category does not take the category lock because it cannot
+leave a dangling reference; the old reference is removed after the fenced course
+write.
+
+The lock order is:
+
+```text
+course edit lease (when the operation edits a course)
+   ↓
+category tree lock (only when categoryId is assigned or published)
+```
+
+Publishing and approval hold the category tree lock through their compare-and-set,
+but do not hold a course edit lease. Category operations never acquire a course
+lease, so the order cannot cycle. Category lock acquisition is non-blocking: a
+competing tree mutation returns `409 CATEGORY_BUSY` instead of waiting. Course
+edits that do not change `categoryId`, course creates without a category, and
+ordinary course reads never touch the category lock.
+
+The lock is not the only protection for course category membership. Course
+references are written to the category document before the course row and are
+checked atomically by category delete/deactivate/move:
+
+- approval and publishing add a protected reference to the target category and
+  every ancestor before their course CAS. Any later hide/move of that branch must
+  fail, even if the original 30-second lease has expired.
+- create/update add a normal reference before the course write. The category
+  delete filter requires both reference arrays to be empty, so either the
+  reference wins and the delete returns `409 CATEGORY_IN_USE`, or the delete wins
+  and the reference write fails with `409 COURSE_CATEGORY_CONFLICT`.
+- the category path is re-read after the protected reference is written. A stale
+  writer that lost its lease while a concurrent move changed the path fails
+  closed instead of approving/protecting the wrong branch.
+
+Failure semantics: a process crash after the reference write but before the course
+write/rollback can leave a reference with no matching course. This only over-blocks
+category deletion/deactivation/move; it never creates a course under a hidden or
+missing category. Clearing such a stale membership requires an operational
+cleanup because no public API mutates reference arrays directly.
+
+Referential rules:
+
+- Deleting a category is blocked by **any** course reference, regardless of
+  course status, via `409 CATEGORY_IN_USE`.
+- Deactivating a category or moving it under a hidden branch is blocked when the
+  affected subtree contains `approved` or `published` courses.
+- An unknown category id on create/update returns
+  `422 COURSE_CATEGORY_NOT_FOUND` and leaves the course unchanged.
+- The public catalog filters by a category slug and includes descendants by
+  default. Unknown or hidden categories return `404 CATEGORY_NOT_FOUND` so
+  unpublished taxonomy is not leaked.
+
+### Legacy data
+
+Existing published courses without a category remain visible and return
+`category: null`. No backfill or migration is performed.
+
+A course that was already `approved` before this integration, and has no
+category, cannot publish. It also remains frozen for ordinary content edits, but
+an admin can use the category-only repair endpoint below. That endpoint requires a
+valid, publicly visible category, changes only `categoryId`, preserves content
+and review metadata, and refuses published courses. Approval also now requires a
+valid category, so new courses cannot enter this state.
+
 ## Admin API
 
 All routes require an authenticated user with `role = "admin"`. State-changing
@@ -111,6 +201,7 @@ routes also require the `X-CSRF-Token` header.
 | `GET` | `/api/admin/categories/:categoryId` | Get one category |
 | `PATCH` | `/api/admin/categories/:categoryId` | Update name/description/parent/active/order |
 | `DELETE` | `/api/admin/categories/:categoryId` | Delete an unused leaf category |
+| `PATCH` | `/api/admin/courses/:courseId/category` | Category-only repair for an approved, unpublished course |
 
 Create body:
 
@@ -149,6 +240,28 @@ The admin response includes management fields:
 }
 ```
 
+### Approved-course category repair
+
+`PATCH /api/admin/courses/:courseId/category`
+
+```json
+{
+  "categoryId": "665f…"
+}
+```
+
+The body is strict: `categoryId` is the only accepted field. The course must be
+`approved` and unpublished; content, review metadata, submission timestamps, and
+publish state are never modified. The category must exist and have an active
+ancestor chain. The update is a compare-and-set on `status: "approved"`,
+`publishedAt` absent, and the previously inspected category, so concurrent
+repairs cannot both succeed (`409 INVALID_STATUS_TRANSITION`). A concurrent
+category delete/move/deactivation is handled by the same reference guards used by
+approval and publishing.
+
+This endpoint exists specifically to repair legacy or historically damaged
+approved courses without weakening the rule that approved content is frozen.
+
 ## Hierarchy Rules
 
 - A category cannot be its own parent.
@@ -157,7 +270,7 @@ The admin response includes management fields:
   subtree would exceed the cap.
 - A parent must exist.
 - Parent changes that would hide a branch containing `approved` or `published`
-  courses are rejected once course references exist.
+  courses are rejected.
 - Deactivation is rejected when the subtree contains `approved` or `published`
   courses.
 
@@ -257,8 +370,14 @@ restored while no committed row supplies a generation floor would require
 transactions on a replica set or a durable, non-resettable generation allocator;
 the current design does not claim that case.
 
-The lock protects category writes. Course writes that change category membership
-must participate in the same boundary when the course-category phase lands.
+The lock protects category writes. Course operations that change category
+membership participate in the same boundary: they hold the course edit lease
+first and this lease second, while approval/publishing acquire only this lease.
+Category operations never acquire a course lease. Course-reference membership is
+the durable backstop when the 30-second category lease expires between validation
+and a course write: the reference is written before the course row and the
+category's delete/deactivate/move filters consume it atomically. See
+[Course ↔ Category Integration](#course--category-integration).
 
 ## Deletion Rules
 
@@ -268,22 +387,28 @@ A category can be deleted only when:
 2. no course references it.
 
 Deletion uses `409 CATEGORY_HAS_CHILDREN` or `409 CATEGORY_IN_USE` otherwise.
-The course-reference check is already present and queries the `courses`
-collection for `categoryId`, so the rule becomes effective as soon as the
-course-category PR starts writing that field.
+The authoritative guard is the category's `courseRefs`/`protectedCourseRefs`
+membership, checked in the same single-document delete as the fence. A legacy
+Course row with `categoryId` but no reference is also checked before deletion.
+Both apply to every course status and prevent deleting a category out from under
+a draft.
 
-That forward-looking query deliberately does not add `categoryId` to the Course
-model in this phase. The course-category PR must add a `courses.categoryId`
-index for the guard and decide whether course writes that change category
-membership participate in the category lock. Until then, the guard is correct
-for any references written by future code, but it is not a substitute for that
-integration work.
+Deactivation and moves that would hide a branch use the same protected-reference
+rule for `approved`/`published` courses. Protected references are copied to every
+ancestor, so hiding or moving any node in the path fails atomically. A draft may
+keep an inactive category; approval and publishing re-validate the full ancestor
+chain. The `courses.categoryId` index supports legacy-row checks and the filtered
+public catalog.
 
 ## Error Codes
 
 | Code | HTTP | Meaning |
 | --- | --- | --- |
-| `CATEGORY_NOT_FOUND` | 404 | Category id does not exist |
+| `CATEGORY_NOT_FOUND` | 404 | Category id does not exist, or a catalog filter names an unknown/hidden category |
+| `COURSE_CATEGORY_NOT_FOUND` | 422 | Course create/update references a category that does not exist |
+| `COURSE_CATEGORY_INACTIVE` | 422 | Admin repair targets an inactive category or one with an inactive ancestor |
+| `COURSE_CATEGORY_CONFLICT` | 409 | Category reference/path changed while a course category operation was running |
+| `COURSE_NOT_APPROVABLE` | 422 | Approval requires a committed category with an active ancestor chain |
 | `CATEGORY_PARENT_NOT_FOUND` | 422 | Parent id does not exist |
 | `CATEGORY_CYCLE` | 409 | Self-parent or move under a descendant |
 | `CATEGORY_MAX_DEPTH` | 422 | Depth cap would be exceeded |
@@ -329,10 +454,36 @@ integration work.
 - cleanup preserves a newer staged row while its lease is still valid
 - cycle safety against corrupt data
 
+`backend/tests/course-category.test.ts` adds 32 integration tests covering:
+
+- create/update category assignment, replacement, clearing and normalization
+- unknown/malformed references and ownership enforcement
+- inactive category assignment on drafts and approval/publish-time rejection,
+  including an inactive ancestor
+- approval rejection when the category is missing, inactive, or has an inactive
+  ancestor
+- category-required publishing for approved courses whose category was removed
+- admin category-only repair, including a legacy approved/no-category course
+- admin assignment authorization, CSRF, strict body validation, invalid targets,
+  pending/published rejection, content preservation and old-reference cleanup
+- missing references, publish-vs-category-mutation locking and legacy published
+  `category: null`
+- catalog filtering by parent/child/grandchild, pagination, hidden/unknown
+  filters and hidden historical categories
+- deletion/deactivation guards against course references
+- lock scoping: unrelated course edits and category-free creates are not
+  serialized
+- deterministic lease-expiry races: approval before/after protected references,
+  publish vs deactivate, draft assignment vs delete, create vs delete, and admin
+  assignment vs delete/move/deactivate. Mutations are blocked by durable
+  references even after the category lease is expired.
+
 ## Deferred
 
-- `Course.categoryId`, teacher assignment and catalog `?category=` filtering
-- category required at publish time
+- backfill for pre-existing approved courses that have no category (the
+  category-only admin repair endpoint is available; bulk/automatic backfill is
+  not)
 - category thumbnail/icon and translations
 - drag-and-drop ordering UI (the backend `sortOrder` contract exists)
 - frontend category administration and public navigation
+- search/filter combinations beyond the single category-slug filter

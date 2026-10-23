@@ -7,6 +7,7 @@ import { UserModel } from '../src/modules/users/user.model.js';
 import { RefreshTokenModel } from '../src/modules/auth/refresh-token.model.js';
 import { VideoModel } from '../src/modules/videos/video.model.js';
 import { CourseModel } from '../src/modules/courses/course.model.js';
+import { CategoryModel } from '../src/modules/categories/category.model.js';
 import { SectionModel } from '../src/modules/courses/section.model.js';
 import { LessonModel } from '../src/modules/courses/lesson.model.js';
 import {
@@ -158,6 +159,7 @@ const PUBLISH_METADATA = {
 
 describe('Course Publishing Integration Tests', () => {
   const app = createApp();
+  let defaultCategoryId: string;
 
   beforeAll(async () => {
     assertSafeTestDatabase();
@@ -175,6 +177,7 @@ describe('Course Publishing Integration Tests', () => {
     await RefreshTokenModel.deleteMany({});
     await VideoModel.deleteMany({});
     await CourseModel.deleteMany({});
+    await CategoryModel.deleteMany({});
     await SectionModel.deleteMany({});
     await LessonModel.deleteMany({});
     await mongoose.disconnect();
@@ -186,8 +189,16 @@ describe('Course Publishing Integration Tests', () => {
     await RefreshTokenModel.deleteMany({});
     await VideoModel.deleteMany({});
     await CourseModel.deleteMany({});
+    await CategoryModel.deleteMany({});
     await SectionModel.deleteMany({});
     await LessonModel.deleteMany({});
+
+    const category = await CategoryModel.create({
+      name: 'Publishing Category',
+      slug: 'publishing-category',
+      isActive: true,
+    });
+    defaultCategoryId = category._id.toString();
   });
 
   // ---------------------------------------------------------------------------
@@ -396,7 +407,17 @@ describe('Course Publishing Integration Tests', () => {
     );
 
     if (options.metadata !== false) {
-      const patch = await patchCourse(teacher, course.id, PUBLISH_METADATA);
+      const patch = await patchCourse(teacher, course.id, {
+        ...PUBLISH_METADATA,
+        categoryId: defaultCategoryId,
+      });
+      expect(patch.status).toBe(200);
+    } else {
+      // Approval requires a valid category even when the rest of the metadata
+      // is intentionally missing for a completeness test.
+      const patch = await patchCourse(teacher, course.id, {
+        categoryId: defaultCategoryId,
+      });
       expect(patch.status).toBe(200);
     }
 
@@ -701,6 +722,9 @@ describe('Course Publishing Integration Tests', () => {
         COURSE_PUBLISH_ISSUES.SECTIONS_REQUIRED,
       ]),
     );
+    expect(res.body.error.details.reasons).not.toContain(
+      COURSE_PUBLISH_ISSUES.CATEGORY_REQUIRED,
+    );
 
     const stored = await CourseModel.findById(course.id).exec();
     expect(stored?.status).toBe('approved');
@@ -948,7 +972,10 @@ describe('Course Publishing Integration Tests', () => {
     const teacher = await registerApprovedTeacher('order@test.com');
     const admin = await createAdmin('order-admin@test.com');
     const course = await createCourse(teacher);
-    await patchCourse(teacher, course.id, PUBLISH_METADATA);
+    await patchCourse(teacher, course.id, {
+      ...PUBLISH_METADATA,
+      categoryId: defaultCategoryId,
+    });
     const section = await addSection(teacher, course.id);
     await addTextLesson(teacher, course.id, section.id);
     await submitForReview(teacher, course.id);

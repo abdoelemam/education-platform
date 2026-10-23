@@ -9,6 +9,7 @@ import { asyncHandler } from '../../utils/async-handler.js';
 import { CourseController } from './course.controller.js';
 import { courseService, type CourseService } from './course.service.js';
 import {
+  assignCourseCategorySchema,
   courseIdParamSchema,
   listReviewCoursesQuerySchema,
   rejectCourseSchema,
@@ -56,6 +57,18 @@ export function createAdminCourseRouter(
     verifyCsrfToken,
     validate({ params: courseIdParamSchema, body: rejectCourseSchema }),
     asyncHandler(controller.reject),
+  );
+
+  // Category-only repair for an approved but unpublished course. This is not a
+  // general edit endpoint and cannot change content, status, or publish state.
+  router.patch(
+    '/:courseId/category',
+    verifyCsrfToken,
+    validate({
+      params: courseIdParamSchema,
+      body: assignCourseCategorySchema,
+    }),
+    asyncHandler(controller.assignCategory),
   );
 
   return router;

@@ -75,6 +75,21 @@ const categorySchema = new Schema<CategoryDocument>(
       type: Date,
       default: undefined,
     },
+    /**
+     * Course-reference membership. `courseRefs` blocks deletion; the protected
+     * subset blocks hiding/moving a branch that contains a protected course.
+     * Both are internal and never exposed by the API.
+     */
+    courseRefs: {
+      type: [Schema.Types.ObjectId],
+      ref: 'Course',
+      default: undefined,
+    },
+    protectedCourseRefs: {
+      type: [Schema.Types.ObjectId],
+      ref: 'Course',
+      default: undefined,
+    },
   },
   {
     timestamps: true,

@@ -92,8 +92,9 @@ Teacher approval status    ✅
 
 # Phase 3 — Categories
 
-Status: Category backend foundation complete. Course ↔ category linking and
-catalog filtering are the next PR.
+Status: Complete (backend). Course ↔ category linking, catalog category
+filtering, the approval/publish-time category requirement and the admin
+category-only repair path are implemented.
 
 Tasks:
 
@@ -102,9 +103,9 @@ Tasks:
 * [x] Category tree
 * [x] Admin CRUD
 * [x] Public category listing
-* [ ] Category filtering (requires course ↔ category linking)
+* [x] Category filtering
 
-Notes: the foundation provides a `parentId` adjacency-list hierarchy, unique
+Notes: the backend provides a `parentId` adjacency-list hierarchy, unique
 immutable slugs, description, active state and `sortOrder`. Admin routes are
 admin-only and CSRF-protected; the public endpoint exposes only active nodes with
 active ancestors. The backend prevents self/descendant cycles, enforces a depth
@@ -114,13 +115,19 @@ prevents an older holder's late lease refresh from overwriting a newer fence,
 acquisition reconciles that generation above existing row fences after lock
 document loss/recreation/older restore, it revokes older staged creates, and it
 revalidates ownership after refreshing. Creates are staged until a fenced commit
-succeeds. It blocks
-deletion of categories with children or course references, and blocks hiding a
-branch with approved/published courses. The deletion/course-reference guard is
-forward-compatible with the next PR. Covered by 35 integration tests in
-`backend/tests/categories.test.ts`; contract
-documented in [`docs/categories.md`](docs/categories.md). Course linking, catalog
-filtering and the publish requirement remain deferred.
+succeeds. It blocks deletion of categories with children or any course
+reference, and blocks hiding a branch with approved/published courses. Courses
+store an optional `categoryId`; a committed category with an active ancestor
+chain is required to approve or publish, catalog `?category=` filtering includes
+descendants, and existing published courses without a category stay visible with
+`category: null`. Durable `courseRefs`/`protectedCourseRefs` are written before
+course rows and checked in the same category delete/deactivate/move filter, so
+the 30-second category lease is not the sole concurrency guarantee. An
+admin-only, CSRF-protected category-only repair endpoint handles approved,
+unpublished courses without weakening published-content immutability. Assignment,
+approval and publishing share the category lock using the documented order.
+Covered by 35 category tests plus 32 course-category tests; contract documented
+in [`docs/categories.md`](docs/categories.md).
 
 ---
 
@@ -135,7 +142,7 @@ Tasks:
 * [x] Course status
 * [x] Course slug
 * [ ] Thumbnail upload (external `thumbnailUrl` metadata is implemented)
-* [ ] Course ↔ category link (category backend foundation complete)
+* [x] Course ↔ category link
 * [x] Pricing (`priceMinor` + `currency` metadata; no payments yet)
 * [x] Level
 * [x] Language
@@ -152,9 +159,10 @@ phase added the review lifecycle (`draft`/`rejected` → `pending_review` →
 `approved`/`rejected`), owner-only submission and admin-only moderation. The
 Course Publishing phase added owner-only publishing (`approved` → `published`)
 with server-side completeness validation, and a public catalog limited to
-published courses. The Category backend foundation is complete, but course ↔
-category linking remains deferred. Thumbnail upload and course preview also
-remain deferred; `thumbnailUrl` is an external HTTP(S) reference.
+published courses. Course ↔ category linking is implemented: a category is
+optional while drafting, required at publication, and drives catalog
+`?category=` filtering. Thumbnail upload and course preview remain deferred;
+`thumbnailUrl` is an external HTTP(S) reference.
 
 ---
 
@@ -282,17 +290,22 @@ Tasks:
 * [x] Public course detail by slug
 * [x] Instructor summary (name/avatar only)
 * [x] Protected lesson content excluded from public responses
-* [ ] Category requirement (course ↔ category linking is the next PR)
+* [x] Category requirement and catalog category filtering
 * [ ] Thumbnail upload provider
 * [ ] Search/filter/sort in the catalog
 * [ ] Archive / unpublish / post-publication edit flow
 
 Notes: publishing is a separate owner action after admin approval. Validation
-reads committed content only and reports machine-readable reasons. The public
-catalog exposes metadata and a curriculum outline but never lesson bodies, video
-ids, document URLs or playback references. Pricing is stored for future checkout;
-no payments, coupons or enrollment logic exists in this phase. Covered by 27
-integration tests in `backend/tests/course-publishing.test.ts`.
+reads committed content only and reports machine-readable reasons. A category is
+required to approve and to publish, and the category plus every ancestor must be
+active; category assignment, approval and publishing share the category tree
+lock. Durable category references are written before course rows so lease expiry
+cannot hide an approved/published course. The public catalog exposes metadata and
+a curriculum outline but never lesson bodies, video ids, document URLs or
+playback references, and can filter by a category slug including descendants.
+Pricing is stored for future checkout; no payments, coupons or enrollment logic
+exists in this phase. Covered by 27 publishing integration tests plus 32
+course-category integration tests.
 
 ---
 
@@ -606,9 +619,9 @@ Teacher Workflow
 Course Publishing + Public Catalog
 ```
 
-The Category backend foundation now follows the agreed sequence. Course ↔
-category linking, category filtering and the remaining Course Management work
-stay defined in this roadmap and continue next.
+The Category backend and course ↔ category integration follow the agreed
+sequence. Remaining Course Management work and the next functional phases stay
+defined in this roadmap and continue next.
 
 ---
 
@@ -617,7 +630,7 @@ stay defined in this roadmap and continue next.
 Current phase:
 
 ```text
-Category Backend Foundation (course ↔ category integration and filtering deferred)
+Category backend + course ↔ category integration complete
 ```
 
 Completed:
@@ -630,17 +643,15 @@ Phase 6 — Video System foundational backend
 Phase 5 — Course Builder backend
 Teacher Workflow — course submission, review and approval backend
 Course Publishing — approval-to-publication backend + public catalog minimum
-Phase 3 — Category model, hierarchy, admin CRUD and public active tree
+Phase 3 — Categories + course ↔ category linking, filtering and publish requirement
 ```
 
 Immediate next tasks:
 
 ```text
-1. Course ↔ category linking, catalog category filtering and the publish
-   requirement (separate PR)
-2. Remaining Course Management items (thumbnail upload, course preview)
-3. Enrollment (Phase 7), then Course Player (Phase 8) and Progress (Phase 9)
-4. Course Builder + moderation + publishing frontend (once the frontend app is initialized)
+1. Remaining Course Management items (thumbnail upload, course preview)
+2. Enrollment (Phase 7), then Course Player (Phase 8) and Progress (Phase 9)
+3. Course Builder + moderation + publishing frontend (once the frontend app is initialized)
 ```
 
 The remaining Video System items (resumable uploads, upload UI, upload progress,

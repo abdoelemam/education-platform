@@ -39,6 +39,15 @@ const courseSchema = new Schema<CourseDocument>(
       maxlength: [5000, 'Description cannot exceed 5000 characters'],
       default: undefined,
     },
+    /**
+     * Public taxonomy placement. Optional while drafting; publishing requires
+     * the category (and every ancestor) to be active.
+     */
+    categoryId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Category',
+      default: undefined,
+    },
     status: {
       type: String,
       enum: {
@@ -151,5 +160,11 @@ courseSchema.index({ status: 1, createdAt: -1 });
 
 // Public catalog: published courses only, newest publication first.
 courseSchema.index({ status: 1, publishedAt: -1 });
+
+// Public catalog filtered by a category subtree.
+courseSchema.index({ status: 1, categoryId: 1, publishedAt: -1 });
+
+// Category deletion/deactivation guards resolve course references by category.
+courseSchema.index({ categoryId: 1 });
 
 export const CourseModel = mongoose.model<CourseDocument>('Course', courseSchema);

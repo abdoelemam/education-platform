@@ -22,11 +22,26 @@ export interface PublishVideoState {
   playbackUrl?: string;
 }
 
+/**
+ * Visibility snapshot for the course's category reference. The service resolves
+ * the category under the category tree lock and passes only what the rules need,
+ * keeping this module independent from category persistence.
+ */
+export interface PublishCategoryState {
+  /** True only when the category and every ancestor are active. */
+  publiclyVisible: boolean;
+}
+
 export interface PublishReadinessInput {
   course: ICourse;
   sections: SectionDocument[];
   lessons: LessonDocument[];
   videos: ReadonlyMap<string, PublishVideoState>;
+  /**
+   * `null` means the referenced category no longer exists (or was never
+   * committed). `undefined` is treated the same way when `categoryId` is set.
+   */
+  category?: PublishCategoryState | null;
 }
 
 /**
@@ -42,6 +57,14 @@ export function collectPublishIssues(
 ): CoursePublishIssue[] {
   const issues = new Set<CoursePublishIssue>();
   const { course } = input;
+
+  if (!course.categoryId) {
+    issues.add(COURSE_PUBLISH_ISSUES.CATEGORY_REQUIRED);
+  } else if (!input.category) {
+    issues.add(COURSE_PUBLISH_ISSUES.CATEGORY_NOT_FOUND);
+  } else if (!input.category.publiclyVisible) {
+    issues.add(COURSE_PUBLISH_ISSUES.CATEGORY_INACTIVE);
+  }
 
   if (!course.description || course.description.trim().length === 0) {
     issues.add(COURSE_PUBLISH_ISSUES.DESCRIPTION_REQUIRED);

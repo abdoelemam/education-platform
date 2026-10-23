@@ -7,6 +7,8 @@ import { UserModel } from '../src/modules/users/user.model.js';
 import { RefreshTokenModel } from '../src/modules/auth/refresh-token.model.js';
 import { VideoModel } from '../src/modules/videos/video.model.js';
 import { CourseModel } from '../src/modules/courses/course.model.js';
+import { CategoryModel } from '../src/modules/categories/category.model.js';
+import { CategoryLockModel } from '../src/modules/categories/category-lock.model.js';
 import { SectionModel } from '../src/modules/courses/section.model.js';
 import { LessonModel } from '../src/modules/courses/lesson.model.js';
 import {
@@ -131,6 +133,7 @@ interface CourseDto {
 
 describe('Teacher Workflow Integration Tests', () => {
   const app = createApp();
+  let defaultCategoryId: string;
 
   beforeAll(async () => {
     assertSafeTestDatabase();
@@ -148,6 +151,8 @@ describe('Teacher Workflow Integration Tests', () => {
     await RefreshTokenModel.deleteMany({});
     await VideoModel.deleteMany({});
     await CourseModel.deleteMany({});
+    await CategoryModel.deleteMany({});
+    await CategoryLockModel.deleteMany({});
     await SectionModel.deleteMany({});
     await LessonModel.deleteMany({});
     await mongoose.disconnect();
@@ -159,8 +164,17 @@ describe('Teacher Workflow Integration Tests', () => {
     await RefreshTokenModel.deleteMany({});
     await VideoModel.deleteMany({});
     await CourseModel.deleteMany({});
+    await CategoryModel.deleteMany({});
+    await CategoryLockModel.deleteMany({});
     await SectionModel.deleteMany({});
     await LessonModel.deleteMany({});
+
+    const category = await CategoryModel.create({
+      name: 'Workflow Category',
+      slug: 'workflow-category',
+      isActive: true,
+    });
+    defaultCategoryId = category._id.toString();
   });
 
   // ---------------------------------------------------------------------------
@@ -238,7 +252,11 @@ describe('Teacher Workflow Integration Tests', () => {
       .post('/api/teacher/courses')
       .set('Cookie', session.cookies)
       .set('X-CSRF-Token', session.csrf)
-      .send({ title, description: 'A complete algebra course' });
+      .send({
+        title,
+        description: 'A complete algebra course',
+        categoryId: defaultCategoryId,
+      });
 
     expect(res.status).toBe(201);
     return res.body.data.course as CourseDto;

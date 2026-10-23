@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CATEGORY_SLUG_MAX } from '../categories/category.constants.js';
 import {
   COURSE_DESCRIPTION_MAX,
   COURSE_LANGUAGE_MAX,
@@ -124,6 +125,7 @@ const currencySchema = z
 export const createCourseSchema = z.object({
   title: title(COURSE_TITLE_MAX),
   description: description(COURSE_DESCRIPTION_MAX),
+  categoryId: objectId('category id').nullable().optional(),
 });
 
 export type CreateCourseInput = z.infer<typeof createCourseSchema>;
@@ -132,6 +134,7 @@ export const updateCourseSchema = z
   .object({
     title: title(COURSE_TITLE_MAX).optional(),
     description: description(COURSE_DESCRIPTION_MAX),
+    categoryId: objectId('category id').nullable().optional(),
     thumbnailUrl: thumbnailUrlSchema.nullable().optional(),
     level: levelSchema.nullable().optional(),
     language: languageSchema.nullable().optional(),
@@ -198,10 +201,21 @@ export const listCoursesQuerySchema = z.object({
 export type ListCoursesQuery = z.infer<typeof listCoursesQuerySchema>;
 
 /**
- * Public catalog pagination. Search, filters and sorting belong to the course
- * discovery phase and intentionally are not accepted yet.
+ * Public catalog pagination plus category filtering.
+ *
+ * `category` is a public category slug. Filtering includes the category's
+ * descendants by default. Search, level/price filters and sorting belong to the
+ * course discovery phase and are intentionally not accepted yet.
  */
-export const publicCatalogQuerySchema = listCoursesQuerySchema;
+export const publicCatalogQuerySchema = listCoursesQuerySchema.extend({
+  category: z
+    .string()
+    .trim()
+    .min(1, 'Category is required')
+    .max(CATEGORY_SLUG_MAX, `Category cannot exceed ${CATEGORY_SLUG_MAX} characters`)
+    .regex(/^[a-z0-9][a-z0-9-]*$/, 'Invalid category slug')
+    .optional(),
+});
 
 export type PublicCatalogQuery = z.infer<typeof publicCatalogQuerySchema>;
 
@@ -258,6 +272,20 @@ export const rejectCourseSchema = z.object({
 });
 
 export type RejectCourseInput = z.infer<typeof rejectCourseSchema>;
+
+/**
+ * The only field an admin may repair on an approved course. Content, status,
+ * review metadata, and publication state are deliberately excluded.
+ */
+export const assignCourseCategorySchema = z
+  .object({
+    categoryId: objectId('category id'),
+  })
+  .strict();
+
+export type AssignCourseCategoryInput = z.infer<
+  typeof assignCourseCategorySchema
+>;
 
 // ---------------------------------------------------------------------------
 // Route params

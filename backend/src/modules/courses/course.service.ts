@@ -1,8 +1,20 @@
 import { randomBytes } from 'node:crypto';
 import { Types } from 'mongoose';
 import { AppError } from '../../errors/index.js';
+import { logger } from '../../utils/logger.js';
 import { slugify } from '../../utils/slug.js';
 import { AUTH_ERRORS } from '../auth/auth.constants.js';
+import {
+  categoryService,
+  type CategoryService,
+} from '../categories/category.service.js';
+import { CATEGORY_ERRORS } from '../categories/category.constants.js';
+import {
+  collectAncestorIds,
+  collectSubtreeIds,
+  isPubliclyVisible,
+} from '../categories/category.tree.js';
+import type { CategoryDocument } from '../categories/category.types.js';
 import type { AuthUser } from '../users/user.types.js';
 import {
   userRepository,
@@ -17,10 +29,12 @@ import {
   COURSE_EDITABLE_STATUSES,
   COURSE_EDIT_LOCK_TTL_MS,
   COURSE_ERRORS,
+  COURSE_PUBLISH_ISSUES,
   COURSE_SLUG_MAX,
   COURSE_SLUG_MAX_ATTEMPTS,
   COURSE_STATUS_TRANSITIONS,
   type CourseErrorCode,
+  type CoursePublishIssue,
 } from './course.constants.js';
 import type { CourseEditFence } from './course.fence.js';
 import {
@@ -46,9 +60,11 @@ import {
 } from './course.mapper.js';
 import {
   collectPublishIssues,
+  type PublishCategoryState,
   type PublishVideoState,
 } from './course.publish-rules.js';
 import type {
+  CatalogCategory,
   CatalogCourse,
   CatalogCourseDetail,
   CatalogInstructor,
@@ -61,6 +77,7 @@ import type {
   SectionDocument,
 } from './course.types.js';
 import type {
+  CreateCourseInput,
   CreateLessonInput,
   CreateSectionInput,
   UpdateCourseInput,
@@ -165,6 +182,7 @@ export class CourseService {
     private readonly lessonRepo: LessonRepository = lessonRepository,
     private readonly videoRepo: VideoRepository = videoRepository,
     private readonly userRepo: UserRepository = userRepository,
+    private readonly categorySvc: CategoryService = categoryService,
   ) {}
 
   // -------------------------------------------------------------------------
@@ -173,43 +191,87 @@ export class CourseService {
 
   async createCourse(params: {
     ownerId: string;
-    input: { title: string; description?: string };
+    input: CreateCourseInput;
   }): Promise<CourseDetail> {
-    const base =
-      slugify(params.input.title, SLUG_BASE_MAX) ||
-      `course-${randomBytes(4).toString('hex')}`;
+    const create = async (
+      courseId: string,
+      categoryId?: string,
+    ): Promise<CourseDetail> => {
+      const base =
+        slugify(params.input.title, SLUG_BASE_MAX) ||
+        `course-${randomBytes(4).toString('hex')}`;
 
-    for (let attempt = 0; attempt <= COURSE_SLUG_MAX_ATTEMPTS; attempt += 1) {
-      const slug =
-        attempt === 0
-          ? base.slice(0, COURSE_SLUG_MAX)
-          : `${base.slice(0, SLUG_BASE_MAX)}-${attempt + 1}`;
+      for (let attempt = 0; attempt <= COURSE_SLUG_MAX_ATTEMPTS; attempt += 1) {
+        const slug =
+          attempt === 0
+            ? base.slice(0, COURSE_SLUG_MAX)
+            : `${base.slice(0, SLUG_BASE_MAX)}-${attempt + 1}`;
 
-      try {
-        const course = await this.courseRepo.create({
-          ownerId: params.ownerId,
-          title: params.input.title,
-          slug,
-          description: params.input.description,
-        });
+        try {
+          const course = await this.courseRepo.create({
+            id: courseId,
+            ownerId: params.ownerId,
+            title: params.input.title,
+            slug,
+            description: params.input.description,
+            categoryId,
+          });
 
-        return toCourseDetail(course, [], []);
-      } catch (error) {
-        if (!isDuplicateKeyError(error)) {
-          throw error;
+          return toCourseDetail(course, [], []);
+        } catch (error) {
+          if (!isDuplicateKeyError(error)) {
+            throw error;
+          }
         }
       }
+
+      // Practically unreachable: every numbered suffix collided.
+      const course = await this.courseRepo.create({
+        id: courseId,
+        ownerId: params.ownerId,
+        title: params.input.title,
+        slug: `${base.slice(0, SLUG_BASE_MAX)}-${randomBytes(4).toString('hex')}`,
+        description: params.input.description,
+        categoryId,
+      });
+
+      return toCourseDetail(course, [], []);
+    };
+
+    if (!params.input.categoryId) {
+      return create(new Types.ObjectId().toString());
     }
 
-    // Practically unreachable: every numbered suffix collided.
-    const course = await this.courseRepo.create({
-      ownerId: params.ownerId,
-      title: params.input.title,
-      slug: `${base.slice(0, SLUG_BASE_MAX)}-${randomBytes(4).toString('hex')}`,
-      description: params.input.description,
-    });
+    const categoryId = new Types.ObjectId(params.input.categoryId).toString();
 
-    return toCourseDetail(course, [], []);
+    // Reserve a reference on the category before inserting the course. The
+    // category delete is atomic with respect to this reference array, so a
+    // delete can never win after validation and leave a dangling categoryId.
+    return this.categorySvc.withCategoryReferenceLock(async (fence) => {
+      const categories = await this.categorySvc.listReferenceCategories();
+      this.assertCategoryInList(categories, categoryId);
+
+      const courseId = new Types.ObjectId().toString();
+      const reference = await this.categorySvc.addDraftCourseReference({
+        categoryId,
+        courseId,
+        fence,
+      });
+      if (!reference.matched) {
+        throw this.categoryReferenceConflictError();
+      }
+
+      try {
+        return await create(courseId, categoryId);
+      } catch (error) {
+        await this.categorySvc.removeCourseReferencePath({
+          categories,
+          categoryId,
+          courseId,
+        });
+        throw error;
+      }
+    });
   }
 
   async listCourses(params: {
@@ -246,87 +308,182 @@ export class CourseService {
     requester: AuthUser;
     input: UpdateCourseInput;
   }): Promise<CourseDetail> {
-    return this.withCourseMutationLock(
+    const updated = await this.withCourseMutationLock(
       params.courseId,
       params.requester,
       COURSE_EDITABLE_STATUSES,
       COURSE_ERRORS.COURSE_NOT_EDITABLE,
       'edited',
       async (course, fence) => {
-        const update: CourseUpdate = {};
-        const unset: string[] = [];
+        const oldCategoryId = course.categoryId?.toString() ?? null;
+        const requestedCategoryId = params.input.categoryId;
+        const newCategoryId =
+          requestedCategoryId === undefined
+            ? undefined
+            : requestedCategoryId === null
+              ? null
+              : new Types.ObjectId(requestedCategoryId).toString();
 
-        if (params.input.title !== undefined) {
-          update.title = params.input.title;
-          // The slug is a stable identifier and is intentionally not regenerated.
-        }
+        const applyUpdate = async (): Promise<CourseDocument> => {
+          const update: CourseUpdate = {};
+          const unset: string[] = [];
 
-        if (params.input.description !== undefined) {
-          if (params.input.description === '') {
-            unset.push('description');
-          } else {
-            update.description = params.input.description;
+          if (params.input.title !== undefined) {
+            update.title = params.input.title;
+            // The slug is a stable identifier and is intentionally not regenerated.
           }
-        }
 
-        if (params.input.thumbnailUrl !== undefined) {
-          if (params.input.thumbnailUrl === null) {
-            unset.push('thumbnailUrl');
-          } else {
-            update.thumbnailUrl = params.input.thumbnailUrl;
+          if (params.input.description !== undefined) {
+            if (params.input.description === '') {
+              unset.push('description');
+            } else {
+              update.description = params.input.description;
+            }
           }
-        }
 
-        if (params.input.level !== undefined) {
-          if (params.input.level === null) {
-            unset.push('level');
-          } else {
-            update.level = params.input.level;
+          if (newCategoryId === null) {
+            unset.push('categoryId');
+          } else if (newCategoryId !== undefined) {
+            update.categoryId = new Types.ObjectId(newCategoryId);
           }
-        }
 
-        if (params.input.language !== undefined) {
-          if (params.input.language === null) {
-            unset.push('language');
-          } else {
-            update.language = params.input.language;
+          if (params.input.thumbnailUrl !== undefined) {
+            if (params.input.thumbnailUrl === null) {
+              unset.push('thumbnailUrl');
+            } else {
+              update.thumbnailUrl = params.input.thumbnailUrl;
+            }
           }
-        }
 
-        if (params.input.learningOutcomes !== undefined) {
-          update.learningOutcomes = params.input.learningOutcomes;
-        }
-
-        if (params.input.requirements !== undefined) {
-          update.requirements = params.input.requirements;
-        }
-
-        if (params.input.priceMinor !== undefined) {
-          if (params.input.priceMinor === null) {
-            unset.push('priceMinor', 'currency');
-          } else {
-            update.priceMinor = params.input.priceMinor;
-            // Zod guarantees both fields are present together.
-            update.currency = params.input.currency ?? undefined;
+          if (params.input.level !== undefined) {
+            if (params.input.level === null) {
+              unset.push('level');
+            } else {
+              update.level = params.input.level;
+            }
           }
+
+          if (params.input.language !== undefined) {
+            if (params.input.language === null) {
+              unset.push('language');
+            } else {
+              update.language = params.input.language;
+            }
+          }
+
+          if (params.input.learningOutcomes !== undefined) {
+            update.learningOutcomes = params.input.learningOutcomes;
+          }
+
+          if (params.input.requirements !== undefined) {
+            update.requirements = params.input.requirements;
+          }
+
+          if (params.input.priceMinor !== undefined) {
+            if (params.input.priceMinor === null) {
+              unset.push('priceMinor', 'currency');
+            } else {
+              update.priceMinor = params.input.priceMinor;
+              // Zod guarantees both fields are present together.
+              update.currency = params.input.currency ?? undefined;
+            }
+          }
+
+          const updated = await this.courseRepo.updateById(
+            course._id.toString(),
+            update,
+            unset,
+            fence,
+          );
+
+          if (!updated) {
+            // The course was deleted or the lease expired/was replaced between
+            // request start and this write.
+            throw this.editInProgressError();
+          }
+
+          return updated;
+        };
+
+        if (newCategoryId === undefined) {
+          return applyUpdate();
         }
 
-        const updated = await this.courseRepo.updateById(
-          course._id.toString(),
-          update,
-          unset,
-          fence,
-        );
-
-        if (!updated) {
-          // The course was deleted or the lease expired/was replaced between
-          // request start and this write.
-          throw this.editInProgressError();
+        if (newCategoryId === null) {
+          const updated = await applyUpdate();
+          if (oldCategoryId) {
+            // The course no longer points at the old category. Narrowing the
+            // reference after the fenced course write cannot create a dangling
+            // reference; a concurrent category delete can only observe the
+            // reference and retry after this cleanup.
+            await this.categorySvc.removeCourseReferences(
+              [oldCategoryId],
+              course._id.toString(),
+            );
+          }
+          return updated;
         }
 
-        return this.buildDetail(updated);
+        // The course edit lease is held first, then the category tree lock.
+        // Category operations never acquire a course lease, so this order
+        // cannot deadlock. The reference is written before the course row and
+        // the atomic category-delete guard consumes it, closing the lease-TTL
+        // gap between validation and the course write.
+        return this.categorySvc.withCategoryReferenceLock(async (categoryFence) => {
+          const categories = await this.categorySvc.listReferenceCategories();
+          this.assertCategoryInList(categories, newCategoryId);
+
+          const reference = await this.categorySvc.addDraftCourseReference({
+            categoryId: newCategoryId,
+            courseId: course._id.toString(),
+            fence: categoryFence,
+          });
+          if (!reference.matched) {
+            throw this.categoryReferenceConflictError();
+          }
+
+          try {
+            const updated = await applyUpdate();
+            if (oldCategoryId && oldCategoryId !== newCategoryId) {
+              await this.categorySvc
+                .removeCourseReferencePath({
+                  categories,
+                  categoryId: oldCategoryId,
+                  courseId: course._id.toString(),
+                })
+                .catch((error: unknown) => {
+                  logger.warn('Failed to remove old category reference', {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  });
+                });
+            }
+            return updated;
+          } catch (error) {
+            if (oldCategoryId !== newCategoryId) {
+              await this.categorySvc
+                .removeCourseReferencePath({
+                  categories,
+                  categoryId: newCategoryId,
+                  courseId: course._id.toString(),
+                })
+                .catch((removeError: unknown) => {
+                  logger.warn('Failed to roll back category reference', {
+                    error:
+                      removeError instanceof Error
+                        ? removeError.message
+                        : String(removeError),
+                  });
+                });
+            }
+            throw error;
+          }
+        });
       },
     );
+
+    // Detail assembly is read-only and needs no category or course lease.
+    return this.buildDetail(updated);
   }
 
   /**
@@ -365,6 +522,19 @@ export class CourseService {
         // than visible partial content. See docs/course-builder.md.
         await this.lessonRepo.deleteByCourse(courseId);
         await this.sectionRepo.deleteByCourse(courseId);
+
+        if (course.categoryId) {
+          await this.categorySvc
+            .removeCourseReferences(
+              [course.categoryId.toString()],
+              courseId,
+            )
+            .catch((error: unknown) => {
+              logger.warn('Failed to remove deleted course category reference', {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+        }
       },
     );
   }
@@ -449,24 +619,160 @@ export class CourseService {
     this.assertAdmin(params.requester);
     const course = await this.requireCourse(params.courseId);
     this.assertTransition(course.status, 'approved');
+    const courseId = course._id.toString();
 
-    const updated = await this.courseRepo.transitionStatus(
-      course._id.toString(),
-      [course.status],
-      {
-        status: 'approved',
-        reviewedAt: new Date(),
-        reviewedBy: new Types.ObjectId(params.requester.id),
-      },
-      ['rejectionReason'],
-      this.submissionGuard(course),
-    );
+    return this.categorySvc.withCategoryReferenceLock(async (fence) => {
+      const categories = await this.categorySvc.listReferenceCategories();
+      const categoryId = this.requireApprovableCategory(course, categories);
+      const pathBefore = this.categoryPathSignature(categories, categoryId);
 
-    if (!updated) {
-      throw this.concurrentTransitionError();
+      const reference = await this.categorySvc.addProtectedCourseReferencePath({
+        categories,
+        categoryId,
+        courseId,
+        fence,
+      });
+      if (!reference.ok) {
+        throw this.categoryReferenceConflictError();
+      }
+
+      let keepReferences = false;
+      try {
+        // A stale lease could have allowed a concurrent move between validation
+        // and the reference write. Re-read the path and fail if it changed.
+        const currentCategories =
+          await this.categorySvc.listReferenceCategories();
+        this.requireApprovableCategory(course, currentCategories);
+        if (
+          this.categoryPathSignature(currentCategories, categoryId) !==
+          pathBefore
+        ) {
+          throw this.categoryReferenceConflictError();
+        }
+
+        const updated = await this.courseRepo.transitionStatus(
+          courseId,
+          [course.status],
+          {
+            status: 'approved',
+            reviewedAt: new Date(),
+            reviewedBy: new Types.ObjectId(params.requester.id),
+          },
+          ['rejectionReason'],
+          this.submissionGuard(course),
+        );
+
+        if (!updated) {
+          const current = await this.requireCourse(courseId);
+          // A concurrent approval may have won. Its protected reference must
+          // stay in place; otherwise only remove the reference this request
+          // added.
+          keepReferences =
+            current.status === 'approved' || current.status === 'published';
+          throw this.concurrentTransitionError();
+        }
+
+        keepReferences = true;
+        return this.buildDetail(updated);
+      } catch (error) {
+        if (!keepReferences) {
+          await this.categorySvc
+            .removeCourseReferences(reference.addedCategoryIds, courseId)
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Administrative repair path for an approved, not-yet-published course whose
+   * category is missing or invalid. Only the category changes; content, review
+   * metadata, and publication state are untouched.
+   */
+  async assignApprovedCourseCategory(params: {
+    courseId: string;
+    requester: AuthUser;
+    categoryId: string;
+  }): Promise<CourseDetail> {
+    this.assertAdmin(params.requester);
+    const course = await this.requireCourse(params.courseId);
+
+    if (course.status !== 'approved' || course.publishedAt) {
+      throw new AppError(
+        409,
+        COURSE_ERRORS.COURSE_NOT_EDITABLE,
+        'Only an approved, unpublished course can be assigned a category',
+      );
     }
 
-    return this.buildDetail(updated);
+    const courseId = course._id.toString();
+    const oldCategoryId = course.categoryId?.toString() ?? null;
+    const categoryId = new Types.ObjectId(params.categoryId).toString();
+
+    return this.categorySvc.withCategoryReferenceLock(async (fence) => {
+      const categories = await this.categorySvc.listReferenceCategories();
+      this.requireAssignableCategory(categories, categoryId);
+      const pathBefore = this.categoryPathSignature(categories, categoryId);
+
+      const reference = await this.categorySvc.addProtectedCourseReferencePath({
+        categories,
+        categoryId,
+        courseId,
+        fence,
+      });
+      if (!reference.ok) {
+        throw this.categoryReferenceConflictError();
+      }
+
+      let keepReferences = false;
+      try {
+        const currentCategories =
+          await this.categorySvc.listReferenceCategories();
+        this.requireAssignableCategory(currentCategories, categoryId);
+        if (
+          this.categoryPathSignature(currentCategories, categoryId) !==
+          pathBefore
+        ) {
+          throw this.categoryReferenceConflictError();
+        }
+
+        const updated = await this.courseRepo.assignCategoryIfApproved({
+          id: courseId,
+          fromCategoryId: oldCategoryId,
+          toCategoryId: categoryId,
+        });
+
+        if (!updated) {
+          throw this.concurrentTransitionError();
+        }
+
+        keepReferences = true;
+
+        if (oldCategoryId && oldCategoryId !== categoryId) {
+          await this.categorySvc
+            .removeCourseReferencePath({
+              categories,
+              categoryId: oldCategoryId,
+              courseId,
+            })
+            .catch((error: unknown) => {
+              logger.warn('Failed to remove old assigned category reference', {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+        }
+
+        return this.buildDetail(updated);
+      } catch (error) {
+        if (!keepReferences) {
+          await this.categorySvc
+            .removeCourseReferences(reference.addedCategoryIds, courseId)
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+    });
   }
 
   /**
@@ -532,46 +838,155 @@ export class CourseService {
     ]);
     const videos = await this.loadPublishVideoStates(lessons);
 
-    const issues = collectPublishIssues({
-      course,
-      sections,
-      lessons,
-      videos,
-    });
+    const requirePublishable = (
+      categories: CategoryDocument[] | null,
+    ): void => {
+      const category = categories
+        ? this.resolvePublishCategory(course, categories)
+        : null;
 
-    if (issues.length > 0) {
-      throw new AppError(
-        422,
-        COURSE_ERRORS.COURSE_NOT_PUBLISHABLE,
-        'The course does not meet the publishing requirements',
-        { reasons: issues },
+      const issues = collectPublishIssues({
+        course,
+        sections,
+        lessons,
+        videos,
+        category,
+      });
+
+      if (issues.length > 0) {
+        throw new AppError(
+          422,
+          COURSE_ERRORS.COURSE_NOT_PUBLISHABLE,
+          'The course does not meet the publishing requirements',
+          { reasons: issues },
+        );
+      }
+    };
+
+    // With no category there is nothing to protect, and the readiness check
+    // reports CATEGORY_REQUIRED. Otherwise hold the category tree lock across
+    // validation and the publish compare-and-set so an admin cannot deactivate,
+    // move or delete the category underneath a publication.
+    let published: CourseDocument;
+    if (!course.categoryId) {
+      requirePublishable(null);
+      published = await this.transitionToPublished(course);
+    } else {
+      published = await this.categorySvc.withCategoryReferenceLock(
+        async (fence) => {
+          // Re-read the course under the tree lock. An admin category repair
+          // could have changed the category after this request loaded its
+          // snapshot; publishing that snapshot would validate and protect the
+          // wrong branch while storing the new category. Fail closed instead.
+          const currentCourse = await this.requireCourse(courseId);
+          if (
+            currentCourse.status !== course.status ||
+            currentCourse.categoryId?.toString() !==
+              course.categoryId!.toString() ||
+            this.submissionIdentityChanged(course, currentCourse)
+          ) {
+            throw this.concurrentTransitionError();
+          }
+
+          const categories = await this.categorySvc.listReferenceCategories();
+          requirePublishable(categories);
+
+          const categoryId = course.categoryId!.toString();
+          const pathBefore = this.categoryPathSignature(categories, categoryId);
+          const reference =
+            await this.categorySvc.addProtectedCourseReferencePath({
+              categories,
+              categoryId,
+              courseId,
+              fence,
+            });
+          if (!reference.ok) {
+            throw this.categoryReferenceConflictError();
+          }
+
+          const currentCategories =
+            await this.categorySvc.listReferenceCategories();
+          try {
+            requirePublishable(currentCategories);
+            if (
+              this.categoryPathSignature(currentCategories, categoryId) !==
+              pathBefore
+            ) {
+              throw this.categoryReferenceConflictError();
+            }
+          } catch (error) {
+            await this.categorySvc
+              .removeCourseReferences(reference.addedCategoryIds, courseId)
+              .catch(() => undefined);
+            throw error;
+          }
+
+          // The approved course remains protected even if this particular
+          // publish attempt later loses a compare-and-set.
+          return this.transitionToPublished(course);
+        },
       );
     }
 
-    const published = await this.transitionToPublished(course);
-
+    // Detail assembly is read-only and needs no category lease.
     return this.buildDetail(published);
   }
 
   /**
    * Public catalog: published courses only, newest publication first.
+   *
+   * `categorySlug` filters by a publicly visible category and includes its
+   * descendants by default. Unknown or hidden categories are reported as not
+   * found so unpublished taxonomy is not leaked.
    */
   async listPublishedCourses(params: {
     page: number;
     limit: number;
+    categorySlug?: string;
   }): Promise<PaginatedCatalog> {
     const skip = (params.page - 1) * params.limit;
+    let categories: CategoryDocument[] | null = null;
+    let categoryIds: string[] | undefined;
+
+    if (params.categorySlug) {
+      const tree = await this.categorySvc.listReferenceCategories();
+      categories = tree;
+
+      const category = tree.find((item) => item.slug === params.categorySlug);
+      if (
+        !category ||
+        !isPubliclyVisible(tree, category._id.toString())
+      ) {
+        throw new AppError(
+          404,
+          CATEGORY_ERRORS.CATEGORY_NOT_FOUND,
+          'Category not found',
+        );
+      }
+      categoryIds = collectSubtreeIds(tree, category._id.toString()).filter(
+        (id) => isPubliclyVisible(tree, id),
+      );
+    }
+
     const { items, total } = await this.courseRepo.listPublished({
       skip,
       limit: params.limit,
+      categoryIds,
     });
+
+    if (!categories && items.some((course) => course.categoryId)) {
+      categories = await this.categorySvc.listReferenceCategories();
+    }
+
     const instructors = await this.loadInstructors(items);
+    const categoryList = categories ?? [];
 
     return {
       items: items.map((course) =>
         toCatalogCourse(
           course,
           instructors.get(course.ownerId.toString()) ?? UNKNOWN_INSTRUCTOR,
+          this.toCatalogCategory(course, categoryList),
         ),
       ),
       page: params.page,
@@ -592,15 +1007,19 @@ export class CourseService {
     }
 
     const courseId = course._id.toString();
-    const [sections, lessons, instructors] = await Promise.all([
+    const [sections, lessons, instructors, categories] = await Promise.all([
       this.sectionRepo.listByCourse(courseId),
       this.lessonRepo.listByCourse(courseId),
       this.loadInstructors([course]),
+      course.categoryId
+        ? this.categorySvc.listReferenceCategories()
+        : Promise.resolve<CategoryDocument[]>([]),
     ]);
 
     return toCatalogCourseDetail(
       course,
       instructors.get(course.ownerId.toString()) ?? UNKNOWN_INSTRUCTOR,
+      this.toCatalogCategory(course, categories),
       sections,
       lessons,
     );
@@ -1363,6 +1782,160 @@ export class CourseService {
   }
 
   /**
+   * Validate that a category reference points at a committed category. The
+   * caller normally holds the category tree lock; the reference write itself is
+   * also conditional on the live fence, so a stale lease cannot attach a course
+   * to a category that another request is changing.
+   */
+  private assertCategoryInList(
+    categories: CategoryDocument[],
+    categoryId: string,
+  ): void {
+    const exists = categories.some(
+      (category) => category._id.toString() === categoryId,
+    );
+
+    if (!exists) {
+      throw new AppError(
+        422,
+        COURSE_ERRORS.COURSE_CATEGORY_NOT_FOUND,
+        'The selected category does not exist',
+      );
+    }
+  }
+
+  /**
+   * Approval requires a committed category whose whole ancestor chain is
+   * visible. Approval and category deactivation/move run under the same tree
+   * lock, and protected references make the decision durable even if that lock
+   * lease expires.
+   */
+  private requireApprovableCategory(
+    course: CourseDocument,
+    categories: CategoryDocument[],
+  ): string {
+    if (!course.categoryId) {
+      throw this.notApprovableError(COURSE_PUBLISH_ISSUES.CATEGORY_REQUIRED);
+    }
+
+    const categoryId = course.categoryId.toString();
+    if (
+      !categories.some((category) => category._id.toString() === categoryId)
+    ) {
+      throw this.notApprovableError(COURSE_PUBLISH_ISSUES.CATEGORY_NOT_FOUND);
+    }
+
+    if (!isPubliclyVisible(categories, categoryId)) {
+      throw this.notApprovableError(COURSE_PUBLISH_ISSUES.CATEGORY_INACTIVE);
+    }
+
+    return categoryId;
+  }
+
+  /**
+   * The admin repair path may only target a committed, publicly visible
+   * category. It never changes a published course.
+   */
+  private requireAssignableCategory(
+    categories: CategoryDocument[],
+    categoryId: string,
+  ): void {
+    if (
+      !categories.some((category) => category._id.toString() === categoryId)
+    ) {
+      throw new AppError(
+        422,
+        COURSE_ERRORS.COURSE_CATEGORY_NOT_FOUND,
+        'The selected category does not exist',
+      );
+    }
+
+    if (!isPubliclyVisible(categories, categoryId)) {
+      throw new AppError(
+        422,
+        COURSE_ERRORS.COURSE_CATEGORY_INACTIVE,
+        'The selected category is inactive or has an inactive ancestor',
+      );
+    }
+  }
+
+  private notApprovableError(reason: CoursePublishIssue): AppError {
+    return new AppError(
+      422,
+      COURSE_ERRORS.COURSE_NOT_APPROVABLE,
+      'The course does not have a valid category and cannot be approved',
+      { reasons: [reason] },
+    );
+  }
+
+  private categoryReferenceConflictError(): AppError {
+    return new AppError(
+      409,
+      COURSE_ERRORS.COURSE_CATEGORY_CONFLICT,
+      'The category changed while processing this request; reload and retry',
+    );
+  }
+
+  private categoryPathSignature(
+    categories: CategoryDocument[],
+    categoryId: string,
+  ): string | null {
+    return collectAncestorIds(categories, categoryId)?.join('/') ?? null;
+  }
+
+  /**
+   * Resolve the stored category reference against the current tree. A missing
+   * row or a hidden branch is not publishable; `null` means not found.
+   */
+  private resolvePublishCategory(
+    course: CourseDocument,
+    categories: CategoryDocument[],
+  ): PublishCategoryState | null {
+    if (!course.categoryId) {
+      return null;
+    }
+
+    const categoryId = course.categoryId.toString();
+    const category = categories.find(
+      (item) => item._id.toString() === categoryId,
+    );
+    if (!category) {
+      return null;
+    }
+
+    return {
+      publiclyVisible: isPubliclyVisible(categories, categoryId),
+    };
+  }
+
+  /**
+   * Safe catalog summary for a course's category. Hidden or corrupt references
+   * degrade to `null` so a public response never leaks an inactive branch.
+   */
+  private toCatalogCategory(
+    course: CourseDocument,
+    categories: CategoryDocument[],
+  ): CatalogCategory | null {
+    if (!course.categoryId) {
+      return null;
+    }
+
+    const categoryId = course.categoryId.toString();
+    const category = categories.find(
+      (item) => item._id.toString() === categoryId,
+    );
+    if (!category || !isPubliclyVisible(categories, categoryId)) {
+      return null;
+    }
+
+    return {
+      id: categoryId,
+      name: category.name,
+      slug: category.slug,
+    };
+  }
+
+  /**
    * Move a draft or rejected course to `pending_review`, but only while no
    * content edit is in flight. A concurrent submission or status change is
    * reported as a conflict rather than retried blindly, which prevents a stale
@@ -1370,7 +1943,8 @@ export class CourseService {
    */
   private async transitionToPendingReview(
     course: CourseDocument,
-  ): Promise<CourseDocument> {    const courseId = course._id.toString();
+  ): Promise<CourseDocument> {
+    const courseId = course._id.toString();
     const fromStatus = course.status;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {

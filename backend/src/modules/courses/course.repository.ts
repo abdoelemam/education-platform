@@ -9,10 +9,13 @@ import { CourseModel } from './course.model.js';
 import type { CourseDocument, CourseStatus, ICourse } from './course.types.js';
 
 export interface CreateCourseData {
+  /** Pre-generated id used to reserve category membership before insertion. */
+  id?: string;
   ownerId: string;
   title: string;
   slug: string;
   description?: string;
+  categoryId?: string;
 }
 
 export type CourseUpdate = Partial<
@@ -84,10 +87,14 @@ function buildUpdateDocument(
 export class CourseRepository {
   async create(data: CreateCourseData): Promise<CourseDocument> {
     const course = new CourseModel({
+      _id: data.id ? new Types.ObjectId(data.id) : undefined,
       ownerId: new Types.ObjectId(data.ownerId),
       title: data.title,
       slug: data.slug,
       description: data.description,
+      categoryId: data.categoryId
+        ? new Types.ObjectId(data.categoryId)
+        : undefined,
       status: 'draft',
     });
 
@@ -136,12 +143,22 @@ export class CourseRepository {
 
   /**
    * Public catalog listing: published courses only, newest publication first.
+   * `categoryIds` restricts the result to a resolved category subtree.
    */
   async listPublished(params: {
     skip: number;
     limit: number;
+    categoryIds?: string[];
   }): Promise<ListCoursesResult> {
-    const filter = { status: 'published' as const };
+    const filter: FilterQuery<CourseDocument> = {
+      status: 'published' as const,
+    };
+
+    if (params.categoryIds) {
+      filter.categoryId = {
+        $in: params.categoryIds.map((id) => new Types.ObjectId(id)),
+      };
+    }
 
     const [items, total] = await Promise.all([
       CourseModel.find(filter)
@@ -176,6 +193,35 @@ export class CourseRepository {
     return CourseModel.findOneAndUpdate(
       filter,
       buildUpdateDocument(update, unset),
+      { new: true },
+    ).exec();
+  }
+
+  /**
+   * Administrative repair path: change only the category of an approved course
+   * that has not been published yet.
+   *
+   * The category that was inspected is part of the CAS filter, so two admins
+   * racing the same repair cannot both succeed. The method never writes content,
+   * review metadata, or publish state.
+   */
+  async assignCategoryIfApproved(params: {
+    id: string;
+    fromCategoryId?: string | null;
+    toCategoryId: string;
+  }): Promise<CourseDocument | null> {
+    const fromFilter = params.fromCategoryId
+      ? { categoryId: new Types.ObjectId(params.fromCategoryId) }
+      : { categoryId: null };
+
+    return CourseModel.findOneAndUpdate(
+      {
+        _id: params.id,
+        status: 'approved',
+        publishedAt: { $exists: false },
+        ...fromFilter,
+      },
+      { $set: { categoryId: new Types.ObjectId(params.toCategoryId) } },
       { new: true },
     ).exec();
   }
