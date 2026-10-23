@@ -195,6 +195,42 @@ export function isPubliclyVisible(
   return false;
 }
 
+/**
+ * Root-to-node ancestry for a category, including the category itself.
+ * Returns `null` when any link is missing or the graph contains a cycle, so
+ * callers never write a reference onto an incomplete path.
+ */
+export function collectAncestorIds(
+  categories: CategoryDocument[],
+  categoryId: string,
+): string[] | null {
+  const map = byId(categories);
+  const path: string[] = [];
+  const seen = new Set<string>();
+  let current = map.get(categoryId);
+
+  if (!current) {
+    return null;
+  }
+
+  while (current) {
+    const currentId = current._id.toString();
+    if (seen.has(currentId)) {
+      return null;
+    }
+    seen.add(currentId);
+    path.push(currentId);
+
+    if (!current.parentId) {
+      return path.reverse();
+    }
+
+    current = map.get(current.parentId.toString());
+  }
+
+  return null;
+}
+
 /** Category ids in a subtree, including the root. Cycle-safe. */
 export function collectSubtreeIds(
   categories: CategoryDocument[],

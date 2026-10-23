@@ -1,4 +1,5 @@
 import type {
+  CatalogCategory,
   CatalogCourse,
   CatalogCourseDetail,
   CatalogInstructor,
@@ -28,6 +29,7 @@ export function toPublicCourse(course: CourseLike): PublicCourse {
     title: course.title,
     slug: course.slug,
     description: course.description,
+    categoryId: course.categoryId?.toString(),
     status: course.status,
     thumbnailUrl: course.thumbnailUrl,
     level: course.level,
@@ -130,6 +132,7 @@ export function toCourseDetail(
 export function toCatalogCourse(
   course: CourseLike,
   instructor: CatalogInstructor,
+  category: CatalogCategory | null = null,
 ): CatalogCourse {
   const priceMinor = course.priceMinor ?? 0;
 
@@ -139,6 +142,7 @@ export function toCatalogCourse(
     slug: course.slug,
     description: course.description,
     thumbnailUrl: course.thumbnailUrl,
+    category,
     level: course.level,
     language: course.language,
     priceMinor,
@@ -156,6 +160,7 @@ export function toCatalogCourse(
 export function toCatalogCourseDetail(
   course: CourseLike,
   instructor: CatalogInstructor,
+  category: CatalogCategory | null,
   sections: SectionDocument[],
   lessons: LessonDocument[],
 ): CatalogCourseDetail {
@@ -188,7 +193,7 @@ export function toCatalogCourseDetail(
   });
 
   return {
-    ...toCatalogCourse(course, instructor),
+    ...toCatalogCourse(course, instructor, category),
     learningOutcomes: course.learningOutcomes ?? [],
     requirements: course.requirements ?? [],
     curriculum,

@@ -19,12 +19,14 @@ import {
 import {
   categoryRepository,
   type CategoryRepository,
+  type CourseReferenceWrite,
   type CategoryUpdate,
 } from './category.repository.js';
 import {
   buildCategoryTree,
   categoryDepth,
   categorySubtreeHeight,
+  collectAncestorIds,
   collectSubtreeIds,
   isPubliclyVisible,
   isWithinSubtree,
@@ -71,6 +73,135 @@ export class CategoryService {
     const categories = await this.repo.listAll();
     const tree = buildCategoryTree(categories, { activeOnly: true });
     return toPublicCategoryTree(tree);
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-module references (Course ↔ Category)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Committed categories for modules that validate a category reference.
+   *
+   * Staged category creates are excluded by the repository, so a caller can
+   * never link a course to a category that is still being created.
+   */
+  async listReferenceCategories(): Promise<CategoryDocument[]> {
+    return this.repo.listAll();
+  }
+
+  /**
+   * Serialize a course-side category reference operation with category tree
+   * mutations (delete, deactivate, move, create).
+   *
+   * A course write that assigns a category holds the course edit lease first
+   * and this lease second; category operations never acquire a course lease, so
+   * the lock order cannot cycle. Acquisition is non-blocking: a competing tree
+   * mutation makes the course operation fail with `409 CATEGORY_BUSY` instead
+   * of waiting. Publishing holds this lease through its compare-and-set so an
+   * admin cannot hide or delete the category underneath the publication.
+   */
+  async withCategoryReferenceLock<T>(
+    operation: (fence: CategoryMutationFence) => Promise<T>,
+  ): Promise<T> {
+    return this.withCategoryLock(operation);
+  }
+
+  /**
+   * Add a normal (draft/rejected) reference to the category itself.
+   *
+   * The reference is written before the course row. A category delete uses a
+   * single-document filter that requires both reference arrays to be empty, so
+   * either this write wins (delete is refused) or the delete wins (this write
+   * no longer matches). No lease TTL is needed for that guarantee.
+   */
+  async addDraftCourseReference(params: {
+    categoryId: string;
+    courseId: string;
+    fence: CategoryMutationFence;
+  }): Promise<CourseReferenceWrite> {
+    return this.repo.addCourseReference(
+      normalizeObjectId(params.categoryId),
+      params.courseId,
+      params.fence,
+      { protected: false },
+    );
+  }
+
+  /**
+   * Add protected references to the category and every ancestor.
+   *
+   * The ancestor copies are what let deactivation/move use a local atomic
+   * condition: hiding or moving any node in the path must fail while a
+   * protected course exists below it, even if the original category lock lease
+   * has expired.
+   *
+   * Returns the exact categories this call added to, so a failed operation can
+   * remove only its own additions and never a pre-existing valid reference.
+   */
+  async addProtectedCourseReferencePath(params: {
+    categories: CategoryDocument[];
+    categoryId: string;
+    courseId: string;
+    fence: CategoryMutationFence;
+  }): Promise<{ ok: boolean; addedCategoryIds: string[] }> {
+    const path = collectAncestorIds(
+      params.categories,
+      normalizeObjectId(params.categoryId),
+    );
+    if (!path) {
+      return { ok: false, addedCategoryIds: [] };
+    }
+
+    const addedCategoryIds: string[] = [];
+    for (const pathCategoryId of path) {
+      const result = await this.repo.addCourseReference(
+        pathCategoryId,
+        params.courseId,
+        params.fence,
+        { protected: true, requireActive: true },
+      );
+      if (!result.matched) {
+        await this.removeCourseReferences(addedCategoryIds, params.courseId);
+        return { ok: false, addedCategoryIds: [] };
+      }
+      if (result.added) {
+        addedCategoryIds.push(pathCategoryId);
+      }
+    }
+
+    return { ok: true, addedCategoryIds };
+  }
+
+  /**
+   * Remove a course from its category and all ancestors. Used after a course
+   * changes/clears its category, is deleted, or when a failed operation has to
+   * roll back a protected reference.
+   */
+  async removeCourseReferencePath(params: {
+    categories: CategoryDocument[];
+    categoryId?: string | null;
+    courseId: string;
+  }): Promise<void> {
+    if (!params.categoryId) {
+      return;
+    }
+
+    const path = collectAncestorIds(
+      params.categories,
+      normalizeObjectId(params.categoryId),
+    ) ?? [normalizeObjectId(params.categoryId)];
+    await this.removeCourseReferences(path, params.courseId);
+  }
+
+  async removeCourseReferences(
+    categoryIds: string[],
+    courseId: string,
+  ): Promise<void> {
+    await Promise.all(
+      [...new Set(categoryIds)].map((categoryId) =>
+        this.repo.removeCourseReference(categoryId, courseId),
+      ),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -200,6 +331,7 @@ export class CategoryService {
 
       const update: CategoryUpdate = {};
       const unset: string[] = [];
+      let requiresProtectedGuard = false;
 
       if (params.input.name !== undefined) {
         update.name = params.input.name;
@@ -221,6 +353,7 @@ export class CategoryService {
         update.isActive = params.input.isActive;
         if (params.input.isActive === false) {
           await this.assertNoProtectedCourses(categories, categoryId);
+          requiresProtectedGuard = true;
         }
       }
 
@@ -252,6 +385,7 @@ export class CategoryService {
 
           if (!isPubliclyVisible(categories, parentId)) {
             await this.assertNoProtectedCourses(categories, categoryId);
+            requiresProtectedGuard = true;
           }
         }
       }
@@ -261,8 +395,21 @@ export class CategoryService {
         update,
         unset,
         fence,
+        requiresProtectedGuard
+          ? { 'protectedCourseRefs.0': { $exists: false } }
+          : {},
       );
       if (!updated) {
+        // A competing approval/publish may have protected the branch after the
+        // pre-check, or the lease expired before this write. Re-check the
+        // durable guard so the client gets the specific in-use error when
+        // possible instead of a generic busy conflict.
+        if (
+          requiresProtectedGuard &&
+          (await this.repo.hasProtectedCourseReferences([categoryId]))
+        ) {
+          throw this.inUseError();
+        }
         // The row was deleted directly in the database, or this request lost
         // its lease between validation and the fenced write.
         throw this.conflictError();
@@ -308,8 +455,21 @@ export class CategoryService {
         );
       }
 
-      const deleted = await this.repo.deleteById(categoryId, fence);
+      const deleted = await this.repo.deleteById(categoryId, fence, {
+        'courseRefs.0': { $exists: false },
+        'protectedCourseRefs.0': { $exists: false },
+      });
       if (!deleted) {
+        // A course reference may have been added after the pre-check. The
+        // reference and delete are single-document operations on this row, so
+        // MongoDB serializes them: either our delete wins, or it must fail.
+        if (await this.repo.hasCourseReference(categoryId)) {
+          throw new AppError(
+            409,
+            CATEGORY_ERRORS.CATEGORY_IN_USE,
+            'A category referenced by a course cannot be deleted',
+          );
+        }
         throw this.conflictError();
       }
     });
@@ -392,12 +552,16 @@ export class CategoryService {
   ): Promise<void> {
     const subtreeIds = collectSubtreeIds(categories, categoryId);
     if (await this.repo.hasProtectedCourseReferences(subtreeIds)) {
-      throw new AppError(
-        409,
-        CATEGORY_ERRORS.CATEGORY_IN_USE,
-        'A category with approved or published courses cannot be hidden',
-      );
+      throw this.inUseError();
     }
+  }
+
+  private inUseError(): AppError {
+    return new AppError(
+      409,
+      CATEGORY_ERRORS.CATEGORY_IN_USE,
+      'A category with approved or published courses cannot be hidden',
+    );
   }
 
   private maxDepthError(): AppError {

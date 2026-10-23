@@ -342,6 +342,13 @@ draft ──owner submit──▶ pending_review ──admin approve──▶ ap
 
 * Submission is owner-only; admins cannot submit on a teacher's behalf.
 * Approval/rejection is admin-only and only valid from `pending_review`.
+* Approval additionally requires a committed category with an active ancestor
+  chain (`422 COURSE_NOT_APPROVABLE`). It does not require the rest of the
+  publishing metadata; that is checked at publish time.
+* An admin-only, CSRF-protected `PATCH /api/admin/courses/:courseId/category`
+  repairs the category of an approved, unpublished course that has none (or has
+  an invalid historical one). It changes only `categoryId`; content and review
+  state remain frozen.
 * `approved` means "review approved", not published. The owner publishes it
   separately (`approved` → `published`) after server-side completeness
   validation.
@@ -406,22 +413,32 @@ approved ──owner publish + completeness validation──▶ published
   curriculum outline. Lesson bodies, video ids, document URLs and playback
   references are never returned: protected content requires the Enrollment and
   Course Player authorization boundary.
+* Publishing requires a category whose full ancestor chain is active. Category
+  assignment is optional while drafting and is validated under the category tree
+  lock; unknown references are rejected. Approval also requires a valid category,
+  so a newly approved course cannot enter the legacy no-category dead end.
+  Existing published courses without a category stay visible with
+  `category: null` (no backfill). An admin-only, CSRF-protected category repair
+  endpoint handles approved-but-unpublished legacy courses and changes only
+  `categoryId`.
+* The public catalog can filter by a public category slug and includes
+  descendants by default. Unknown or hidden categories are reported as not found.
 * Instructor data in the catalog is limited to display name and avatar.
 * `priceMinor` (integer minor units) and `currency` are publication metadata.
   Payments, coupons and enrollment are separate phases and no revenue is derived
   from the current price.
-* Category is not required to publish yet. The Category backend foundation
-  exists, but courses do not reference categories until the course-category PR.
 
 The full publishing contract is documented in
 [`docs/course-publishing.md`](docs/course-publishing.md).
 
-## Category Foundation
+## Categories & Course Linking
 
 Categories use an adjacency list (`parentId`) rather than denormalized ancestor
 paths, so moving a node cannot leave stale descendant metadata. The model stores
-`name`, an immutable unique `slug`, optional `description`, `isActive` and
-`sortOrder`.
+`name`, an immutable unique `slug`, optional `description`, `isActive`,
+`sortOrder`, and internal `courseRefs` / `protectedCourseRefs` membership arrays.
+Courses store an optional `categoryId` reference; a committed category with an
+active ancestor chain is required at approval and publish time.
 
 * Public reads build a tree from the category collection and expose only active
   nodes whose entire ancestor chain is active. Management fields are never
@@ -452,16 +469,36 @@ paths, so moving a node cannot leave stale descendant metadata. The model stores
   singleton with no committed generation floor cannot classify a strictly newer
   live staged row; that boundary needs transactions or a durable non-resettable
   allocator and is documented as a residual limitation.
-* Deletion is blocked by child categories or course references. Deactivation and
-  moves that would hide a branch are blocked when the subtree contains
-  approved/published courses. The course reference checks are forward-compatible
-  with the next phase; that phase must add the course `categoryId` index and
-  decide whether category-changing course writes share this lock.
+* Deletion is blocked by child categories or any course reference. Deactivation
+  and moves that would hide a branch are blocked when the subtree contains
+  `approved`/`published` courses; drafts may keep an inactive category and are
+  revalidated at approval/publish time.
+* Course category assignment takes the course edit lease first and the category
+  tree lock second. Approval and publishing take only the category tree lock.
+  Category operations never acquire a course lease, so the order cannot cycle.
+  Acquisition is non-blocking: a conflict fails with `409 CATEGORY_BUSY` instead
+  of waiting. Course writes that do not change `categoryId` never touch the
+  category lock.
+* A course reference is written to the category document before the course row.
+  `courseRefs` blocks category deletion; `protectedCourseRefs` is copied to every
+  ancestor and blocks deactivation/move of any node in the path. Category delete,
+  deactivate and move consume these references in the same single-document
+  conditional write, so the 30-second lease TTL is not the only guarantee. A
+  category delete returns `CATEGORY_IN_USE` if a reference wins; a failed
+  reference write returns `COURSE_CATEGORY_CONFLICT`.
+* Approval and publishing write protected references before their course
+  compare-and-set and re-read the category path afterward. A stale writer that
+  lost its lease while a move/deactivation occurred either fails before its CAS or
+  leaves a durable reference that blocks the concurrent category mutation. Both
+  operations cannot succeed into an approved/published course under a hidden
+  category.
+* The admin category repair path uses the same protected-reference protocol, the
+  category lock, and a category/status CAS. It only runs for approved,
+  unpublished courses and never edits content.
 * The tree builder is cycle-safe even if corrupt rows are inserted directly.
 
-Course ↔ category linking, catalog `?category=` filtering and the category
-publishing requirement are deliberately a separate phase. The full contract is
-documented in [`docs/categories.md`](docs/categories.md).
+The full category and course-linking contract is documented in
+[`docs/categories.md`](docs/categories.md).
 
 ---
 

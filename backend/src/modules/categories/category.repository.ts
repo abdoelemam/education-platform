@@ -30,6 +30,20 @@ export type CategoryUpdate = Partial<
 
 export type CategoryLockLease = CategoryMutationFence;
 
+export interface CourseReferenceWrite {
+  /** The category row still existed and carried the live fence. */
+  matched: boolean;
+  /** The course was not already present in the requested reference arrays. */
+  added: boolean;
+}
+
+export interface AddCourseReferenceOptions {
+  /** Also mark the course as approved/published and block branch hiding. */
+  protected: boolean;
+  /** Require the category itself to be active (used by protected references). */
+  requireActive?: boolean;
+}
+
 function isDuplicateKeyError(error: unknown): boolean {
   return (
     typeof error === 'object' &&
@@ -114,12 +128,14 @@ export class CategoryRepository {
     update: CategoryUpdate,
     unset: string[] = [],
     fence: CategoryMutationFence,
+    guard: Record<string, unknown> = {},
   ): Promise<CategoryDocument | null> {
     return CategoryModel.findOneAndUpdate(
       {
         _id: id,
         ...COMMITTED_CATEGORY_FILTER,
         ...activeCategoryFenceFilter(fence),
+        ...guard,
       },
       buildUpdateDocument(update, unset),
       { new: true },
@@ -127,18 +143,98 @@ export class CategoryRepository {
   }
 
   /**
-   * Delete a committed category only while `fence` is still the live lease.
+   * Delete a committed category only while `fence` is still the live lease and
+   * no course reference exists. The reference conditions are evaluated in the
+   * same single-document delete, so a course reference cannot slip in between
+   * a guard read and the delete.
    */
   async deleteById(
     id: string,
     fence: CategoryMutationFence,
+    guard: Record<string, unknown> = {},
   ): Promise<boolean> {
     const deleted = await CategoryModel.findOneAndDelete({
       _id: id,
       ...COMMITTED_CATEGORY_FILTER,
       ...activeCategoryFenceFilter(fence),
+      ...guard,
     }).exec();
     return deleted !== null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Course references
+  // -------------------------------------------------------------------------
+
+  /**
+   * Add a course reference before the course row is written.
+   *
+   * This is a single-document conditional update on the category. Combined with
+   * the category delete filter, MongoDB serializes the two operations:
+   *
+   * - reference first: the delete filter sees `courseRefs` and fails;
+   * - delete first: this update no longer matches the category and fails.
+   *
+   * The category fence is deliberately required too. If the caller's lease
+   * expired, the reference write fails rather than allowing a stale operation
+   * to attach itself to a category that another request is mutating.
+   */
+  async addCourseReference(
+    categoryId: string,
+    courseId: string,
+    fence: CategoryMutationFence,
+    options: AddCourseReferenceOptions,
+  ): Promise<CourseReferenceWrite> {
+    const courseObjectId = new Types.ObjectId(courseId);
+    const add: Record<string, Types.ObjectId> = {
+      courseRefs: courseObjectId,
+    };
+    if (options.protected) {
+      add.protectedCourseRefs = courseObjectId;
+    }
+
+    const filter: Record<string, unknown> = {
+      _id: new Types.ObjectId(categoryId),
+      ...COMMITTED_CATEGORY_FILTER,
+      ...activeCategoryFenceFilter(fence),
+    };
+    if (options.requireActive) {
+      filter.isActive = true;
+    }
+
+    const result = await CategoryModel.updateOne(
+      filter,
+      { $addToSet: add },
+      { timestamps: false },
+    ).exec();
+
+    return {
+      matched: result.matchedCount > 0,
+      added: result.modifiedCount > 0,
+    };
+  }
+
+  /**
+   * Remove a course from both membership arrays. This is intentionally not
+   * fenced: it only narrows a guard and is also used as best-effort cleanup
+   * after a successful course delete/update. Removal by course id cannot affect
+   * another course.
+   */
+  async removeCourseReference(
+    categoryId: string,
+    courseId: string,
+  ): Promise<void> {
+    const courseObjectId = new Types.ObjectId(courseId);
+    await CategoryModel.updateOne(
+      { _id: new Types.ObjectId(categoryId) },
+      {
+        $pull: {
+          courseRefs: courseObjectId,
+          protectedCourseRefs: courseObjectId,
+        },
+      },
+      { timestamps: false },
+    ).exec();
   }
 
   /**
@@ -171,41 +267,66 @@ export class CategoryRepository {
   }
 
   /**
-   * Deletion guard for the course link introduced in the next Category phase.
+   * Deletion guard for the course link.
    *
-   * The Course schema does not expose `categoryId` yet, so this intentionally
-   * queries the underlying collection. It becomes effective as soon as the
-   * course-category PR starts writing that field, and it lets this PR enforce
-   * the referential rule rather than leaving a known hole.
+   * Any course that references the category, regardless of lifecycle status,
+   * blocks deletion so a draft cannot be left with a dangling category.
    */
   async hasCourseReference(categoryId: string): Promise<boolean> {
-    const course = await CourseModel.collection.findOne(
-      { categoryId: new Types.ObjectId(categoryId) },
-      { projection: { _id: 1 } },
-    );
-    return course !== null;
+    const categoryObjectId = new Types.ObjectId(categoryId);
+    const [course, category] = await Promise.all([
+      // Legacy/corrupt rows written before reference membership existed.
+      CourseModel.findOne({ categoryId: categoryObjectId }, { _id: 1 })
+        .lean()
+        .exec(),
+      // The authoritative guard for new writes.
+      CategoryModel.findOne(
+        { _id: categoryObjectId, 'courseRefs.0': { $exists: true } },
+        { _id: 1 },
+      )
+        .lean()
+        .exec(),
+    ]);
+
+    return course !== null || category !== null;
   }
 
   /**
-   * Deactivation guard for reviewed/published courses in a subtree. Like
-   * `hasCourseReference`, it is forward-compatible with the course-category
-   * phase and is a no-op until courses can reference categories.
+   * Deactivation/move guard for reviewed/published courses in a subtree.
+   * Drafts and rejected courses may keep an inactive category; publishing
+   * re-validates that the whole ancestor chain is active.
+   *
+   * The course query covers legacy rows. New protected references are copied to
+   * every ancestor, so the category check also covers descendants atomically.
    */
   async hasProtectedCourseReferences(categoryIds: string[]): Promise<boolean> {
     if (categoryIds.length === 0) {
       return false;
     }
 
-    const course = await CourseModel.collection.findOne(
-      {
-        categoryId: {
-          $in: categoryIds.map((id) => new Types.ObjectId(id)),
+    const objectIds = categoryIds.map((id) => new Types.ObjectId(id));
+    const [course, category] = await Promise.all([
+      CourseModel.findOne(
+        {
+          categoryId: { $in: objectIds },
+          status: { $in: ['approved', 'published'] },
         },
-        status: { $in: ['approved', 'published'] },
-      },
-      { projection: { _id: 1 } },
-    );
-    return course !== null;
+        { _id: 1 },
+      )
+        .lean()
+        .exec(),
+      CategoryModel.findOne(
+        {
+          _id: { $in: objectIds },
+          'protectedCourseRefs.0': { $exists: true },
+        },
+        { _id: 1 },
+      )
+        .lean()
+        .exec(),
+    ]);
+
+    return course !== null || category !== null;
   }
 
   // -------------------------------------------------------------------------

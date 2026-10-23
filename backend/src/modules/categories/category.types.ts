@@ -29,6 +29,23 @@ export interface ICategory {
   /** Monotonic lease generation used to reject stale fence refreshes. */
   fenceGeneration?: number;
   leaseExpiresAt?: Date;
+
+  /*
+   * Course-reference membership.
+   *
+   * `courseRefs` contains every course directly assigned to this category. It
+   * is written before the course row and blocks category deletion, so a stale
+   * course write can never outlive the category it references.
+   *
+   * `protectedCourseRefs` is the subset belonging to approved, published, or
+   * currently-publishing courses. It is also copied to every ancestor of the
+   * assigned category. Deactivation and moves check this field atomically, so a
+   * category branch cannot be hidden while a protected course lives below it.
+   *
+   * These are internal fields and are never mapped to API responses.
+   */
+  courseRefs?: Types.ObjectId[];
+  protectedCourseRefs?: Types.ObjectId[];
 }
 
 export interface CategoryDocument extends ICategory, Document<Types.ObjectId> {

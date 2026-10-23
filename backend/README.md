@@ -96,10 +96,12 @@ for the full contract and provider configuration.
 - `POST /api/teacher/courses/:courseId/submit` — Submit a draft/rejected course for review
 - `POST /api/teacher/courses/:courseId/publish` — Publish an approved, complete course
 
-State-changing routes require the `X-CSRF-Token` header. Video lessons reference
-an existing video by id and never duplicate the video pipeline. See
+State-changing routes require the `X-CSRF-Token` header. A draft may optionally
+carry `categoryId`; approval and publishing require a committed category whose
+full ancestor chain is active. Video lessons reference an existing video by id and
+never duplicate the video pipeline. See
 [`../docs/course-builder.md`](../docs/course-builder.md) for the full contract;
-publishing and the public catalog are documented in
+publishing, category filtering and the public catalog are documented in
 [`../docs/course-publishing.md`](../docs/course-publishing.md).
 
 ### Course moderation (admins)
@@ -108,6 +110,7 @@ publishing and the public catalog are documented in
 - `GET /api/admin/courses/:courseId` — Full course content for review
 - `POST /api/admin/courses/:courseId/approve` — Approve a pending submission
 - `POST /api/admin/courses/:courseId/reject` — Reject a pending submission with `{ "reason": "…" }`
+- `PATCH /api/admin/courses/:courseId/category` — Category-only repair for an approved, unpublished course
 
 Only the course owner may submit or publish a course; only admins may approve or
 reject. Approval is a review outcome; owners publish separately after server-side
@@ -133,15 +136,19 @@ active categories with active ancestors and never exposes management fields.
 Create/update bodies reject unknown fields; ObjectIds are case-insensitive and
 normalized. Cycles, the depth cap, safe deletion, the generation-guarded
 database-time write fence, staged creation and all error codes are documented in
-[`../docs/categories.md`](../docs/categories.md). Course ↔ category linking and
-catalog filtering are a separate phase.
+[`../docs/categories.md`](../docs/categories.md). Courses store an optional
+`categoryId`; assignment, approval and publishing share the category lock.
+Durable `courseRefs`/`protectedCourseRefs` are written before course rows and
+checked atomically by category delete/deactivate/move, so the 30-second category
+lease is not the only guarantee. Catalog filtering uses public category slugs.
 
 ### Public catalog
 
-- `GET /api/courses?page=&limit=` — Published courses only, newest first
+- `GET /api/courses?page=&limit=&category=` — Published courses only, newest first
 - `GET /api/courses/:slug` — Published course metadata and curriculum outline
 
 The public responses never include lesson bodies, video ids, document URLs,
 review metadata or owner identifiers. Instructor data is limited to name and
-avatar. Non-published slugs return `404`.
+avatar. `category` filters by a public slug and includes descendants. Non-published
+slugs and unknown/hidden categories return `404`.
 

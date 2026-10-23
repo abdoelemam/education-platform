@@ -4,6 +4,7 @@ import { AppError } from '../../errors/index.js';
 import type { AuthUser } from '../users/user.types.js';
 import { courseService, type CourseService } from './course.service.js';
 import type {
+  AssignCourseCategoryInput,
   CourseIdParam,
   CreateCourseInput,
   CreateLessonInput,
@@ -126,6 +127,7 @@ export class CourseController {
     const result = await this.svc.listPublishedCourses({
       page: query.page,
       limit: query.limit,
+      categorySlug: query.category,
     });
 
     sendPaginated(res, result.items, {
@@ -209,6 +211,24 @@ export class CourseController {
       courseId,
       requester: user,
       reason,
+    });
+    sendSuccess(res, { course });
+  };
+
+  /**
+   * PATCH /api/admin/courses/:courseId/category
+   *
+   * Category-only repair for an approved course that has not been published.
+   */
+  assignCategory = async (req: Request, res: Response): Promise<void> => {
+    const user = this.requireUser(req);
+    const { courseId } = req.params as unknown as CourseIdParam;
+    const { categoryId } = req.body as AssignCourseCategoryInput;
+
+    const course = await this.svc.assignApprovedCourseCategory({
+      courseId,
+      requester: user,
+      categoryId,
     });
     sendSuccess(res, { course });
   };

@@ -413,6 +413,14 @@ future public catalog use.
   publishes, active/stale edit leases, the approval-before-publish ordering,
   and the public catalog (published-only filtering, pagination, instructor
   summary, free pricing and protected-content exclusion).
+- `backend/tests/course-category.test.ts` (32 integration tests) covers
+  category assignment/clearing, approval/publish-time category validation
+  (missing, inactive and hidden-ancestor cases), admin category-only repair and
+  its authorization/CSRF/strict-body guards, catalog category filtering with
+  descendants and pagination, legacy `category: null` behavior, category
+  deletion/deactivation/move guards, and deterministic lease-expiry races for
+  approval, publishing, course create/update and admin repair against category
+  delete/deactivate/move.
 
 These are integration tests against a local MongoDB test database
 (`education-platform-test` on loopback), not mocked repositories. Concurrency
@@ -420,7 +428,7 @@ coverage combines real parallel HTTP requests with deterministic stall wrappers
 that delegate to the real Mongoose repositories. The suite runs against a
 standalone MongoDB server, so multi-document transactions are not exercised.
 
-The full backend suite currently has 221 passing tests.
+The full backend suite currently has 253 passing tests.
 
 ## Known limitations / follow-ups
 
@@ -460,11 +468,11 @@ The full backend suite currently has 221 passing tests.
   row. It is never returned by reads. For an existing course, the next lease
   acquisition removes it; for a deleted parent there is no later acquisition,
   so it remains an orphan until manual cleanup.
-- Course ↔ category linking, thumbnail upload, course preview,
-  archive/unpublish and post-publication editing remain separate phases. The
-  category backend foundation is documented in
-  [`categories.md`](categories.md); courses do not reference categories yet, so
-  a category is not required to publish. Publishing and the public catalog are
-  implemented in [`course-publishing.md`](course-publishing.md). Pricing is
+- Course ↔ category linking is implemented: `categoryId` is optional while
+  drafting and required at publish time, with category-tree locking documented
+  in [`categories.md`](categories.md). Thumbnail upload, course preview,
+  archive/unpublish and post-publication editing remain separate phases.
+  Publishing and the public catalog, including `?category=` filtering, are
+  documented in [`course-publishing.md`](course-publishing.md). Pricing is
   stored for future checkout but no payment, coupon or enrollment logic exists
   yet.
