@@ -420,7 +420,7 @@ coverage combines real parallel HTTP requests with deterministic stall wrappers
 that delegate to the real Mongoose repositories. The suite runs against a
 standalone MongoDB server, so multi-document transactions are not exercised.
 
-The full backend suite currently has 186 passing tests.
+The full backend suite currently has 221 passing tests.
 
 ## Known limitations / follow-ups
 
@@ -460,9 +460,11 @@ The full backend suite currently has 186 passing tests.
   row. It is never returned by reads. For an existing course, the next lease
   acquisition removes it; for a deleted parent there is no later acquisition,
   so it remains an orphan until manual cleanup.
-- Categories, thumbnail upload, course preview, archive/unpublish and
-  post-publication editing remain separate phases. Publishing and the public
-  catalog are implemented in
-  [`course-publishing.md`](course-publishing.md); categories are not required to
-  publish. Pricing is stored for future checkout but no payment, coupon or
-  enrollment logic exists yet.
+- Course ↔ category linking, thumbnail upload, course preview,
+  archive/unpublish and post-publication editing remain separate phases. The
+  category backend foundation is documented in
+  [`categories.md`](categories.md); courses do not reference categories yet, so
+  a category is not required to publish. Publishing and the public catalog are
+  implemented in [`course-publishing.md`](course-publishing.md). Pricing is
+  stored for future checkout but no payment, coupon or enrollment logic exists
+  yet.
