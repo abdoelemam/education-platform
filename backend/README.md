@@ -21,6 +21,7 @@ src/
 ├── middleware/       # Express middleware (error handler, validation, logging)
 ├── modules/         # Feature-based modules
 │   ├── auth/        # Authentication and sessions
+│   ├── categories/  # Nested category hierarchy, admin CRUD and public tree
 │   ├── courses/     # Course Builder (courses, sections, lessons)
 │   ├── users/       # User accounts and roles
 │   ├── videos/      # Provider-agnostic video system
@@ -117,6 +118,23 @@ lease expired or was replaced gets `409 COURSE_EDIT_IN_PROGRESS` instead of
 committing; creates are staged until a fenced authorization/commit succeeds,
 and stale recovery discards rows staged or created during the takeover.
 Pending/approved/published courses cannot be deleted (`409 COURSE_NOT_DELETABLE`).
+
+### Categories
+
+- `GET /api/categories` — Public active category tree
+- `GET /api/admin/categories` — Flat list of all categories (admin)
+- `POST /api/admin/categories` — Create a category (admin)
+- `GET /api/admin/categories/:categoryId` — Get a category (admin)
+- `PATCH /api/admin/categories/:categoryId` — Update name, description, parent, active state or order (admin)
+- `DELETE /api/admin/categories/:categoryId` — Delete an unused leaf category (admin)
+
+Admin writes require the `X-CSRF-Token` header. The public endpoint returns only
+active categories with active ancestors and never exposes management fields.
+Create/update bodies reject unknown fields; ObjectIds are case-insensitive and
+normalized. Cycles, the depth cap, safe deletion, the generation-guarded
+database-time write fence, staged creation and all error codes are documented in
+[`../docs/categories.md`](../docs/categories.md). Course ↔ category linking and
+catalog filtering are a separate phase.
 
 ### Public catalog
 

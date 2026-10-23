@@ -18,6 +18,10 @@ import {
   createPublicCourseRouter,
 } from './modules/courses/index.js';
 import type { CourseService } from './modules/courses/index.js';
+import {
+  createAdminCategoryRouter,
+  createPublicCategoryRouter,
+} from './modules/categories/index.js';
 
 export interface CreateAppOptions {
   /**
@@ -73,14 +77,12 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.use('/api/teacher/courses', createCourseRouter(options.courseService));
   app.use('/api/admin/courses', createAdminCourseRouter(options.courseService));
   app.use('/api/courses', createPublicCourseRouter(options.courseService));
+  app.use('/api/admin/categories', createAdminCategoryRouter());
+  app.use('/api/categories', createPublicCategoryRouter());
 
   // Future module routes will be registered here:
-  // app.use('/api/auth', authRoutes);
-  // app.use('/api/courses', courseRoutes);
-  // app.use('/api/categories', categoryRoutes);
   // app.use('/api/teacher', teacherRoutes);
   // app.use('/api/student', studentRoutes);
-  // app.use('/api/admin', adminRoutes);
   // app.use('/api/payments', paymentRoutes);
 
   // ---------------------------------------------------------------------------

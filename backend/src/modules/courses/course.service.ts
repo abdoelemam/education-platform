@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { Types } from 'mongoose';
 import { AppError } from '../../errors/index.js';
+import { slugify } from '../../utils/slug.js';
 import { AUTH_ERRORS } from '../auth/auth.constants.js';
 import type { AuthUser } from '../users/user.types.js';
 import {
@@ -115,21 +116,6 @@ interface ContentSnapshot {
   stagedLessonIds: string[];
 }
 
-/**
- * Turn an arbitrary title into a URL-safe ASCII slug. Non-latin titles (for
- * example fully-Arabic titles) produce an empty base; the caller then falls
- * back to a random slug.
- */
-function slugify(input: string): string {
-  return input
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, SLUG_BASE_MAX);
-}
-
 function isDuplicateKeyError(error: unknown): boolean {
   return (
     typeof error === 'object' &&
@@ -189,7 +175,9 @@ export class CourseService {
     ownerId: string;
     input: { title: string; description?: string };
   }): Promise<CourseDetail> {
-    const base = slugify(params.input.title) || `course-${randomBytes(4).toString('hex')}`;
+    const base =
+      slugify(params.input.title, SLUG_BASE_MAX) ||
+      `course-${randomBytes(4).toString('hex')}`;
 
     for (let attempt = 0; attempt <= COURSE_SLUG_MAX_ATTEMPTS; attempt += 1) {
       const slug =

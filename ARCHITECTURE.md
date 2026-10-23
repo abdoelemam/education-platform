@@ -410,10 +410,58 @@ approved ──owner publish + completeness validation──▶ published
 * `priceMinor` (integer minor units) and `currency` are publication metadata.
   Payments, coupons and enrollment are separate phases and no revenue is derived
   from the current price.
-* Category is not required to publish until the Category phase exists.
+* Category is not required to publish yet. The Category backend foundation
+  exists, but courses do not reference categories until the course-category PR.
 
 The full publishing contract is documented in
 [`docs/course-publishing.md`](docs/course-publishing.md).
+
+## Category Foundation
+
+Categories use an adjacency list (`parentId`) rather than denormalized ancestor
+paths, so moving a node cannot leave stale descendant metadata. The model stores
+`name`, an immutable unique `slug`, optional `description`, `isActive` and
+`sortOrder`.
+
+* Public reads build a tree from the category collection and expose only active
+  nodes whose entire ancestor chain is active. Management fields are never
+  returned publicly.
+* Admin CRUD requires `role = "admin"`; writes are CSRF-protected. Create and
+  update bodies are strict Zod objects, and ObjectIds are normalized before
+  comparison.
+* The service rejects self-parenting, moves under a descendant, missing parents
+  and trees deeper than 10 levels.
+* Category-tree mutations are serialized by a short-lived lease because
+  standalone MongoDB cannot transact across parent/child documents. Acquisition
+  uses MongoDB server time. The same atomic acquisition increments a monotonic
+  generation and copies the token, generation and expiry onto committed category
+  rows that carry an older generation; every write must match all three at
+  database time, and creates are staged until a fenced commit succeeds. A late
+  refresh from an older holder cannot overwrite a newer fence, and acquisition
+  revalidates token/generation/expiry after refreshing. A stalled writer cannot
+  land after its lease expired or a newer writer took over. A concurrent/
+  conflicted write gets `409 CATEGORY_BUSY`; expired and malformed locks are
+  recoverable. Acquisition also reconciles the lease generation against the
+  highest committed row fence and raises it with a guarded atomic lock update
+  when the singleton was deleted, recreated or restored at an older generation.
+  The following refresh then rewrites every older fence, so a holder that
+  validated under the lost lock cannot write. Staged rows from older or
+  same-generation foreign tokens are revoked before the refresh; expired ones
+  are cleaned up and a strictly newer live staged row is preserved. Standalone
+  MongoDB cannot atomically couple the lock with a staged commit, so a restored
+  singleton with no committed generation floor cannot classify a strictly newer
+  live staged row; that boundary needs transactions or a durable non-resettable
+  allocator and is documented as a residual limitation.
+* Deletion is blocked by child categories or course references. Deactivation and
+  moves that would hide a branch are blocked when the subtree contains
+  approved/published courses. The course reference checks are forward-compatible
+  with the next phase; that phase must add the course `categoryId` index and
+  decide whether category-changing course writes share this lock.
+* The tree builder is cycle-safe even if corrupt rows are inserted directly.
+
+Course ↔ category linking, catalog `?category=` filtering and the category
+publishing requirement are deliberately a separate phase. The full contract is
+documented in [`docs/categories.md`](docs/categories.md).
 
 ---
 

@@ -55,10 +55,11 @@ array clears them (but an empty `learningOutcomes` blocks publishing).
 `status`, `publishedAt` and all review/lease fields are server-owned and are
 stripped from client payloads.
 
-**Category is deliberately not part of publishing in this phase.** The
-Category module (Phase 3) does not exist yet, so requiring it would block every
-publication. It becomes an additional publishing requirement when that phase is
-implemented.
+**Category is deliberately not part of publishing yet.** The Category backend
+foundation now exists (see [`categories.md`](categories.md)), but courses cannot
+reference a category until the separate course-category PR lands. Category
+selection, catalog filtering and the publishing requirement will be added in
+that PR; requiring a category now would break every publication.
 
 ## Completeness rules
 
@@ -242,11 +243,13 @@ concurrent publishes, active and stale leases, approval ordering, and the public
 catalog (published-only filtering, pagination, instructor summary, free pricing,
 protected-content exclusion and 404/422 behavior).
 
-The full backend suite has 186 passing tests.
+The category foundation adds 35 integration tests; the full backend suite has
+221 passing tests.
 
 ## Deferred
 
-- Categories and category filtering.
+- Course ↔ category linking, category catalog filtering and the category
+  publishing requirement.
 - Archive, unpublish, delete-published and edit-after-publication flows.
 - Search, filters, sorting and ratings in the catalog.
 - Thumbnail upload/storage provider (this phase stores an external URL).

@@ -92,14 +92,35 @@ Teacher approval status    ✅
 
 # Phase 3 — Categories
 
+Status: Category backend foundation complete. Course ↔ category linking and
+catalog filtering are the next PR.
+
 Tasks:
 
-* [ ] Category model
-* [ ] Nested category support
-* [ ] Category tree
-* [ ] Admin CRUD
-* [ ] Public category listing
-* [ ] Category filtering
+* [x] Category model
+* [x] Nested category support
+* [x] Category tree
+* [x] Admin CRUD
+* [x] Public category listing
+* [ ] Category filtering (requires course ↔ category linking)
+
+Notes: the foundation provides a `parentId` adjacency-list hierarchy, unique
+immutable slugs, description, active state and `sortOrder`. Admin routes are
+admin-only and CSRF-protected; the public endpoint exposes only active nodes with
+active ancestors. The backend prevents self/descendant cycles, enforces a depth
+cap of 10, serializes tree mutations with a database-time lease/fence, and
+rejects writes from a lease that expired or was replaced. A monotonic generation
+prevents an older holder's late lease refresh from overwriting a newer fence,
+acquisition reconciles that generation above existing row fences after lock
+document loss/recreation/older restore, it revokes older staged creates, and it
+revalidates ownership after refreshing. Creates are staged until a fenced commit
+succeeds. It blocks
+deletion of categories with children or course references, and blocks hiding a
+branch with approved/published courses. The deletion/course-reference guard is
+forward-compatible with the next PR. Covered by 35 integration tests in
+`backend/tests/categories.test.ts`; contract
+documented in [`docs/categories.md`](docs/categories.md). Course linking, catalog
+filtering and the publish requirement remain deferred.
 
 ---
 
@@ -114,7 +135,7 @@ Tasks:
 * [x] Course status
 * [x] Course slug
 * [ ] Thumbnail upload (external `thumbnailUrl` metadata is implemented)
-* [ ] Category
+* [ ] Course ↔ category link (category backend foundation complete)
 * [x] Pricing (`priceMinor` + `currency` metadata; no payments yet)
 * [x] Level
 * [x] Language
@@ -131,8 +152,9 @@ phase added the review lifecycle (`draft`/`rejected` → `pending_review` →
 `approved`/`rejected`), owner-only submission and admin-only moderation. The
 Course Publishing phase added owner-only publishing (`approved` → `published`)
 with server-side completeness validation, and a public catalog limited to
-published courses. Thumbnail upload, category and course preview remain
-deferred; `thumbnailUrl` is an external HTTP(S) reference.
+published courses. The Category backend foundation is complete, but course ↔
+category linking remains deferred. Thumbnail upload and course preview also
+remain deferred; `thumbnailUrl` is an external HTTP(S) reference.
 
 ---
 
@@ -260,7 +282,7 @@ Tasks:
 * [x] Public course detail by slug
 * [x] Instructor summary (name/avatar only)
 * [x] Protected lesson content excluded from public responses
-* [ ] Category requirement (deferred until Phase 3)
+* [ ] Category requirement (course ↔ category linking is the next PR)
 * [ ] Thumbnail upload provider
 * [ ] Search/filter/sort in the catalog
 * [ ] Archive / unpublish / post-publication edit flow
@@ -584,8 +606,9 @@ Teacher Workflow
 Course Publishing + Public Catalog
 ```
 
-Categories and the remaining Course Management work stay defined in this
-roadmap and continue after the agreed sequence.
+The Category backend foundation now follows the agreed sequence. Course ↔
+category linking, category filtering and the remaining Course Management work
+stay defined in this roadmap and continue next.
 
 ---
 
@@ -594,7 +617,7 @@ roadmap and continue after the agreed sequence.
 Current phase:
 
 ```text
-Course Publishing + Public Catalog (backend complete; UI deferred)
+Category Backend Foundation (course ↔ category integration and filtering deferred)
 ```
 
 Completed:
@@ -607,15 +630,17 @@ Phase 6 — Video System foundational backend
 Phase 5 — Course Builder backend
 Teacher Workflow — course submission, review and approval backend
 Course Publishing — approval-to-publication backend + public catalog minimum
+Phase 3 — Category model, hierarchy, admin CRUD and public active tree
 ```
 
 Immediate next tasks:
 
 ```text
-1. Categories (Phase 3) and the remaining Course Management items
-   (thumbnail upload, course preview)
-2. Enrollment (Phase 7), then Course Player (Phase 8) and Progress (Phase 9)
-3. Course Builder + moderation + publishing frontend (once the frontend app is initialized)
+1. Course ↔ category linking, catalog category filtering and the publish
+   requirement (separate PR)
+2. Remaining Course Management items (thumbnail upload, course preview)
+3. Enrollment (Phase 7), then Course Player (Phase 8) and Progress (Phase 9)
+4. Course Builder + moderation + publishing frontend (once the frontend app is initialized)
 ```
 
 The remaining Video System items (resumable uploads, upload UI, upload progress,
