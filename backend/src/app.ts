@@ -22,6 +22,12 @@ import {
   createAdminCategoryRouter,
   createPublicCategoryRouter,
 } from './modules/categories/index.js';
+import {
+  createCourseEnrollmentRouter,
+  createMyCoursesRouter,
+  createTeacherEnrollmentRouter,
+} from './modules/enrollments/index.js';
+import type { EnrollmentService } from './modules/enrollments/index.js';
 
 export interface CreateAppOptions {
   /**
@@ -34,6 +40,11 @@ export interface CreateAppOptions {
    * repositories instead of touching the database directly.
    */
   courseService?: CourseService;
+  /**
+   * Optional enrollment service override, mirroring the course service hook for
+   * tests that want to isolate enrollment logic.
+   */
+  enrollmentService?: EnrollmentService;
 }
 
 /**
@@ -74,8 +85,18 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.use('/api', healthRoutes);
   app.use('/api/auth', authRoutes);
   app.use('/api/teacher/videos', createVideoRouter(options.videoService));
+  // Mounted before the course builder router so a roster request is handled
+  // here and does not run the builder's router-level authentication twice.
+  app.use(
+    '/api/teacher/courses/:courseId/enrollments',
+    createTeacherEnrollmentRouter(options.enrollmentService),
+  );
   app.use('/api/teacher/courses', createCourseRouter(options.courseService));
   app.use('/api/admin/courses', createAdminCourseRouter(options.courseService));
+  app.use('/api/my-courses', createMyCoursesRouter(options.enrollmentService));
+  // Enrollment routes are mounted before the public catalog. They declare
+  // per-route authentication, so unmatched catalog requests fall through.
+  app.use('/api/courses', createCourseEnrollmentRouter(options.enrollmentService));
   app.use('/api/courses', createPublicCourseRouter(options.courseService));
   app.use('/api/admin/categories', createAdminCategoryRouter());
   app.use('/api/categories', createPublicCategoryRouter());

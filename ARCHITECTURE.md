@@ -557,7 +557,91 @@ backend/src/modules/videos/
 
 ---
 
-# 13. Payment Architecture
+# 13. Enrollment Architecture
+
+Enrollment is the authorized student ↔ course relationship. It is not a copy of
+course metadata and it is not a payment record.
+
+```text
+Student
+   ↓
+POST /api/courses/:courseId/enroll
+   ↓
+Authentication + student role
+   ↓
+Enrollment Service
+   ↓
+Published-course + free eligibility (server-owned)
+   ↓
+Atomic upsert
+   ↓
+Enrollment (unique studentId + courseId)
+```
+
+Rules:
+
+- The request body is not trusted. Price, status, source, order and timestamps
+  are server-owned; enrollment accepts no client fields.
+- Free enrollment is allowed only for a currently published course whose server
+  price is exactly `0` (or missing on a legacy published course). The same
+  `isCourseFree` predicate is used by the catalog and enrollment; invalid legacy
+  prices (negative, `NaN`, non-finite) are never treated as free. Every other
+  lifecycle state is treated as not found.
+- A paid or invalid-price course returns `409 ENROLLMENT_PAYMENT_REQUIRED` and
+  creates no enrollment until a verified payment flow exists.
+- One enrollment per student per course is enforced by a unique compound index.
+  Concurrent upserts resolve to the same row, and duplicate requests return the
+  existing row with `created: false`.
+- A repeated enrollment never mutates business fields (`$setOnInsert`), so
+  completion state, `enrolledAt`, `completedAt` and `source` are preserved.
+  Mongoose may advance `updatedAt`; that is not a lifecycle transition. A
+  duplicate request for a cancelled/expired row returns it unchanged with
+  `hasAccess: false` and never reactivates it.
+- Required model indexes are initialized with `Model.init()` after the database
+  connection and before the HTTP listener starts. Initialization failures abort
+  startup; no destructive index synchronization is performed.
+- Enrollment is a student-only action. Teachers and admins use course-management
+  endpoints and receive `403` on student endpoints.
+- The teacher roster is owner-scoped (admin bypass) and never returns student
+  email.
+- `enrolled` means record existence only and is never sufficient authorization.
+  The reusable server-side predicate `canAccessCourse` grants content access for
+  `active` and `completed` enrollments only when the course is published;
+  `cancelled` and `expired` never grant access. The Course Player must call this
+  predicate (or an equivalent service check) against database records on every
+  protected read; frontend flags are informational only.
+- `status` supports `active`, `completed`, `cancelled`, `expired`. Completion is
+  written by authoritative Progress logic, never by a client. `markCompleted`
+  returns `null` when no transition occurs so a cancelled/expired row cannot be
+  mistaken for a successful completion.
+- Lesson progress and course completion percentages belong to the Progress
+  System. `progress` in the student course list stays `null` until that system
+  exists.
+- Reads use lean documents so legacy rows missing `status`, `enrolledAt` or
+  `source` are normalized from stored data instead of receiving read-time schema
+  defaults. A row missing both `enrolledAt` and `createdAt` exposes
+  `enrolledAt: null`; no timestamp is fabricated.
+
+Module layout:
+
+```text
+src/modules/enrollments/
+├── enrollment.model.ts
+├── enrollment.types.ts
+├── enrollment.constants.ts
+├── enrollment.validation.ts
+├── enrollment.mapper.ts
+├── enrollment.repository.ts
+├── enrollment.service.ts
+├── enrollment.controller.ts
+├── enrollment.routes.ts
+├── teacher-enrollment.routes.ts
+└── index.ts
+```
+
+---
+
+# 14. Payment Architecture
 
 ```text
 Student
@@ -583,7 +667,7 @@ Webhook handling must be idempotent.
 
 ---
 
-# 14. Progress Architecture
+# 15. Progress Architecture
 
 ```text
 Video Player
@@ -605,7 +689,7 @@ Use throttled updates.
 
 ---
 
-# 15. Quiz Architecture
+# 16. Quiz Architecture
 
 ```text
 Student
@@ -627,7 +711,7 @@ The client cannot determine its own score.
 
 ---
 
-# 16. Certificate Architecture
+# 17. Certificate Architecture
 
 ```text
 Course Completion
@@ -659,7 +743,7 @@ Valid / Invalid
 
 ---
 
-# 17. Notification Architecture
+# 18. Notification Architecture
 
 Business operation:
 
@@ -683,7 +767,7 @@ Realtime delivery must not be required for the core transaction to succeed.
 
 ---
 
-# 18. API Organization
+# 19. API Organization
 
 Public APIs:
 
@@ -697,15 +781,21 @@ Public APIs:
 Student APIs:
 
 ```text
+/api/my-courses
+/api/courses/:courseId/enroll
+/api/courses/:courseId/enrollment
 /api/student/*
 /api/learning/*
 ```
+
+`/api/my-courses` is the canonical student course-list endpoint.
 
 Teacher APIs:
 
 ```text
 /api/teacher/*
 /api/teacher/videos/*
+/api/teacher/courses/:courseId/enrollments
 ```
 
 Admin APIs:
@@ -722,7 +812,7 @@ Payment APIs:
 
 ---
 
-# 19. Frontend Feature Structure
+# 20. Frontend Feature Structure
 
 ```text
 src/
@@ -758,7 +848,7 @@ src/
 
 ---
 
-# 20. Frontend Data Flow
+# 21. Frontend Data Flow
 
 ```text
 React Component
@@ -776,7 +866,7 @@ Node.js API
 
 ---
 
-# 21. Frontend Authentication Flow
+# 22. Frontend Authentication Flow
 
 ```text
 Application Start
@@ -794,7 +884,7 @@ The frontend should not assume authentication based only on local storage.
 
 ---
 
-# 22. Error Flow
+# 23. Error Flow
 
 Backend:
 
@@ -822,7 +912,7 @@ UI Error State
 
 ---
 
-# 23. Security Boundary
+# 24. Security Boundary
 
 The frontend is untrusted.
 
@@ -845,7 +935,7 @@ The backend validates and calculates authoritative values.
 
 ---
 
-# 24. Deployment Architecture
+# 25. Deployment Architecture
 
 The target deployment may eventually be:
 

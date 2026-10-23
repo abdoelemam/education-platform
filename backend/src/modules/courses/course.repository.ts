@@ -105,6 +105,21 @@ export class CourseRepository {
     return CourseModel.findById(id).exec();
   }
 
+  /**
+   * Load several courses in one query. Used by listing endpoints that join a
+   * page of related records (for example a student's enrollments) to course
+   * summaries without issuing one query per row.
+   */
+  async findByIds(ids: string[]): Promise<CourseDocument[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    return CourseModel.find({
+      _id: { $in: ids.map((id) => new Types.ObjectId(id)) },
+    }).exec();
+  }
+
   async listByOwner(params: ListCoursesParams): Promise<ListCoursesResult> {
     const filter = { ownerId: new Types.ObjectId(params.ownerId) };
 
