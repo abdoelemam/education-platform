@@ -1,3 +1,4 @@
+import { isCourseFree } from './course.pricing.js';
 import type {
   CatalogCategory,
   CatalogCourse,
@@ -147,7 +148,7 @@ export function toCatalogCourse(
     language: course.language,
     priceMinor,
     currency: course.currency,
-    isFree: priceMinor === 0,
+    isFree: isCourseFree(course.priceMinor),
     publishedAt: (course.publishedAt ?? course.createdAt).toISOString(),
     instructor,
   };

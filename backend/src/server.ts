@@ -1,23 +1,29 @@
 import { createApp } from './app.js';
+import { bootstrapApplication } from './bootstrap.js';
 import { config } from './config/index.js';
-import { connectDatabase, disconnectDatabase } from './database/index.js';
+import {
+  connectDatabase,
+  disconnectDatabase,
+  initializeModelIndexes,
+} from './database/index.js';
 import { logger } from './utils/logger.js';
 
 /**
  * Start the application server.
  *
  * 1. Connect to MongoDB
- * 2. Create Express app
- * 3. Listen on configured port
- * 4. Register graceful shutdown handlers
+ * 2. Initialize required model indexes (fail fast on failure)
+ * 3. Create Express app
+ * 4. Listen on configured port
+ * 5. Register graceful shutdown handlers
  */
 async function startServer(): Promise<void> {
   try {
-    // Connect to database first
-    await connectDatabase();
-
-    // Create and start Express app
-    const app = createApp();
+    const app = await bootstrapApplication({
+      connect: connectDatabase,
+      initializeIndexes: initializeModelIndexes,
+      createApp,
+    });
 
     const server = app.listen(config.PORT, () => {
       logger.info(`🚀 Server running on port ${config.PORT}`, {

@@ -303,22 +303,45 @@ lock. Durable category references are written before course rows so lease expiry
 cannot hide an approved/published course. The public catalog exposes metadata and
 a curriculum outline but never lesson bodies, video ids, document URLs or
 playback references, and can filter by a category slug including descendants.
-Pricing is stored for future checkout; no payments, coupons or enrollment logic
-exists in this phase. Covered by 27 publishing integration tests plus 32
-course-category integration tests.
+Pricing is stored for future checkout; no payments or coupons exist yet.
+Enrollment is implemented separately in Phase 7. Covered by 27 publishing
+integration tests plus 32 course-category integration tests.
 
 ---
 
 # Phase 7 — Student Enrollment
 
+Status: Backend complete (frontend deferred with the frontend app)
+
 Tasks:
 
-* [ ] Enrollment model
-* [ ] Free enrollment
-* [ ] Enrollment validation
-* [ ] Student course list
-* [ ] Course access authorization
-* [ ] Enrollment history
+* [x] Enrollment model
+* [x] Free enrollment
+* [x] Enrollment validation
+* [x] Student course list
+* [x] Course access authorization (enrollment eligibility + status/access predicate; protected lesson content lands in Phase 8)
+* [x] Enrollment history (student enrollment list with lifecycle timestamps)
+* [ ] Enrollment UI
+
+Notes: paid courses are blocked with `409 ENROLLMENT_PAYMENT_REQUIRED` and no
+enrollment row is created until verified payments exist (Phase 12). One
+enrollment per student/course is enforced by a unique compound index, and
+enrollment is an atomic idempotent upsert (`201` created / `200` existing),
+including under concurrent requests. Enrollment is student-only.
+`GET /api/my-courses` is the canonical student list and returns safe course
+summaries with `progress: null` until Phase 9. The teacher roster is owner-scoped
+(admin bypass) and omits student email. Legacy published courses without
+price/currency and legacy enrollment rows are normalized on read. Record
+existence (`enrolled`) is separate from access: the reusable `canAccessCourse`
+predicate allows published-course access for `active` and `completed`
+enrollments, denies `cancelled`/`expired`, and is exposed as `hasAccess`.
+Repeated enrollment never reactivates a cancelled/expired row. Required model
+indexes are initialized before the server listens, and an index failure aborts
+startup. Enrollment does not by itself grant protected lesson content; the
+Course Player must enforce the access predicate on every protected read.
+Status-transition audit history and cancellation/expiry flows are not part of
+this phase. Covered by 48 enrollment integration tests plus startup/index
+initialization tests.
 
 ---
 
@@ -630,7 +653,7 @@ defined in this roadmap and continue next.
 Current phase:
 
 ```text
-Category backend + course ↔ category integration complete
+Enrollment backend complete
 ```
 
 Completed:
@@ -644,14 +667,15 @@ Phase 5 — Course Builder backend
 Teacher Workflow — course submission, review and approval backend
 Course Publishing — approval-to-publication backend + public catalog minimum
 Phase 3 — Categories + course ↔ category linking, filtering and publish requirement
+Phase 7 — Enrollment backend (free enrollment, student course list, teacher roster)
 ```
 
 Immediate next tasks:
 
 ```text
 1. Remaining Course Management items (thumbnail upload, course preview)
-2. Enrollment (Phase 7), then Course Player (Phase 8) and Progress (Phase 9)
-3. Course Builder + moderation + publishing frontend (once the frontend app is initialized)
+2. Course Player (Phase 8) protected lesson access, then Progress (Phase 9)
+3. Course Builder + moderation + publishing + enrollment frontend (once the frontend app is initialized)
 ```
 
 The remaining Video System items (resumable uploads, upload UI, upload progress,

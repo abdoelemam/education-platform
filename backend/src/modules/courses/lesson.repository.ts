@@ -115,6 +115,35 @@ export class LessonRepository {
       .exec();
   }
 
+  /**
+   * Count committed lessons for several courses in one aggregation. Used by
+   * listing endpoints that show a curriculum summary per course.
+   */
+  async countCommittedByCourseIds(
+    courseIds: string[],
+  ): Promise<Map<string, number>> {
+    if (courseIds.length === 0) {
+      return new Map();
+    }
+
+    const rows = await LessonModel.aggregate<{
+      _id: Types.ObjectId;
+      count: number;
+    }>([
+      {
+        $match: {
+          courseId: {
+            $in: courseIds.map((id) => new Types.ObjectId(id)),
+          },
+          ...COMMITTED_CONTENT_FILTER,
+        },
+      },
+      { $group: { _id: '$courseId', count: { $sum: 1 } } },
+    ]).exec();
+
+    return new Map(rows.map((row) => [row._id.toString(), row.count]));
+  }
+
   async listBySection(sectionId: string): Promise<LessonDocument[]> {
     return LessonModel.find({
       sectionId,
