@@ -322,9 +322,12 @@ passing tests.
 - Archive, unpublish, delete-published and edit-after-publication flows.
 - Search, combined filters, sorting and ratings in the catalog.
 - Thumbnail upload/storage provider (this phase stores an external URL).
-- Payments, checkout, coupons and enrollment. `priceMinor`/`currency` are
-  publication metadata only; no purchase or revenue calculation exists.
-- Protected lesson delivery and playback authorization (Enrollment/Course
-  Player phases).
+- Payments, checkout and coupons. `priceMinor`/`currency` are publication
+  metadata only; no purchase or revenue calculation exists. Free enrollment is
+  implemented separately (see [`enrollment.md`](enrollment.md)).
+- Lesson progress, resume position and completion (Phase 9).
 - Instructor profiles beyond `name` and `avatar`.
 - Quiz lessons (Quiz System phase).
+
+Protected lesson delivery and playback authorization are implemented by the
+Course Player; see [`course-player.md`](course-player.md).

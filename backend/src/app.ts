@@ -28,6 +28,8 @@ import {
   createTeacherEnrollmentRouter,
 } from './modules/enrollments/index.js';
 import type { EnrollmentService } from './modules/enrollments/index.js';
+import { createCoursePlayerRouter } from './modules/course-player/index.js';
+import type { CoursePlayerService } from './modules/course-player/index.js';
 import {
   createAdminTeacherRouter,
   createTeacherApplicationRouter,
@@ -54,6 +56,10 @@ export interface CreateAppOptions {
    * Optional teacher-approval service override for tests.
    */
   teacherApprovalService?: TeacherApprovalService;
+  /**
+   * Optional Course Player service override for tests.
+   */
+  coursePlayerService?: CoursePlayerService;
 }
 
 /**
@@ -116,6 +122,9 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   // Enrollment routes are mounted before the public catalog. They declare
   // per-route authentication, so unmatched catalog requests fall through.
   app.use('/api/courses', createCourseEnrollmentRouter(options.enrollmentService));
+  // Protected Course Player content. Authentication is declared per route so
+  // the public catalog below remains anonymous.
+  app.use('/api/courses', createCoursePlayerRouter(options.coursePlayerService));
   app.use('/api/courses', createPublicCourseRouter(options.courseService));
   app.use('/api/admin/categories', createAdminCategoryRouter());
   app.use('/api/categories', createPublicCategoryRouter());

@@ -106,6 +106,21 @@ export class LessonRepository {
     }).exec();
   }
 
+  /**
+   * Course-scoped lookup used by the Course Player. A lesson id from another
+   * course is treated as missing rather than resolved globally.
+   */
+  async findByCourseAndId(
+    courseId: string,
+    lessonId: string,
+  ): Promise<LessonDocument | null> {
+    return LessonModel.findOne({
+      _id: lessonId,
+      courseId,
+      ...COMMITTED_CONTENT_FILTER,
+    }).exec();
+  }
+
   async listByCourse(courseId: string): Promise<LessonDocument[]> {
     return LessonModel.find({
       courseId,
