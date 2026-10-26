@@ -16,13 +16,15 @@ Implemented in this phase:
 - Student enrollment status for one course
 - Teacher/admin course roster (owner-scoped)
 - Backend authorization and course-eligibility enforcement
-- A reusable enrollment/course access predicate for the upcoming Course Player
+- A reusable enrollment/course access predicate, consumed by the Course Player
+  (Phase 8)
 - Startup index initialization before the HTTP server accepts traffic
 - Legacy published-course and legacy enrollment-row compatibility
 
-Deliberately **not** implemented in this phase: course player, lesson access
-endpoints, lesson progress, quizzes, certificates, cancellation/expiry flows and
-payment-provider integration.
+Deliberately **not** implemented in this phase: lesson progress, quizzes,
+certificates, cancellation/expiry flows and payment-provider integration.
+Protected lesson delivery is implemented separately by the Course Player
+(Phase 8); see [`course-player.md`](course-player.md).
 
 ## Enrollment model
 
@@ -136,7 +138,7 @@ reusable server-side predicate in
 enrollment lifecycle would otherwise allow access. Legacy rows without a stored
 `status` resolve to `completed` when `completedAt` exists, otherwise `active`.
 
-The Course Player must verify, on every protected read:
+The Course Player verifies, on every protected read:
 
 ```text
 authenticated
@@ -152,6 +154,10 @@ allow lesson content
 frontend flags are informational only. Every protected backend route must call
 the same access predicate (or an equivalent service method) against the
 authoritative database records.
+
+This policy is implemented by `GET /api/courses/:courseId/lessons/:lessonId`.
+See [`course-player.md`](course-player.md) for the endpoint contract, response
+shapes and the owner-teacher/admin preview rules.
 
 ## API
 
@@ -313,7 +319,6 @@ accepted from a client.
 
 ## Deferred work
 
-- Course Player protected lesson access (Phase 8)
 - Lesson progress and course completion rules (Phase 9)
 - Checkout, verified webhooks, Order/Purchase records and paid enrollment
   (Phase 12)

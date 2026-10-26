@@ -23,6 +23,7 @@ src/
 │   ├── auth/        # Authentication and sessions
 │   ├── categories/  # Nested category hierarchy, admin CRUD and public tree
 │   ├── courses/     # Course Builder (courses, sections, lessons)
+│   ├── course-player/ # Protected lesson content and navigation
 │   ├── teacher-approvals/ # Admin teacher account review
 │   ├── users/       # User accounts and roles
 │   ├── videos/      # Provider-agnostic video system
@@ -168,6 +169,18 @@ database-time write fence, staged creation and all error codes are documented in
 Durable `courseRefs`/`protectedCourseRefs` are written before course rows and
 checked atomically by category delete/deactivate/move, so the 30-second category
 lease is not the only guarantee. Catalog filtering uses public category slugs.
+
+### Course Player (authenticated)
+
+- `GET /api/courses/:courseId/lessons/:lessonId` — Protected lesson content and previous/next navigation
+
+Students need a published course and an active/completed enrollment. Approved
+course owners and admins may preview unpublished content; non-owners and
+non-approved teachers are denied. Free courses still require enrollment, and
+there is no preview-lesson bypass. Video responses contain only a ready
+playback URL, duration and thumbnail; provider metadata is never exposed.
+Staged sections and lessons remain hidden. See
+[`../docs/course-player.md`](../docs/course-player.md) for the full contract.
 
 ### Public catalog
 

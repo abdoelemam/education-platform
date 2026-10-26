@@ -784,11 +784,17 @@ Student APIs:
 /api/my-courses
 /api/courses/:courseId/enroll
 /api/courses/:courseId/enrollment
+/api/courses/:courseId/lessons/:lessonId
 /api/student/*
 /api/learning/*
 ```
 
 `/api/my-courses` is the canonical student course-list endpoint.
+
+`GET /api/courses/:courseId/lessons/:lessonId` is the protected Course Player
+lesson-content endpoint. It is authenticated and applies the course access policy
+(enrolled student, course owner, or admin); see
+[`docs/course-player.md`](docs/course-player.md).
 
 Teacher APIs:
 

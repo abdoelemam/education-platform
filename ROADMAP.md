@@ -347,18 +347,40 @@ initialization tests.
 
 # Phase 8 — Course Player
 
-Tasks:
+Status: Backend complete (frontend deferred - the frontend app is not initialized yet)
+
+Backend tasks:
+
+* [x] Protected lesson-content endpoint (`GET /api/courses/:courseId/lessons/:lessonId`)
+* [x] Text lesson delivery
+* [x] Document lesson and resource-reference delivery
+* [x] Video playback reference (ready-only, provider metadata excluded)
+* [x] Previous/next navigation metadata
+* [x] Published-course and active/completed-enrollment enforcement
+* [x] Owner-teacher/admin preview without broadening existing access
+* [x] Staged content hidden and cross-course lesson ids rejected
+* [x] Integration tests
+
+Frontend tasks (deferred):
 
 * [ ] Course player layout
 * [ ] Course sidebar
 * [ ] Lesson viewer
-* [ ] Video lesson
-* [ ] Text lesson
-* [ ] Document lesson
+* [ ] Video lesson UI
+* [ ] Text lesson UI
+* [ ] Document lesson UI
 * [ ] Resources
-* [ ] Previous/next navigation
-* [ ] Resume lesson
+* [ ] Previous/next navigation UI
+* [ ] Resume lesson (Phase 9)
 * [ ] Mobile responsive player
+
+Notes: every protected read authorizes the requester before resolving the
+lesson, then reuses `canAccessCourse` for students. There is no preview/free
+lesson bypass: a free course still requires a free enrollment, and the public
+catalog remains outline-only. Approved owners and admins may preview
+unpublished content; non-owners and non-approved teachers are denied. Video
+responses expose only a ready playback URL, duration and thumbnail. Covered by
+33 Course Player integration tests. See [`docs/course-player.md`](docs/course-player.md).
 
 ---
 
