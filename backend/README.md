@@ -23,6 +23,7 @@ src/
 │   ├── auth/        # Authentication and sessions
 │   ├── categories/  # Nested category hierarchy, admin CRUD and public tree
 │   ├── courses/     # Course Builder (courses, sections, lessons)
+│   ├── teacher-approvals/ # Admin teacher account review
 │   ├── users/       # User accounts and roles
 │   ├── videos/      # Provider-agnostic video system
 │   └── health/      # Health check endpoint
@@ -63,6 +64,32 @@ src/
 - `POST /api/auth/refresh` — Rotate refresh token and issue new token pair
 - `POST /api/auth/logout` — Revoke session and clear authentication cookies
 - `GET /api/auth/me` — Retrieve authenticated user profile (protected)
+
+### Teacher approvals (admins)
+
+- `GET /api/admin/teachers?status=pending&page=&limit=` — Review queue (defaults to `pending`)
+- `GET /api/admin/teachers/:teacherId` — Safe teacher account profile
+- `POST /api/admin/teachers/:teacherId/approve` — Approve a pending application
+- `POST /api/admin/teachers/:teacherId/reject` — Reject a pending application with `{ "reason": "…" }`
+
+Teacher decisions update the existing user account (`teacherStatus` plus review
+metadata); they never create a second account or a separate application record.
+Only `pending` applications can be reviewed, and concurrent decisions are
+resolved atomically. Rejection feedback is returned to the teacher through
+`GET /api/auth/me` and shown on the approval status screen. State-changing
+routes require the `X-CSRF-Token` header. These endpoints are the authoritative
+teacher-approval workflow.
+
+### Teacher application (teachers)
+
+- `POST /api/teacher/reapply` — Resubmit a rejected application for review
+
+A rejected teacher can resubmit for review; each subsequent rejection allows
+another resubmission. The account returns to `pending`, and the previous
+rejection reason and review metadata are cleared. Pending and approved accounts
+cannot resubmit, and students or administrators cannot use this endpoint to
+apply for teacher access. Disabled accounts are excluded from the review queue
+and cannot be inspected or reviewed until they are re-enabled.
 
 ### Videos (approved teachers)
 

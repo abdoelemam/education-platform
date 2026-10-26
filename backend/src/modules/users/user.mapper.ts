@@ -19,6 +19,10 @@ export function toPublicUser(user: UserDocument | (IUser & { _id: unknown })): P
     isActive: user.isActive,
     isEmailVerified: user.isEmailVerified,
     lastLoginAt: user.lastLoginAt ? user.lastLoginAt.toISOString() : undefined,
+    teacherRejectionReason: user.teacherRejectionReason,
+    teacherReviewedAt: user.teacherReviewedAt
+      ? user.teacherReviewedAt.toISOString()
+      : undefined,
     createdAt: user.createdAt.toISOString(),
     updatedAt: user.updatedAt.toISOString(),
   };

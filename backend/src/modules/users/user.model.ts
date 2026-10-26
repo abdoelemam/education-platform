@@ -2,6 +2,7 @@ import mongoose, { Schema } from 'mongoose';
 import {
   USER_ROLES,
   TEACHER_STATUSES,
+  TEACHER_REJECTION_REASON_MAX,
   type UserDocument,
 } from './user.types.js';
 
@@ -61,6 +62,24 @@ const userSchema = new Schema<UserDocument>(
       type: Date,
       default: undefined,
     },
+    teacherRejectionReason: {
+      type: String,
+      trim: true,
+      maxlength: [
+        TEACHER_REJECTION_REASON_MAX,
+        `Teacher rejection reason cannot exceed ${TEACHER_REJECTION_REASON_MAX} characters`,
+      ],
+      default: undefined,
+    },
+    teacherReviewedAt: {
+      type: Date,
+      default: undefined,
+    },
+    teacherReviewedBy: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      default: undefined,
+    },
   },
   {
     timestamps: true,
@@ -74,5 +93,8 @@ const userSchema = new Schema<UserDocument>(
     },
   },
 );
+
+// Supports the admin teacher-approval queue without scanning all users.
+userSchema.index({ role: 1, teacherStatus: 1, createdAt: 1 });
 
 export const UserModel = mongoose.model<UserDocument>('User', userSchema);
