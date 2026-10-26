@@ -403,9 +403,10 @@ appear. The backend is the source of truth: clients submit position/watched time
 and an explicit text/document completion action, but never `durationSeconds`, a
 video `completed` flag, `score` or a percentage (strict validation rejects them).
 Video completion is `watchedSeconds >= 0.9 ×` the authoritative stored video
-duration; a ready video without a positive duration is rejected. Watched time is
-monotonic and clamped, completion is sticky with the original `completedAt`, and
-`lastPositionSeconds` only changes when a position is supplied. Course
+duration; a ready video without a positive duration is rejected by progress and
+blocked at publication. Watched time is monotonic and clamped, completion is
+sticky with the original `completedAt`, and `lastPositionSeconds` only changes
+when a position is supplied. Course
 percentages count committed lessons in committed sections whose type is
 video/text/document; quiz lessons are excluded until Phase 10 and a course with
 zero eligible lessons reports zero and never completes. When every eligible
@@ -414,7 +415,7 @@ lesson is complete the service calls the existing idempotent
 and committed-content filtering; progress is student-only (teachers/admins can
 preview content but not progress) and a free course still requires enrollment.
 Client-reported watch time is a heuristic, not proof of genuine viewing. The
-Progress UI and resume control remain deferred with the frontend. Covered by 45
+Progress UI and resume control remain deferred with the frontend. Covered by 48
 integration tests. See [`docs/progress.md`](docs/progress.md).
 
 ---

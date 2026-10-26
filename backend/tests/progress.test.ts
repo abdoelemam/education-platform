@@ -913,6 +913,35 @@ describe('Progress Integration Tests', () => {
       expect(res.body.data.lastPositionSeconds).toBe(20);
     });
 
+    it('preserves the resume position across watched-only and position-only updates', async () => {
+      const { student, course, lesson } = await seedVideoCourse();
+
+      await putProgress(
+        student,
+        course._id.toString(),
+        lesson._id.toString(),
+        { watchedSeconds: 30, positionSeconds: 27 },
+      );
+
+      const watchedOnly = await putProgress(
+        student,
+        course._id.toString(),
+        lesson._id.toString(),
+        { watchedSeconds: 40 },
+      );
+      expect(watchedOnly.body.data.watchedSeconds).toBe(40);
+      expect(watchedOnly.body.data.lastPositionSeconds).toBe(27);
+
+      const positionOnly = await putProgress(
+        student,
+        course._id.toString(),
+        lesson._id.toString(),
+        { positionSeconds: 12 },
+      );
+      expect(positionOnly.body.data.watchedSeconds).toBe(40);
+      expect(positionOnly.body.data.lastPositionSeconds).toBe(12);
+    });
+
     it('preserves sticky completion and the original completion timestamp', async () => {
       const { student, course, lesson } = await seedVideoCourse();
 
@@ -1310,6 +1339,60 @@ describe('Progress Integration Tests', () => {
       const res = await getCourseProgress(student, course._id.toString());
       expect(res.body.data.currentLessonId).toBe(lesson._id.toString());
     });
+
+    it('returns lessons in curriculum order across sections', async () => {
+      const teacher = await registerApprovedTeacher();
+      const student = await registerStudent();
+      const course = await seedCourse({ ownerId: teacher.userId });
+      const firstSection = await seedSection({
+        courseId: course._id.toString(),
+        title: 'First Section',
+        order: 1,
+      });
+      const secondSection = await seedSection({
+        courseId: course._id.toString(),
+        title: 'Second Section',
+        order: 2,
+      });
+
+      // Insert out of order and give each section its own order sequence. A
+      // global sort by lesson `order` would interleave the two sections.
+      const firstSectionLessonTwo = await seedLesson({
+        courseId: course._id.toString(),
+        sectionId: firstSection._id.toString(),
+        title: 'First Section Lesson 2',
+        content: 'Second lesson in the first section.',
+        order: 2,
+      });
+      const secondSectionLessonOne = await seedLesson({
+        courseId: course._id.toString(),
+        sectionId: secondSection._id.toString(),
+        title: 'Second Section Lesson 1',
+        content: 'First lesson in the second section.',
+        order: 1,
+      });
+      const firstSectionLessonOne = await seedLesson({
+        courseId: course._id.toString(),
+        sectionId: firstSection._id.toString(),
+        title: 'First Section Lesson 1',
+        content: 'First lesson in the first section.',
+        order: 1,
+      });
+      await seedEnrollment(student.userId, course._id.toString());
+
+      const res = await getCourseProgress(student, course._id.toString());
+
+      expect(res.status).toBe(200);
+      expect(
+        res.body.data.lessons.map(
+          (lesson: { lessonId: string }) => lesson.lessonId,
+        ),
+      ).toEqual([
+        firstSectionLessonOne._id.toString(),
+        firstSectionLessonTwo._id.toString(),
+        secondSectionLessonOne._id.toString(),
+      ]);
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -1450,6 +1533,33 @@ describe('Progress Integration Tests', () => {
         completedLessons: 0,
         totalLessons: 1,
         percent: 0,
+      });
+    });
+
+    it('separates curriculum totals from progress-eligible totals', async () => {
+      const { student, course, lessons, section } = await seedTextCourse(1);
+
+      await seedLesson({
+        courseId: course._id.toString(),
+        sectionId: section._id.toString(),
+        type: 'quiz',
+        order: 2,
+      });
+      await putProgress(
+        student,
+        course._id.toString(),
+        lessons[0]!._id.toString(),
+        { completed: true },
+      );
+
+      const res = await myCourses(student);
+
+      expect(res.status).toBe(200);
+      expect(res.body.data[0].course.totalLessons).toBe(2);
+      expect(res.body.data[0].progress).toEqual({
+        completedLessons: 1,
+        totalLessons: 1,
+        percent: 100,
       });
     });
   });

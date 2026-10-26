@@ -204,8 +204,8 @@ focused on content and navigation, so the client fetches progress explicitly:
 The Progress System reuses the same published-course + enrollment policy and the
 same committed-content rules as the Course Player. Video completion is
 server-calculated from the authoritative video duration; a client `completed`
-flag or `ended` event is not proof. See [`progress.md`](progress.md) for the full
-contract.
+flag is ignored and an `ended` field is rejected by the strict progress request
+schema. See [`progress.md`](progress.md) for the full contract.
 
 ## Errors
 

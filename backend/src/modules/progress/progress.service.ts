@@ -165,7 +165,11 @@ export class ProgressService {
         complete,
       });
 
-      if (complete) {
+      // The persisted row is authoritative and completion is sticky. Triggering
+      // from `row.completed` (rather than only the current request's threshold)
+      // lets a later update finish a course when an earlier enrollment-completion
+      // write failed after the lesson itself was already marked complete.
+      if (row.completed) {
         await this.maybeCompleteCourse(studentId, courseId);
       }
 
@@ -427,20 +431,42 @@ export class ProgressService {
    * Completion uses committed lessons that are eligible for progress tracking.
    * A committed lesson whose section is staged is excluded, and quiz lessons
    * stay out until Phase 10.
+   *
+   * The result is in curriculum order: section order first, then the lesson's
+   * own order (lesson `order` is scoped to its section, so a global lesson sort
+   * alone would interleave sections). The caller uses this for the per-lesson
+   * response as well as for counting, so the player UI can render the outline
+   * directly.
    */
   private selectEligibleLessons(
     sections: SectionDocument[],
     lessons: LessonDocument[],
   ): LessonDocument[] {
-    const visibleSectionIds = new Set(
-      sections.map((section) => section._id.toString()),
+    const sectionRank = new Map(
+      sections.map((section, index) => [section._id.toString(), index]),
     );
 
-    return lessons.filter(
-      (lesson) =>
-        PROGRESS_LESSON_TYPE_SET.has(lesson.type) &&
-        visibleSectionIds.has(lesson.sectionId.toString()),
-    );
+    return lessons
+      .filter(
+        (lesson) =>
+          PROGRESS_LESSON_TYPE_SET.has(lesson.type) &&
+          sectionRank.has(lesson.sectionId.toString()),
+      )
+      .sort((a, b) => {
+        const sectionDelta =
+          (sectionRank.get(a.sectionId.toString()) ?? 0) -
+          (sectionRank.get(b.sectionId.toString()) ?? 0);
+
+        if (sectionDelta !== 0) {
+          return sectionDelta;
+        }
+
+        if (a.order !== b.order) {
+          return a.order - b.order;
+        }
+
+        return a.createdAt.getTime() - b.createdAt.getTime();
+      });
   }
 
   private async computeCourseSummary(

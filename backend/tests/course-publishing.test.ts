@@ -337,6 +337,7 @@ describe('Course Publishing Integration Tests', () => {
       provider: 'test-provider',
       uploadStatus: 'completed',
       processingStatus: 'ready',
+      durationSeconds: 321,
       playbackUrl: 'https://cdn.test/video.mp4',
       ...overrides,
     });
@@ -866,6 +867,12 @@ describe('Course Publishing Integration Tests', () => {
         videoId: await createVideo(teacher.userId, {
           processingStatus: 'processing',
           playbackUrl: undefined,
+        }),
+      },
+      {
+        label: 'no duration',
+        videoId: await createVideo(teacher.userId, {
+          durationSeconds: undefined,
         }),
       },
     ];

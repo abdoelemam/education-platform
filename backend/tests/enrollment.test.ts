@@ -1381,6 +1381,45 @@ describe('Enrollment Integration Tests', () => {
       );
     });
 
+    it('preserves an existing completion timestamp on a legacy completed row', async () => {
+      const teacher = await registerApprovedTeacher(
+        'complete-legacy-done-teacher@example.com',
+      );
+      const student = await registerStudent(
+        'complete-legacy-done-student@example.com',
+      );
+      const course = await seedCourse({ ownerId: teacher.userId });
+      const courseId = course._id.toString();
+
+      const completedAt = new Date('2024-06-01T00:00:00.000Z');
+      await mongoose.connection.db!.collection('enrollments').insertOne({
+        _id: new Types.ObjectId(),
+        studentId: new Types.ObjectId(student.userId),
+        courseId: new Types.ObjectId(courseId),
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+        completedAt,
+      });
+
+      const later = new Date('2025-08-08T08:00:00.000Z');
+      const completed = await enrollmentRepository.markCompleted({
+        studentId: student.userId,
+        courseId,
+        completedAt: later,
+      });
+
+      expect(completed).not.toBeNull();
+      expect(completed!.status).toBe('completed');
+      expect(completed!.completedAt?.toISOString()).toBe(
+        completedAt.toISOString(),
+      );
+
+      const stored = await EnrollmentModel.findById(completed!._id).exec();
+      expect(stored?.status).toBe('completed');
+      expect(stored?.completedAt?.toISOString()).toBe(
+        completedAt.toISOString(),
+      );
+    });
+
     it.each(['cancelled', 'expired'] as const)(
       'returns null without changing a %s enrollment',
       async (status) => {

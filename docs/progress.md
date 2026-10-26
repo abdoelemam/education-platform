@@ -143,7 +143,8 @@ Response:
 ### `GET /api/courses/:courseId/progress`
 
 Returns the student's full course summary and per-lesson progress. Lessons with
-no stored row appear with zero progress.
+no stored row appear with zero progress. The `lessons` array is in curriculum
+order: section `order` first, then each lesson's own `order` and creation time.
 
 ```json
 {
@@ -191,10 +192,15 @@ watchedSeconds >= 0.9 × video.durationSeconds
 
 The duration is never accepted from the client. A ready video without a positive
 stored duration is rejected with `409 LESSON_PAYLOAD_REQUIRED` because
-completion cannot be evaluated safely.
+completion cannot be evaluated safely. Publishing also rejects a ready video
+without a positive duration, so a newly published course cannot contain a video
+lesson that is impossible to complete. A course published before that rule could
+still contain such a video; progress remains blocked for that lesson until the
+video duration is refreshed.
 
-The client's `completed` flag and an `ended` event are ignored for video
-lessons. Only the recorded watched time is evaluated.
+The client's `completed` flag is ignored for video lessons. An `ended` field is
+not accepted at all: the strict request schema rejects it with
+`422 VALIDATION_ERROR`. Only the recorded watched time is evaluated.
 
 ### Text and document
 
@@ -251,12 +257,13 @@ progress-eligible lessons; the two can differ when a course contains quizzes.
 
 The 90% rule is a completion heuristic, not proof that the student genuinely
 watched the lesson. A client controls the playback requests it sends and can
-report arbitrary watched time, seek forward, or replay a request. The backend
-prevents the client from choosing its own duration, completion flag or course
-percentage, and it keeps watched time monotonic, but it cannot prove that every
-second was rendered on screen. Stronger guarantees require provider-side
-playback telemetry or signed playback events, which are out of scope for this
-phase.
+report arbitrary watched time, seek forward, or replay a request. For video
+lessons the backend prevents the client from choosing its own duration,
+completion flag or course percentage, and it keeps watched time monotonic, but
+it cannot prove that every second was rendered on screen. Stronger guarantees
+require provider-side playback telemetry or signed playback events, which are
+out of scope for this phase. This includes direct API calls that report a
+qualifying watched time without playing the video.
 
 Progress updates should be throttled by the client (for example on pause, seek,
 lesson exit and video end) rather than sent every second. The backend accepts
@@ -267,7 +274,8 @@ periodic updates and does not require a specific cadence.
 | Status | Code | Meaning |
 | --- | --- | --- |
 | `401` | `AUTH_UNAUTHORIZED` / `AUTH_INVALID_TOKEN` | Missing or invalid authentication |
-| `403` | `AUTH_FORBIDDEN` | Teacher/admin account, or missing CSRF token |
+| `403` | `AUTH_FORBIDDEN` | Teacher/admin account |
+| `403` | `CSRF_TOKEN_MISSING` / `CSRF_TOKEN_INVALID` | Missing or mismatched CSRF token on a write |
 | `403` | `COURSE_FORBIDDEN` | No enrollment or a revoked/expired enrollment |
 | `404` | `COURSE_NOT_FOUND` | Unknown course, or unpublished course requested by a student |
 | `404` | `LESSON_NOT_FOUND` | Unknown, cross-course or staged lesson |

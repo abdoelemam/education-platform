@@ -20,6 +20,11 @@ export interface PublishVideoState {
   ownerId: string;
   processingStatus: string;
   playbackUrl?: string;
+  /**
+   * Authoritative duration. Progress completion needs a positive value, so a
+   * ready video without one must not become part of a published course.
+   */
+  durationSeconds?: number;
 }
 
 /**
@@ -156,8 +161,13 @@ export function collectPublishIssues(
           !video ||
           video.ownerId !== course.ownerId.toString() ||
           video.processingStatus !== 'ready' ||
-          !video.playbackUrl
+          !video.playbackUrl ||
+          typeof video.durationSeconds !== 'number' ||
+          !Number.isFinite(video.durationSeconds) ||
+          video.durationSeconds <= 0
         ) {
+          // A ready video without a positive authoritative duration would be
+          // playable but impossible to complete, so it is not publishable.
           issues.add(COURSE_PUBLISH_ISSUES.VIDEO_NOT_READY);
         }
         break;

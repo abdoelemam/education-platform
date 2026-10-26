@@ -1753,6 +1753,7 @@ export class CourseService {
         ownerId: video.ownerId.toString(),
         processingStatus: video.processingStatus,
         playbackUrl: video.playbackUrl,
+        durationSeconds: video.durationSeconds,
       });
     }
 
