@@ -28,6 +28,11 @@ import {
   createTeacherEnrollmentRouter,
 } from './modules/enrollments/index.js';
 import type { EnrollmentService } from './modules/enrollments/index.js';
+import {
+  createAdminTeacherRouter,
+  createTeacherApplicationRouter,
+} from './modules/teacher-approvals/index.js';
+import type { TeacherApprovalService } from './modules/teacher-approvals/index.js';
 
 export interface CreateAppOptions {
   /**
@@ -45,6 +50,10 @@ export interface CreateAppOptions {
    * tests that want to isolate enrollment logic.
    */
   enrollmentService?: EnrollmentService;
+  /**
+   * Optional teacher-approval service override for tests.
+   */
+  teacherApprovalService?: TeacherApprovalService;
 }
 
 /**
@@ -84,6 +93,12 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   // All API routes are prefixed with /api
   app.use('/api', healthRoutes);
   app.use('/api/auth', authRoutes);
+  // Teacher reapplication is mounted on its own path so it cannot affect the
+  // authentication behavior of the other `/api/teacher/*` routers.
+  app.use(
+    '/api/teacher/reapply',
+    createTeacherApplicationRouter(options.teacherApprovalService),
+  );
   app.use('/api/teacher/videos', createVideoRouter(options.videoService));
   // Mounted before the course builder router so a roster request is handled
   // here and does not run the builder's router-level authentication twice.
@@ -92,6 +107,10 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     createTeacherEnrollmentRouter(options.enrollmentService),
   );
   app.use('/api/teacher/courses', createCourseRouter(options.courseService));
+  app.use(
+    '/api/admin/teachers',
+    createAdminTeacherRouter(options.teacherApprovalService),
+  );
   app.use('/api/admin/courses', createAdminCourseRouter(options.courseService));
   app.use('/api/my-courses', createMyCoursesRouter(options.enrollmentService));
   // Enrollment routes are mounted before the public catalog. They declare

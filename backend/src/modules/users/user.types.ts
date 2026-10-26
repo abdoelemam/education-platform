@@ -13,6 +13,9 @@ export type UserRole = (typeof USER_ROLES)[number];
 export const TEACHER_STATUSES = ['none', 'pending', 'approved', 'rejected'] as const;
 export type TeacherStatus = (typeof TEACHER_STATUSES)[number];
 
+/** Maximum length of the administrator feedback stored on a rejected application. */
+export const TEACHER_REJECTION_REASON_MAX = 1000;
+
 /**
  * Core User entity interface representing database structure.
  */
@@ -26,6 +29,12 @@ export interface IUser {
   isActive: boolean;
   isEmailVerified: boolean;
   lastLoginAt?: Date;
+  /** Administrator feedback shown to a rejected teacher applicant. */
+  teacherRejectionReason?: string;
+  /** When an administrator last approved or rejected the teacher application. */
+  teacherReviewedAt?: Date;
+  /** Administrator who made the most recent teacher approval decision. */
+  teacherReviewedBy?: Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -51,6 +60,8 @@ export interface PublicUser {
   isActive: boolean;
   isEmailVerified: boolean;
   lastLoginAt?: string;
+  teacherRejectionReason?: string;
+  teacherReviewedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
