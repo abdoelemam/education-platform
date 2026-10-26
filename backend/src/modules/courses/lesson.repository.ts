@@ -131,6 +131,26 @@ export class LessonRepository {
   }
 
   /**
+   * Committed lessons for several courses in one query. Used by the Progress
+   * System to build course summaries for a student's course list without a
+   * query per course.
+   */
+  async listByCourseIds(courseIds: string[]): Promise<LessonDocument[]> {
+    if (courseIds.length === 0) {
+      return [];
+    }
+
+    return LessonModel.find({
+      courseId: {
+        $in: courseIds.map((id) => new Types.ObjectId(id)),
+      },
+      ...COMMITTED_CONTENT_FILTER,
+    })
+      .sort({ courseId: 1, order: 1, createdAt: 1 })
+      .exec();
+  }
+
+  /**
    * Count committed lessons for several courses in one aggregation. Used by
    * listing endpoints that show a curriculum summary per course.
    */

@@ -933,7 +933,11 @@ describe('Enrollment Integration Tests', () => {
       expect(item.course.totalSections).toBe(2);
       expect(item.course.totalLessons).toBe(3);
       expect(item.hasAccess).toBe(true);
-      expect(item.progress).toBeNull();
+      expect(item.progress).toEqual({
+        completedLessons: 0,
+        totalLessons: 3,
+        percent: 0,
+      });
 
       expect(
         (res.body.data as Array<{ course: { id: string } }>).some(
@@ -1251,7 +1255,11 @@ describe('Enrollment Integration Tests', () => {
       expect(list.body.data[0].enrollment.enrolledAt).toBe(
         createdAt.toISOString(),
       );
-      expect(list.body.data[0].progress).toBeNull();
+      expect(list.body.data[0].progress).toEqual({
+        completedLessons: 0,
+        totalLessons: 0,
+        percent: 0,
+      });
     });
 
     it('normalizes a legacy completed purchase row', async () => {

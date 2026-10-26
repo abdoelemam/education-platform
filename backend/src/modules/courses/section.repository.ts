@@ -89,6 +89,26 @@ export class SectionRepository {
       .exec();
   }
 
+  /**
+   * Committed sections for several courses in one query. Used by the Progress
+   * System so a batch course summary only counts lessons whose section is
+   * visible.
+   */
+  async listByCourseIds(courseIds: string[]): Promise<SectionDocument[]> {
+    if (courseIds.length === 0) {
+      return [];
+    }
+
+    return SectionModel.find({
+      courseId: {
+        $in: courseIds.map((id) => new Types.ObjectId(id)),
+      },
+      ...COMMITTED_CONTENT_FILTER,
+    })
+      .sort({ courseId: 1, order: 1, createdAt: 1 })
+      .exec();
+  }
+
   async countByCourse(courseId: string): Promise<number> {
     return SectionModel.countDocuments({
       courseId,

@@ -615,8 +615,9 @@ Rules:
   returns `null` when no transition occurs so a cancelled/expired row cannot be
   mistaken for a successful completion.
 - Lesson progress and course completion percentages belong to the Progress
-  System. `progress` in the student course list stays `null` until that system
-  exists.
+  System. `progress` in the student course list is computed from committed,
+  progress-eligible lessons (video/text/document) and is never accepted from a
+  client. Quiz lessons are excluded until Phase 10.
 - Reads use lean documents so legacy rows missing `status`, `enrolledAt` or
   `source` are normalized from stored data instead of receiving read-time schema
   defaults. A row missing both `enrolledAt` and `createdAt` exposes
@@ -686,6 +687,54 @@ Course Progress
 Do not persist every video time update.
 
 Use throttled updates.
+
+Implementation rules (Phase 9):
+
+- One `LessonProgress` row per `(studentId, lessonId)`, enforced by a unique
+  compound index. Concurrent writes retry as updates, so duplicate rows cannot
+  appear.
+- The backend is the source of truth. Clients submit `positionSeconds`,
+  `watchedSeconds` and (for text/document) an explicit `completed` action. They
+  never submit `durationSeconds`, a video `completed` flag, `score` or a course
+  percentage; those fields are rejected by strict validation.
+- Video completion is derived only from server-recorded watched time and the
+  authoritative `durationSeconds` stored on the Video document
+  (`watchedSeconds >= 0.9 × durationSeconds`). A ready video without a positive
+  stored duration is rejected.
+- Watched time is monotonic (`$max`) and clamped to the duration. Completion is
+  sticky: a conditional update only matches `completed: false`, preserving the
+  original `completedAt`.
+- `lastPositionSeconds` only changes when the client supplies a position, so a
+  watched-time-only update does not reset resume state.
+- Course percentages count committed lessons whose section is committed and
+  whose type is `video`, `text` or `document`. A course with zero eligible
+  lessons reports zero and never completes the enrollment.
+- When all eligible lessons are complete, the service calls the existing
+  idempotent `enrollmentRepository.markCompleted`.
+- Every read and write reuses `canAccessCourse` and committed-content filtering.
+  Progress is student-owned: teachers and admins preview content through the
+  Course Player but cannot read or write student progress. A free course still
+  requires an enrollment.
+- Client-reported watch time is a heuristic, not proof of genuine viewing. A
+  client can seek or report arbitrary values; the backend prevents it from
+  choosing duration/completion/percentage but cannot prove rendering. Stronger
+  guarantees require provider-side telemetry.
+
+Module layout:
+
+```text
+src/modules/progress/
+├── progress.model.ts
+├── progress.types.ts
+├── progress.constants.ts
+├── progress.validation.ts
+├── progress.mapper.ts
+├── progress.repository.ts
+├── progress.service.ts
+├── progress.controller.ts
+├── progress.routes.ts
+└── index.ts
+```
 
 ---
 
@@ -785,6 +834,8 @@ Student APIs:
 /api/courses/:courseId/enroll
 /api/courses/:courseId/enrollment
 /api/courses/:courseId/lessons/:lessonId
+/api/courses/:courseId/progress
+/api/courses/:courseId/lessons/:lessonId/progress
 /api/student/*
 /api/learning/*
 ```
@@ -795,6 +846,11 @@ Student APIs:
 lesson-content endpoint. It is authenticated and applies the course access policy
 (enrolled student, course owner, or admin); see
 [`docs/course-player.md`](docs/course-player.md).
+
+The two progress routes are authenticated student-only endpoints. They reuse the
+same published-course + enrollment policy and committed-content rules, and they
+expose only the caller's own progress. See
+[`docs/progress.md`](docs/progress.md).
 
 Teacher APIs:
 

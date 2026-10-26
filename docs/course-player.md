@@ -22,7 +22,8 @@ Implemented in this phase:
 Deliberately **not** implemented in this phase:
 
 - Player UI, sidebar or responsive layout
-- Lesson progress, resume position or completion (Phase 9)
+- Embedded progress/resume fields in the player response (the separate
+  Progress System endpoints provide them)
 - Quiz content (Phase 10)
 - Certificates (Phase 14)
 - Payments or paid-content entitlements (Phase 12)
@@ -187,6 +188,24 @@ Navigation is built from committed content only:
 `navigation.previous` is `null` for the first lesson and `navigation.next` is
 `null` for the last lesson. Adjacent references contain only `lessonId`,
 `sectionId`, `title` and `type`; they do not duplicate full lesson content.
+
+## Progress integration
+
+Lesson progress, resume positions and course completion are implemented by the
+separate Progress System (Phase 9). The player response intentionally stays
+focused on content and navigation, so the client fetches progress explicitly:
+
+- `PUT /api/courses/:courseId/lessons/:lessonId/progress` — record playback
+  position, watched time, or text/document completion
+- `GET /api/courses/:courseId/lessons/:lessonId/progress` — resume position for
+  the current lesson
+- `GET /api/courses/:courseId/progress` — course summary and per-lesson progress
+
+The Progress System reuses the same published-course + enrollment policy and the
+same committed-content rules as the Course Player. Video completion is
+server-calculated from the authoritative video duration; a client `completed`
+flag or `ended` event is not proof. See [`progress.md`](progress.md) for the full
+contract.
 
 ## Errors
 

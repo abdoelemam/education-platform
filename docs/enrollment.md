@@ -21,10 +21,12 @@ Implemented in this phase:
 - Startup index initialization before the HTTP server accepts traffic
 - Legacy published-course and legacy enrollment-row compatibility
 
-Deliberately **not** implemented in this phase: lesson progress, quizzes,
-certificates, cancellation/expiry flows and payment-provider integration.
-Protected lesson delivery is implemented separately by the Course Player
-(Phase 8); see [`course-player.md`](course-player.md).
+Deliberately **not** implemented in this phase: quizzes, certificates,
+cancellation/expiry flows and payment-provider integration. Protected lesson
+delivery is implemented separately by the Course Player (Phase 8); see
+[`course-player.md`](course-player.md). Lesson progress, resume positions and
+course completion are implemented by the Progress System (Phase 9); see
+[`progress.md`](progress.md).
 
 ## Enrollment model
 
@@ -44,7 +46,8 @@ Protected lesson delivery is implemented separately by the Course Player
 The enrollment stores **relationship state only**. Course metadata stays on
 Course, student profile data on User, lesson progress on LessonProgress (Phase 9)
 and financial history on Order (Phase 12). No price, title, email or progress
-counter is duplicated.
+counter is duplicated. `status = completed` and `completedAt` are written by the
+Progress System through `enrollmentRepository.markCompleted`, never by a client.
 
 Indexes:
 
@@ -159,6 +162,12 @@ This policy is implemented by `GET /api/courses/:courseId/lessons/:lessonId`.
 See [`course-player.md`](course-player.md) for the endpoint contract, response
 shapes and the owner-teacher/admin preview rules.
 
+The Progress System (`PUT/GET /api/courses/:courseId/.../progress`) reuses the
+same `canAccessCourse` predicate and committed-content rules, with one
+additional constraint: progress is student-owned, so teachers and admins cannot
+read or write it. A free published course still requires an enrollment; there is
+no preview bypass. See [`progress.md`](progress.md).
+
 ## API
 
 ### `POST /api/courses/:courseId/enroll`
@@ -246,19 +255,28 @@ describe the returned set.
         "totalLessons": 18
       },
       "hasAccess": true,
-      "progress": null
+      "progress": {
+        "completedLessons": 4,
+        "totalLessons": 18,
+        "percent": 22
+      }
     }
   ],
   "meta": { "page": 1, "limit": 20, "total": 1, "totalPages": 1 }
 }
 ```
 
-`progress` is always `null` until the Progress System exists. The API never
-fabricates a percentage. `hasAccess` uses the same lifecycle/publication
-predicate as the status endpoint; it is a UI convenience, not a substitute for
-backend authorization. `totalSections` / `totalLessons` count committed content
-only. Owner ids, review metadata, category internals and lesson payloads are not
-exposed. Instructor data is limited to name and avatar.
+`progress` is computed by the Progress System from stored LessonProgress rows
+over committed, progress-eligible lessons (video/text/document). Quiz lessons
+are excluded until Phase 10, so `progress.totalLessons` can be smaller than
+`course.totalLessons`. A course with no eligible lessons reports
+`{ completedLessons: 0, totalLessons: 0, percent: 0 }`. The value is never
+accepted from a client and never fabricates a percentage. `hasAccess` uses the
+same lifecycle/publication predicate as the status endpoint; it is a UI
+convenience, not a substitute for backend authorization. `totalSections` /
+`totalLessons` count committed content only. Owner ids, review metadata,
+category internals and lesson payloads are not exposed. Instructor data is
+limited to name and avatar.
 
 ### `GET /api/teacher/courses/:courseId/enrollments?page=1&limit=20`
 
@@ -303,9 +321,9 @@ No backfill or migration is performed.
 
 ## Completion state
 
-`status = completed` and `completedAt` are part of the model so Phase 9 can mark
-completion without a schema change. The authoritative entry point is
-`enrollmentRepository.markCompleted`:
+`status = completed` and `completedAt` are written by the Progress System when
+every committed, progress-eligible lesson is complete. The authoritative entry
+point is `enrollmentRepository.markCompleted`:
 
 - It transitions an `active` enrollment, or a legacy row with no stored
   `status`, to `completed`.
@@ -313,13 +331,16 @@ completion without a schema change. The authoritative entry point is
   occurred (missing row, already completed, cancelled or expired).
 - It never changes a cancelled/expired row, and the first completion timestamp
   is preserved because an already-completed row is not updated again.
+- It is idempotent; repeated progress writes after completion leave the row
+  unchanged.
 
-No HTTP endpoint for completion exists in this phase; completion must never be
-accepted from a client.
+No HTTP endpoint accepts completion from a client. The Progress System derives
+completion from server-recorded lesson progress; see
+[`progress.md`](progress.md).
 
 ## Deferred work
 
-- Lesson progress and course completion rules (Phase 9)
+- Quiz progress and quiz-based completion (Phase 10)
 - Checkout, verified webhooks, Order/Purchase records and paid enrollment
   (Phase 12)
 - Enrollment cancellation/expiry endpoints

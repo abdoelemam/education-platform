@@ -18,18 +18,17 @@ import type {
   LessonDocument,
 } from '../courses/course.types.js';
 import { isValidHttpUrl } from '../courses/course.validators.js';
+import { loadReadyLessonVideo } from '../courses/lesson-video.js';
 import { canAccessCourse } from '../enrollments/enrollment.access.js';
 import {
   enrollmentRepository,
   type EnrollmentRepository,
 } from '../enrollments/enrollment.repository.js';
 import type { AuthUser } from '../users/user.types.js';
-import { VIDEO_ERRORS } from '../videos/video.constants.js';
 import {
   videoRepository,
   type VideoRepository,
 } from '../videos/video.repository.js';
-import type { VideoDocument } from '../videos/video.types.js';
 import {
   toCoursePlayerLessonView,
   toPlayerLessonReference,
@@ -94,7 +93,7 @@ export class CoursePlayerService {
 
     this.assertSupportedLesson(lesson);
 
-    const video = await this.loadLessonVideo(course, lesson);
+    const video = await loadReadyLessonVideo(course, lesson, this.videoRepo);
     const navigation = await this.buildNavigation(params.courseId, lesson);
 
     return toCoursePlayerLessonView({
@@ -232,53 +231,6 @@ export class CoursePlayerService {
           'This lesson type is not supported by the player yet',
         );
     }
-  }
-
-  /**
-   * Load a video only for a video lesson and verify the same invariants the
-   * publishing rules enforce: the asset belongs to the course owner, and the
-   * provider has confirmed it is ready. Only a ready playback URL is exposed.
-   */
-  private async loadLessonVideo(
-    course: CourseDocument,
-    lesson: LessonDocument,
-  ): Promise<VideoDocument | undefined> {
-    if (lesson.type !== 'video') {
-      return undefined;
-    }
-
-    if (!lesson.videoId) {
-      throw new AppError(
-        409,
-        COURSE_ERRORS.LESSON_PAYLOAD_REQUIRED,
-        'This video lesson has no video attached',
-      );
-    }
-
-    const video = await this.videoRepo.findById(lesson.videoId.toString());
-
-    if (
-      !video ||
-      video.ownerId.toString() !== course.ownerId.toString()
-    ) {
-      // A missing or foreign video is treated as unavailable rather than
-      // exposing another teacher's asset to an enrolled student.
-      throw new AppError(
-        404,
-        COURSE_ERRORS.LESSON_VIDEO_NOT_FOUND,
-        'The video for this lesson is not available',
-      );
-    }
-
-    if (video.processingStatus !== 'ready' || !video.playbackUrl) {
-      throw new AppError(
-        409,
-        VIDEO_ERRORS.VIDEO_NOT_READY,
-        'This video is not ready for playback yet',
-      );
-    }
-
-    return video;
   }
 
   /**

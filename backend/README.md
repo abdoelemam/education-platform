@@ -24,6 +24,7 @@ src/
 │   ├── categories/  # Nested category hierarchy, admin CRUD and public tree
 │   ├── courses/     # Course Builder (courses, sections, lessons)
 │   ├── course-player/ # Protected lesson content and navigation
+│   ├── progress/    # Lesson progress, resume position and completion
 │   ├── teacher-approvals/ # Admin teacher account review
 │   ├── users/       # User accounts and roles
 │   ├── videos/      # Provider-agnostic video system
@@ -181,6 +182,23 @@ there is no preview-lesson bypass. Video responses contain only a ready
 playback URL, duration and thumbnail; provider metadata is never exposed.
 Staged sections and lessons remain hidden. See
 [`../docs/course-player.md`](../docs/course-player.md) for the full contract.
+
+### Progress (enrolled students)
+
+- `PUT /api/courses/:courseId/lessons/:lessonId/progress` — Record playback position, watched time, or text/document completion
+- `GET /api/courses/:courseId/progress` — Course summary and per-lesson progress
+- `GET /api/courses/:courseId/lessons/:lessonId/progress` — Resume position and progress for one lesson
+
+Progress is student-owned: teachers and admins can preview content but cannot
+read or write student progress. A free course still requires an enrollment.
+Video completion is calculated by the backend from server-recorded watched time
+reaching 90% of the authoritative stored video duration; a client `completed`
+flag or `ended` event is never trusted. `durationSeconds`, `score` and course
+percentages are rejected from client input. Watched time is monotonic, completion
+is sticky, and course percentages count committed, progress-eligible lessons
+(quizzes are excluded until Phase 10). Writes require the `X-CSRF-Token` header.
+See [`../docs/progress.md`](../docs/progress.md) for the full contract and the
+limits of client-reported watch progress.
 
 ### Public catalog
 

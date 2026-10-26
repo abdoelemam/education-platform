@@ -30,6 +30,8 @@ import {
 import type { EnrollmentService } from './modules/enrollments/index.js';
 import { createCoursePlayerRouter } from './modules/course-player/index.js';
 import type { CoursePlayerService } from './modules/course-player/index.js';
+import { createProgressRouter } from './modules/progress/index.js';
+import type { ProgressService } from './modules/progress/index.js';
 import {
   createAdminTeacherRouter,
   createTeacherApplicationRouter,
@@ -60,6 +62,10 @@ export interface CreateAppOptions {
    * Optional Course Player service override for tests.
    */
   coursePlayerService?: CoursePlayerService;
+  /**
+   * Optional Progress service override for tests.
+   */
+  progressService?: ProgressService;
 }
 
 /**
@@ -125,6 +131,9 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   // Protected Course Player content. Authentication is declared per route so
   // the public catalog below remains anonymous.
   app.use('/api/courses', createCoursePlayerRouter(options.coursePlayerService));
+  // Student progress. Separate endpoints so the player response stays focused
+  // on content and resume data is fetched explicitly.
+  app.use('/api/courses', createProgressRouter(options.progressService));
   app.use('/api/courses', createPublicCourseRouter(options.courseService));
   app.use('/api/admin/categories', createAdminCategoryRouter());
   app.use('/api/categories', createPublicCategoryRouter());
