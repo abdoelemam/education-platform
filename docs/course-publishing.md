@@ -93,7 +93,8 @@ Staged rows from an in-flight create are never counted.
    - `text`: non-empty content.
    - `document`: absolute HTTP(S) URL.
    - `video`: the referenced video exists, belongs to the course owner,
-     `processingStatus === 'ready'` and has a playback URL.
+     `processingStatus === 'ready'`, has a playback URL and has a positive
+     `durationSeconds` (progress completion needs an authoritative duration).
    - `quiz`: cannot be published until the Quiz System exists.
 
 Failures return `422 COURSE_NOT_PUBLISHABLE` with machine-readable reasons in
@@ -312,8 +313,7 @@ a category so the category requirement is exercised alongside the other rules.
 `backend/tests/course-category.test.ts` adds 32 integration tests for category
 assignment, approval/publish-time validation, admin category-only repair, lock
 ordering and deterministic lease-expiry races, catalog filtering, legacy
-`category: null` behavior and category guards. The full backend suite has 253
-passing tests.
+`category: null` behavior and category guards. The full backend suite passes.
 
 ## Deferred
 
@@ -325,7 +325,8 @@ passing tests.
 - Payments, checkout and coupons. `priceMinor`/`currency` are publication
   metadata only; no purchase or revenue calculation exists. Free enrollment is
   implemented separately (see [`enrollment.md`](enrollment.md)).
-- Lesson progress, resume position and completion (Phase 9).
+- Progress UI, resume control and player integration (the backend Progress
+  System is implemented; see [`progress.md`](progress.md)).
 - Instructor profiles beyond `name` and `avatar`.
 - Quiz lessons (Quiz System phase).
 

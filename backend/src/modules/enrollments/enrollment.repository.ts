@@ -197,8 +197,9 @@ export class EnrollmentRepository {
    *
    * Only an active enrollment transitions. A legacy row that never stored
    * `status` is treated as active by the mapper, so it is transitionable too.
-   * The first completion timestamp is preserved on repeat calls, so completion
-   * stays idempotent and historical.
+   * The first completion timestamp is preserved on repeat calls, including
+   * legacy rows that already stored `completedAt` without a `status`, so
+   * completion stays idempotent and historical.
    *
    * Returns `null` when no transition occurred: the row is missing, already
    * completed, cancelled, or expired. Callers must not interpret one of those
@@ -221,7 +222,15 @@ export class EnrollmentRepository {
           { status: null },
         ],
       },
-      { $set: { status: 'completed', completedAt } },
+      [
+        {
+          $set: {
+            status: 'completed',
+            // Never replace a completion timestamp that is already stored.
+            completedAt: { $ifNull: ['$completedAt', completedAt] },
+          },
+        },
+      ],
       { new: true },
     ).exec();
   }

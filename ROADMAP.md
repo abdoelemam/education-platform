@@ -329,9 +329,9 @@ enrollment per student/course is enforced by a unique compound index, and
 enrollment is an atomic idempotent upsert (`201` created / `200` existing),
 including under concurrent requests. Enrollment is student-only.
 `GET /api/my-courses` is the canonical student list and returns safe course
-summaries with `progress: null` until Phase 9. The teacher roster is owner-scoped
-(admin bypass) and omits student email. Legacy published courses without
-price/currency and legacy enrollment rows are normalized on read. Record
+summaries with a computed `progress` summary (see Phase 9). The teacher roster is
+owner-scoped (admin bypass) and omits student email. Legacy published courses
+without price/currency and legacy enrollment rows are normalized on read. Record
 existence (`enrolled`) is separate from access: the reusable `canAccessCourse`
 predicate allows published-course access for `active` and `completed`
 enrollments, denies `cancelled`/`expired`, and is exposed as `hasAccess`.
@@ -388,14 +388,35 @@ responses expose only a ready playback URL, duration and thumbnail. Covered by
 
 Tasks:
 
-* [ ] LessonProgress model
-* [ ] Video progress
-* [ ] Lesson completion
-* [ ] Course completion percentage
-* [ ] Resume position
-* [ ] Course progress API
+* [x] LessonProgress model
+* [x] Video progress
+* [x] Lesson completion
+* [x] Course completion percentage
+* [x] Resume position
+* [x] Course progress API
 * [ ] Progress UI
-* [ ] Completion rules
+* [x] Completion rules
+
+Notes: one `LessonProgress` row per `(studentId, lessonId)` is enforced by a
+unique compound index; concurrent writes retry as updates so duplicates cannot
+appear. The backend is the source of truth: clients submit position/watched time
+and an explicit text/document completion action, but never `durationSeconds`, a
+video `completed` flag, `score` or a percentage (strict validation rejects them).
+Video completion is `watchedSeconds >= 0.9 ×` the authoritative stored video
+duration; a ready video without a positive duration is rejected by progress and
+blocked at publication. Watched time is monotonic and clamped, completion is
+sticky with the original `completedAt`, and `lastPositionSeconds` only changes
+when a position is supplied. Course
+percentages count committed lessons in committed sections whose type is
+video/text/document; quiz lessons are excluded until Phase 10 and a course with
+zero eligible lessons reports zero and never completes. When every eligible
+lesson is complete the service calls the existing idempotent
+`enrollmentRepository.markCompleted`. All reads/writes reuse `canAccessCourse`
+and committed-content filtering; progress is student-only (teachers/admins can
+preview content but not progress) and a free course still requires enrollment.
+Client-reported watch time is a heuristic, not proof of genuine viewing. The
+Progress UI and resume control remain deferred with the frontend. Covered by 48
+integration tests. See [`docs/progress.md`](docs/progress.md).
 
 ---
 
@@ -675,7 +696,7 @@ defined in this roadmap and continue next.
 Current phase:
 
 ```text
-Enrollment backend complete
+Progress backend complete
 ```
 
 Completed:
@@ -690,14 +711,16 @@ Teacher Workflow — course submission, review and approval backend
 Course Publishing — approval-to-publication backend + public catalog minimum
 Phase 3 — Categories + course ↔ category linking, filtering and publish requirement
 Phase 7 — Enrollment backend (free enrollment, student course list, teacher roster)
+Phase 8 — Course Player backend (protected lesson content and navigation)
+Phase 9 — Progress backend (lesson progress, resume position, completion rules)
 ```
 
 Immediate next tasks:
 
 ```text
 1. Remaining Course Management items (thumbnail upload, course preview)
-2. Course Player (Phase 8) protected lesson access, then Progress (Phase 9)
-3. Course Builder + moderation + publishing + enrollment frontend (once the frontend app is initialized)
+2. Quiz System (Phase 10) backend
+3. Course Builder + moderation + publishing + enrollment + player/progress frontend (once the frontend app is initialized)
 ```
 
 The remaining Video System items (resumable uploads, upload UI, upload progress,

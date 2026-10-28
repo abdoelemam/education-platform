@@ -24,6 +24,7 @@ src/
 │   ├── categories/  # Nested category hierarchy, admin CRUD and public tree
 │   ├── courses/     # Course Builder (courses, sections, lessons)
 │   ├── course-player/ # Protected lesson content and navigation
+│   ├── progress/    # Lesson progress, resume position and completion
 │   ├── teacher-approvals/ # Admin teacher account review
 │   ├── users/       # User accounts and roles
 │   ├── videos/      # Provider-agnostic video system
@@ -51,6 +52,31 @@ src/
 - `npm run typecheck` — Run TypeScript type checking
 - `npm run lint` — Run ESLint
 - `npm run lint:fix` — Run ESLint with auto-fix
+
+## Testing
+
+The test suite is integration-heavy: it talks to a real MongoDB instance and
+writes to a dedicated `education-platform-test` database.
+
+Prerequisites:
+
+1. MongoDB must be reachable at `127.0.0.1:27017` (the local MongoDB service is
+   enough).
+2. No manual database setup is required. The integration suites connect
+   themselves and clear the test database between tests; the remaining suites
+   are pure unit tests that do not touch MongoDB.
+
+Run:
+
+```bash
+npm test
+```
+
+`vitest.config.ts` supplies the test environment (`NODE_ENV=test`, the test
+database URI, JWT secrets and `LOG_LEVEL=error`), so a local `.env` file is not
+required for tests. The full suite takes several minutes, so allow at least
+10 minutes when running it from a script or CI; the pass/fail summary is
+printed only after every file finishes.
 
 ## API Endpoints
 
@@ -181,6 +207,23 @@ there is no preview-lesson bypass. Video responses contain only a ready
 playback URL, duration and thumbnail; provider metadata is never exposed.
 Staged sections and lessons remain hidden. See
 [`../docs/course-player.md`](../docs/course-player.md) for the full contract.
+
+### Progress (enrolled students)
+
+- `PUT /api/courses/:courseId/lessons/:lessonId/progress` — Record playback position, watched time, or text/document completion
+- `GET /api/courses/:courseId/progress` — Course summary and per-lesson progress
+- `GET /api/courses/:courseId/lessons/:lessonId/progress` — Resume position and progress for one lesson
+
+Progress is student-owned: teachers and admins can preview content but cannot
+read or write student progress. A free course still requires an enrollment.
+Video completion is calculated by the backend from server-recorded watched time
+reaching 90% of the authoritative stored video duration; a client `completed`
+flag or `ended` event is never trusted. `durationSeconds`, `score` and course
+percentages are rejected from client input. Watched time is monotonic, completion
+is sticky, and course percentages count committed, progress-eligible lessons
+(quizzes are excluded until Phase 10). Writes require the `X-CSRF-Token` header.
+See [`../docs/progress.md`](../docs/progress.md) for the full contract and the
+limits of client-reported watch progress.
 
 ### Public catalog
 

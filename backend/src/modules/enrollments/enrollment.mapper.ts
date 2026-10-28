@@ -67,8 +67,8 @@ export function toRosterEnrollment(
  * Map a course to the safe summary shown in a student's own course list.
  *
  * Owner ids, review metadata, category internals and lesson payloads are
- * excluded. `progress` is added by the service as an explicit `null` until the
- * Progress System exists.
+ * excluded. The service adds the computed `progress` summary alongside this
+ * course summary; it is not part of the course document.
  */
 export function toMyCourseSummary(
   course: CourseDocument,

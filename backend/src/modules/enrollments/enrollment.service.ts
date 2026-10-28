@@ -18,6 +18,10 @@ import type {
   CourseDocument,
 } from '../courses/course.types.js';
 import {
+  progressService,
+  type ProgressService,
+} from '../progress/progress.service.js';
+import {
   userRepository,
   type UserRepository,
 } from '../users/user.repository.js';
@@ -67,6 +71,7 @@ export class EnrollmentService {
     private readonly sectionRepo: SectionRepository = sectionRepository,
     private readonly lessonRepo: LessonRepository = lessonRepository,
     private readonly userRepo: UserRepository = userRepository,
+    private readonly progressSvc: ProgressService = progressService,
   ) {}
 
   /**
@@ -145,9 +150,10 @@ export class EnrollmentService {
   /**
    * Paginated list of the student's enrollments with safe course summaries.
    *
-   * `progress` is always `null` until the Progress System (Phase 9) exists; the
-   * API never invents completion percentages. Curriculum counts come from
-   * committed sections/lessons only.
+   * `progress` is computed by the Progress System from committed,
+   * progress-eligible lessons. It is never accepted from a client and never
+   * invents a completion percentage. Curriculum counts come from committed
+   * sections/lessons only.
    *
    * Published courses cannot be deleted (course deletion is limited to
    * `draft`/`rejected`), so an enrollment cannot normally reference a missing
@@ -170,11 +176,16 @@ export class EnrollmentService {
       ...new Set(items.map((enrollment) => enrollment.courseId.toString())),
     ];
 
-    const [courses, sectionCounts, lessonCounts] = await Promise.all([
-      this.courseRepo.findByIds(courseIds),
-      this.sectionRepo.countCommittedByCourseIds(courseIds),
-      this.lessonRepo.countCommittedByCourseIds(courseIds),
-    ]);
+    const [courses, sectionCounts, lessonCounts, progressByCourse] =
+      await Promise.all([
+        this.courseRepo.findByIds(courseIds),
+        this.sectionRepo.countCommittedByCourseIds(courseIds),
+        this.lessonRepo.countCommittedByCourseIds(courseIds),
+        this.progressSvc.getCourseSummaries({
+          studentId: params.studentId,
+          courseIds,
+        }),
+      ]);
 
     const coursesById = new Map(
       courses.map((course) => [course._id.toString(), course]),
@@ -199,7 +210,11 @@ export class EnrollmentService {
           lessonCounts.get(courseId) ?? 0,
         ),
         hasAccess: canAccessCourse(enrollment, course.status),
-        progress: null,
+        progress: progressByCourse.get(courseId) ?? {
+          completedLessons: 0,
+          totalLessons: 0,
+          percent: 0,
+        },
       });
     }
 

@@ -3,6 +3,7 @@ import type {
   CatalogInstructor,
   CourseLevel,
 } from '../courses/course.types.js';
+import type { CourseProgressSummary } from '../progress/progress.types.js';
 
 /**
  * Enrollment lifecycle.
@@ -143,10 +144,15 @@ export interface MyCourseItem {
    */
   hasAccess: boolean;
   /**
-   * Reserved for the Progress System (Phase 9). It stays `null` until lesson
-   * progress exists; the API never fabricates progress numbers.
+   * Authoritative progress summary for this course.
+   *
+   * Counts only committed lessons that are eligible for progress tracking
+   * (video/text/document; quizzes are excluded until Phase 10). It is computed
+   * from stored LessonProgress rows and never accepted from a client. A course
+   * with no eligible lessons reports `{ completedLessons: 0, totalLessons: 0,
+   * percent: 0 }`.
    */
-  progress: null;
+  progress: CourseProgressSummary;
 }
 
 /** Display-safe student summary for the teacher roster (no email). */

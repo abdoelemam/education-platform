@@ -933,7 +933,11 @@ describe('Enrollment Integration Tests', () => {
       expect(item.course.totalSections).toBe(2);
       expect(item.course.totalLessons).toBe(3);
       expect(item.hasAccess).toBe(true);
-      expect(item.progress).toBeNull();
+      expect(item.progress).toEqual({
+        completedLessons: 0,
+        totalLessons: 3,
+        percent: 0,
+      });
 
       expect(
         (res.body.data as Array<{ course: { id: string } }>).some(
@@ -1251,7 +1255,11 @@ describe('Enrollment Integration Tests', () => {
       expect(list.body.data[0].enrollment.enrolledAt).toBe(
         createdAt.toISOString(),
       );
-      expect(list.body.data[0].progress).toBeNull();
+      expect(list.body.data[0].progress).toEqual({
+        completedLessons: 0,
+        totalLessons: 0,
+        percent: 0,
+      });
     });
 
     it('normalizes a legacy completed purchase row', async () => {
@@ -1369,6 +1377,45 @@ describe('Enrollment Integration Tests', () => {
       expect(completed).not.toBeNull();
       expect(completed!.status).toBe('completed');
       expect(completed!.completedAt?.toISOString()).toBe(
+        completedAt.toISOString(),
+      );
+    });
+
+    it('preserves an existing completion timestamp on a legacy completed row', async () => {
+      const teacher = await registerApprovedTeacher(
+        'complete-legacy-done-teacher@example.com',
+      );
+      const student = await registerStudent(
+        'complete-legacy-done-student@example.com',
+      );
+      const course = await seedCourse({ ownerId: teacher.userId });
+      const courseId = course._id.toString();
+
+      const completedAt = new Date('2024-06-01T00:00:00.000Z');
+      await mongoose.connection.db!.collection('enrollments').insertOne({
+        _id: new Types.ObjectId(),
+        studentId: new Types.ObjectId(student.userId),
+        courseId: new Types.ObjectId(courseId),
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+        completedAt,
+      });
+
+      const later = new Date('2025-08-08T08:00:00.000Z');
+      const completed = await enrollmentRepository.markCompleted({
+        studentId: student.userId,
+        courseId,
+        completedAt: later,
+      });
+
+      expect(completed).not.toBeNull();
+      expect(completed!.status).toBe('completed');
+      expect(completed!.completedAt?.toISOString()).toBe(
+        completedAt.toISOString(),
+      );
+
+      const stored = await EnrollmentModel.findById(completed!._id).exec();
+      expect(stored?.status).toBe('completed');
+      expect(stored?.completedAt?.toISOString()).toBe(
         completedAt.toISOString(),
       );
     });
