@@ -313,8 +313,7 @@ a category so the category requirement is exercised alongside the other rules.
 `backend/tests/course-category.test.ts` adds 32 integration tests for category
 assignment, approval/publish-time validation, admin category-only repair, lock
 ordering and deterministic lease-expiry races, catalog filtering, legacy
-`category: null` behavior and category guards. The full backend suite has 253
-passing tests.
+`category: null` behavior and category guards. The full backend suite passes.
 
 ## Deferred
 

@@ -53,6 +53,31 @@ src/
 - `npm run lint` — Run ESLint
 - `npm run lint:fix` — Run ESLint with auto-fix
 
+## Testing
+
+The test suite is integration-heavy: it talks to a real MongoDB instance and
+writes to a dedicated `education-platform-test` database.
+
+Prerequisites:
+
+1. MongoDB must be reachable at `127.0.0.1:27017` (the local MongoDB service is
+   enough).
+2. No manual database setup is required. The integration suites connect
+   themselves and clear the test database between tests; the remaining suites
+   are pure unit tests that do not touch MongoDB.
+
+Run:
+
+```bash
+npm test
+```
+
+`vitest.config.ts` supplies the test environment (`NODE_ENV=test`, the test
+database URI, JWT secrets and `LOG_LEVEL=error`), so a local `.env` file is not
+required for tests. The full suite takes several minutes, so allow at least
+10 minutes when running it from a script or CI; the pass/fail summary is
+printed only after every file finishes.
+
 ## API Endpoints
 
 ### Health
